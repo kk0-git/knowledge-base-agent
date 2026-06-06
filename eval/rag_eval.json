@@ -1,0 +1,255 @@
+[
+  {
+    "query": "进程是什么",
+    "expected_notes": [
+      "个人/面试/基础/进程.md"
+    ],
+    "notes": "操作系统概念定义，应该命中进程基础定义。",
+    "query_type": "definition",
+    "source_type": "personal_note"
+  },
+  {
+    "query": "进程和线程有什么区别",
+    "expected_notes": [
+      "个人/面试/基础/进程.md"
+    ],
+    "notes": "对比类问题，应该命中进程和线程区别小节。",
+    "query_type": "comparison",
+    "source_type": "personal_note"
+  },
+  {
+    "query": "PCB 进程控制块包含什么信息",
+    "expected_notes": [
+      "个人/面试/基础/进程.md"
+    ],
+    "notes": "操作系统细节问题，应该命中 PCB 小节。",
+    "query_type": "detail_lookup",
+    "source_type": "personal_note"
+  },
+  {
+    "query": "FastAPI CORS 跨域怎么配置",
+    "expected_notes": [
+      "docs/fastapi/tutorial/cors.md",
+      "全栈ai/技术栈/fastapi.md"
+    ],
+    "notes": "官方 FastAPI CORS 文档和个人 fastapi.md 都能正确回答；官方 docs 更权威，命中任一来源都算有效。",
+    "query_type": "configuration",
+    "source_type": "mixed_source"
+  },
+  {
+    "query": "FastAPI dependency_overrides 怎么替换依赖做测试",
+    "expected_notes": [
+      "docs/fastapi/advanced/testing-dependencies.md",
+      "全栈ai/技术栈/fastapi.md"
+    ],
+    "notes": "官方 FastAPI testing-dependencies 文档和个人 fastapi.md 都能回答 dependency_overrides 测试替换；官方 docs 更权威，命中任一来源都算有效。",
+    "query_type": "testing",
+    "source_type": "mixed_source"
+  },
+  {
+    "query": "SQLAlchemy async 和 PostgreSQL 怎么配合",
+    "expected_notes": [
+      "全栈ai/技术栈/postgreSQL.md"
+    ],
+    "notes": "postgreSQL.md 有 SQLAlchemy async + asyncpg + 事务管理的完整内容。",
+    "query_type": "integration",
+    "source_type": "personal_note"
+  },
+  {
+    "query": "Redis Stream 任务队列怎么消费事件",
+    "expected_notes": [
+      "全栈ai/技术栈/redis.md",
+      "全栈ai/技术栈/postgreSQL.md"
+    ],
+    "notes": "Redis Stream 与任务事件流，redis 是主命中，postgreSQL 中也有任务流上下文。",
+    "query_type": "integration",
+    "source_type": "personal_note"
+  },
+  {
+    "query": "Claude Code 代理怎么配置",
+    "expected_notes": [
+      "软件与系统安装配置/软件安装与配置/ClaudeCode安装.md"
+    ],
+    "notes": "排错/配置类问题，应命中 Claude Code 安装代理设置。",
+    "query_type": "configuration",
+    "source_type": "tool_note"
+  },
+  {
+    "query": "Claude API key 在哪里配置和测试",
+    "expected_notes": [
+      "个人/常用信息集合/各平台api keys记录.md",
+      "软件与系统安装配置/软件安装与配置/ClaudeCode安装.md",
+      "全栈ai/项目/mini-claude-code启动记录.md"
+    ],
+    "notes": "Claude API key 与相关工具配置。",
+    "query_type": "configuration",
+    "source_type": "mixed_note"
+  },
+  {
+    "query": "DNS 查询过程递归和迭代有什么区别",
+    "expected_notes": [
+      "个人/面试/基础/DNS查询.md"
+    ],
+    "notes": "计算机网络基础问题，应该命中 DNS 查询。",
+    "query_type": "comparison",
+    "source_type": "personal_note"
+  },
+  {
+    "query": "HTTP 强缓存和协商缓存有什么区别",
+    "expected_notes": [
+      "个人/面试/基础/HTTP缓存.md"
+    ],
+    "notes": "前端/网络缓存问题，应该命中 HTTP 缓存。",
+    "query_type": "comparison",
+    "source_type": "personal_note"
+  },
+  {
+    "query": "git push 失败怎么设置代理",
+    "expected_notes": [
+      "软件与工具使用/git/git命令.md"
+    ],
+    "notes": "Git 代理排错，应命中 git 命令。",
+    "query_type": "troubleshooting",
+    "source_type": "tool_note"
+  },
+  {
+    "query": "Docker 怎么启动容器和查看日志",
+    "expected_notes": [
+      "软件与工具使用/docker/使用命令.md"
+    ],
+    "notes": "Docker 命令查询，应命中 docker 命令。",
+    "query_type": "command",
+    "source_type": "tool_note"
+  },
+  {
+    "query": "Linux 进程管理和系统调用",
+    "expected_notes": [
+      "个人/面试/基础/进程.md"
+    ],
+    "notes": "进程.md 覆盖进程管理和上下文切换（涉及系统调用）。Linux.md 是网络排错日志，不沾边，已移除。",
+    "query_type": "definition",
+    "source_type": "personal_note"
+  },
+  {
+    "query": "从输入URL到页面渲染，DNS解析、TCP握手和HTTP缓存各在哪个阶段起作用",
+    "expected_notes": [
+      "个人/面试/基础/计网.md",
+      "个人/面试/基础/DNS查询.md",
+      "个人/面试/基础/连接握手.md",
+      "个人/面试/基础/HTTP缓存.md"
+    ],
+    "notes": "跨文档推理：计网.md 有完整流程描述并链向另外三篇，需多篇笔记覆盖各阶段。",
+    "query_type": "cross_document",
+    "source_type": "personal_note"
+  },
+  {
+    "query": "构建LLM Agent需要考虑哪些架构组件和推理范式",
+    "expected_notes": [
+      "个人/面试/agent面试/agent-architecture.md"
+    ],
+    "notes": "agent-architecture 完整覆盖四大核心组件（感知/推理/行动/记忆）和推理范式。参考经验.md 讲的是后端技术栈学习路线（FastAPI/Redis/Celery），不回答架构组件问题，已移除。",
+    "query_type": "architecture",
+    "source_type": "personal_note"
+  },
+  {
+    "query": "git push 怎么配置 SSH 密钥和私人令牌免密认证",
+    "expected_notes": [
+      "软件与工具使用/git/gitee/记录.md"
+    ],
+    "notes": "gitee/记录.md 有 SSH 密钥生成、credential.helper 和 HTTPS 转 SSH remote 的配置步骤。",
+    "query_type": "configuration",
+    "source_type": "tool_note"
+  },
+  {
+    "query": "面试可能会问哪些计算机网络和操作系统的问题",
+    "expected_notes": [
+      "个人/面试/基础/计网.md",
+      "个人/面试/基础/操作系统.md"
+    ],
+    "notes": "模糊查询：计网.md 覆盖网络部分，操作系统.md 覆盖OS概念大纲。ai应用开发.md 面经与query关键词不匹配，已移除。",
+    "query_type": "broad_review",
+    "source_type": "personal_note"
+  },
+  {
+    "query": "操作系统为什么被称为资源管理器",
+    "expected_notes": [
+      "imported_docs/textbooks-mineru-agent/操作系统导论/02.md"
+    ],
+    "notes": "教材 PDF ingestion eval：第2章解释操作系统通过虚拟化共享 CPU、内存、磁盘等资源，因此被称为资源管理器。",
+    "query_type": "definition",
+    "source_type": "textbook_pdf"
+  },
+  {
+    "query": "虚拟化 CPU 是什么意思，为什么一个 CPU 看起来能同时运行多个程序",
+    "expected_notes": [
+      "imported_docs/textbooks-mineru-agent/操作系统导论/02.md",
+      "imported_docs/textbooks-mineru-agent/操作系统导论/04.md"
+    ],
+    "notes": "跨章节教材查询：第2章总述虚拟化 CPU，第4章从进程抽象和时分共享解释 CPU 虚拟化。",
+    "query_type": "definition",
+    "source_type": "textbook_pdf"
+  },
+  {
+    "query": "进程是什么，进程的机器状态包括哪些内容",
+    "expected_notes": [
+      "imported_docs/textbooks-mineru-agent/操作系统导论/04.md"
+    ],
+    "notes": "第4章抽象：进程，覆盖进程定义、地址空间、寄存器、程序计数器等机器状态。",
+    "query_type": "definition",
+    "source_type": "textbook_pdf"
+  },
+  {
+    "query": "fork 和 exec 分别做什么，为什么 shell 会用它们启动程序",
+    "expected_notes": [
+      "imported_docs/textbooks-mineru-agent/操作系统导论/05.md"
+    ],
+    "notes": "第5章进程 API，覆盖 fork、wait、exec 以及 shell 启动命令的基本机制。",
+    "query_type": "mechanism",
+    "source_type": "textbook_pdf"
+  },
+  {
+    "query": "受限直接执行是什么，操作系统如何限制用户程序的权限",
+    "expected_notes": [
+      "imported_docs/textbooks-mineru-agent/操作系统导论/06.md"
+    ],
+    "notes": "第6章机制：受限直接执行，覆盖用户态/内核态、陷阱、系统调用、时钟中断等机制。",
+    "query_type": "mechanism",
+    "source_type": "textbook_pdf"
+  },
+  {
+    "query": "并发问题为什么会出现，多个线程递增计数器为什么会得到错误结果",
+    "expected_notes": [
+      "imported_docs/textbooks-mineru-agent/操作系统导论/02.md"
+    ],
+    "notes": "第2章并发例子，覆盖多线程共享计数器、非原子指令和并发问题动机。",
+    "query_type": "causal_reasoning",
+    "source_type": "textbook_pdf"
+  },
+  {
+    "query": "文件系统如何保证数据持久性，日志和写时复制解决什么问题",
+    "expected_notes": [
+      "imported_docs/textbooks-mineru-agent/操作系统导论/02.md"
+    ],
+    "notes": "第2章持久性概览，覆盖文件系统、写入协议、journaling、copy-on-write。",
+    "query_type": "mechanism",
+    "source_type": "textbook_pdf"
+  },
+  {
+    "query": "彩票调度和步长调度如何实现比例份额调度",
+    "expected_notes": [
+      "imported_docs/textbooks-mineru-agent/操作系统导论/09.md"
+    ],
+    "notes": "第9章调度：比例份额，覆盖 lottery scheduling 和 stride scheduling。",
+    "query_type": "mechanism",
+    "source_type": "textbook_pdf"
+  },
+  {
+    "query": "多处理器调度为什么要考虑缓存亲和度，单队列和多队列调度有什么取舍",
+    "expected_notes": [
+      "imported_docs/textbooks-mineru-agent/操作系统导论/10.md"
+    ],
+    "notes": "第10章多处理器调度，覆盖缓存亲和度、SQMS、MQMS、可扩展性和负载均衡取舍。",
+    "query_type": "comparison",
+    "source_type": "textbook_pdf"
+  }
+]

@@ -1,0 +1,88 @@
+[
+  {
+    "query": "进程是什么",
+    "expected_should_rewrite": false,
+    "expected_rewrite_type": "none",
+    "acceptable_rewritten_queries": [],
+    "forbidden_expansions": ["进程的定义", "操作系统进程", "PCB", "线程"],
+    "notes": "清晰定义类 query，不需要改写；只补标点不应算 rewrite。"
+  },
+  {
+    "query": "进程和线程有什么区别",
+    "expected_should_rewrite": false,
+    "expected_rewrite_type": "none",
+    "acceptable_rewritten_queries": [],
+    "forbidden_expansions": ["操作系统调度", "上下文切换", "资源分配"],
+    "notes": "清晰对比类 query，不需要改写或扩展。"
+  },
+  {
+    "query": "agent咋做",
+    "expected_should_rewrite": true,
+    "expected_rewrite_type": "normalize_colloquial",
+    "acceptable_rewritten_queries": [
+      "agent 怎么做？",
+      "Agent 怎么做？"
+    ],
+    "forbidden_expansions": ["LLM Agent", "工具调用", "规划", "记忆", "推理框架"],
+    "notes": "只做口语规范化；agent 是多义词，缺少上下文时不应自动扩展为 LLM Agent。"
+  },
+  {
+    "query": "那个后台任务怎么防重复",
+    "expected_should_rewrite": true,
+    "expected_rewrite_type": "normalize_colloquial",
+    "acceptable_rewritten_queries": [
+      "后台任务如何防止重复执行？",
+      "后台任务怎么防止重复执行？"
+    ],
+    "forbidden_expansions": ["任务队列", "Redis", "分布式锁", "幂等", "数据库唯一约束"],
+    "notes": "可以去掉口语指代词“那个”，但不应补充具体实现方案。"
+  },
+  {
+    "query": "怎么设计一个可靠的 agent 系统",
+    "expected_should_rewrite": false,
+    "expected_rewrite_type": "none",
+    "acceptable_rewritten_queries": [],
+    "forbidden_expansions": ["LLM Agent", "多智能体", "工具调用", "记忆系统", "HyDE"],
+    "notes": "表达已经清晰；纯 rewrite 阶段不负责 HyDE、关键词扩展或架构补全。"
+  },
+  {
+    "query": "Claude Code 代理怎么配置",
+    "expected_should_rewrite": false,
+    "expected_rewrite_type": "none",
+    "acceptable_rewritten_queries": [],
+    "forbidden_expansions": ["Anthropic", "API key", "环境变量", "HTTP_PROXY"],
+    "notes": "明确工具配置问题，不需要改写。"
+  },
+  {
+    "query": "redis那个stream消费",
+    "expected_should_rewrite": true,
+    "expected_rewrite_type": "normalize_colloquial",
+    "acceptable_rewritten_queries": [
+      "Redis Stream 消费",
+      "Redis 的 Stream 消费"
+    ],
+    "forbidden_expansions": ["消费者组", "XREAD", "XREADGROUP", "任务队列"],
+    "notes": "可以规范大小写和去掉口语词，但不应补充 Redis Stream 的具体机制。"
+  },
+  {
+    "query": "接口一直跨域咋办",
+    "expected_should_rewrite": true,
+    "expected_rewrite_type": "normalize_colloquial",
+    "acceptable_rewritten_queries": [
+      "接口一直跨域怎么办？",
+      "接口跨域怎么办？"
+    ],
+    "forbidden_expansions": ["CORS", "代理", "后端配置", "浏览器同源策略"],
+    "notes": "只把口语表达改清楚，不应补充跨域解决方案或技术原因。"
+  },
+  {
+    "query": "PCB是啥",
+    "expected_should_rewrite": true,
+    "expected_rewrite_type": "normalize_colloquial",
+    "acceptable_rewritten_queries": [
+      "PCB 是什么？"
+    ],
+    "forbidden_expansions": ["印刷电路板", "进程控制块", "Process Control Block", "聚氯联苯"],
+    "notes": "多义缩写只做表面规范化，不应猜测具体含义。"
+  }
+]

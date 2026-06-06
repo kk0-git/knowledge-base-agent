@@ -1,0 +1,28 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+
+# generated indexes (huge)
+rag-index/
+
+# generated outputs
+audit-output/
+eval-results/*.json
+eval-results/**/*.json
+
+# logs
+*.log
+*.err.log
+
+# generated audit
+audit-output/
+
+# OS
+.DS_Store
+Thumbs.db
