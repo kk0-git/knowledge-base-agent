@@ -55,6 +55,7 @@ def main() -> int:
     parser.add_argument("--target-chunk-chars", type=int, default=900)
     parser.add_argument("--min-chunk-chars", type=int, default=200)
     parser.add_argument("--chunk-overlap", type=int, default=200)
+    parser.add_argument("--chunk-split-mode", choices=["streaming", "indexed"], default="indexed")
     parser.add_argument("--top-n", type=int, default=20)
     args = parser.parse_args()
 
@@ -67,6 +68,7 @@ def main() -> int:
         target_chunk_chars=args.target_chunk_chars,
         min_chunk_chars=args.min_chunk_chars,
         chunk_overlap=args.chunk_overlap,
+        chunk_split_mode=args.chunk_split_mode,
     )
     chunker = HeadingChunker(config)
 
@@ -129,6 +131,7 @@ def main() -> int:
             "target_chunk_chars": args.target_chunk_chars,
             "min_chunk_chars": args.min_chunk_chars,
             "chunk_overlap": args.chunk_overlap,
+            "chunk_split_mode": args.chunk_split_mode,
         },
         "summary": build_summary(scan_result.notes, note_stats, all_chunks),
         "by_source_type": summarize_by_source(note_stats),

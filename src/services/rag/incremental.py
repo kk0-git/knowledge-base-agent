@@ -66,6 +66,7 @@ def build_index_config(
         "target_chunk_chars": chunker_config.target_chunk_chars,
         "min_chunk_chars": chunker_config.min_chunk_chars,
         "chunk_overlap": chunker_config.chunk_overlap,
+        "chunk_split_mode": chunker_config.chunk_split_mode,
         "strip_code_blocks": chunker_config.strip_code_blocks,
     }
 

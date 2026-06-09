@@ -68,3 +68,58 @@ class OpenAICompatibleClient:
 
         content = raw["choices"][0]["message"]["content"]
         return LLMResponse(content=content, raw=raw)
+
+    def stream_complete(self, request: LLMRequest):
+        url = f"{self.base_url}/chat/completions"
+
+        payload = {
+            "model": request.model,
+            "messages": [asdict(message) for message in request.messages],
+            "temperature": request.temperature,
+            "stream": True,
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+        }
+
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+
+        http_request = urllib.request.Request(
+            url=url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(
+                http_request,
+                timeout=self.config.timeout_seconds,
+            ) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+
+                    data = line.removeprefix("data:").strip()
+                    if data == "[DONE]":
+                        break
+
+                    try:
+                        payload = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+
+                    delta = payload.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        yield content
+
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"LLM stream HTTP error {exc.code}: {body}") from exc
+
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"LLM stream request failed: {exc}") from exc

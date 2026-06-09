@@ -7,3 +7,6 @@ from knowledge_base_agent.llm.schema import LLMRequest, LLMResponse
 class LLMClient(Protocol):
     def complete(self, request: LLMRequest) -> LLMResponse:
         ...
+
+    def stream_complete(self, request: LLMRequest):
+        ...

@@ -28,6 +28,12 @@ from services.rag.manager import RAGManager
 from services.rag.memory_vector_store import MemoryVectorStore
 from services.rag.reranker import DEFAULT_RERANKER_MODEL, CrossEncoderReranker, DashScopeReranker
 from services.rag.schema import EmbeddingChunk, TextChunk
+from services.rag.vector_store_loader import (
+    DEFAULT_HNSW_EF_CONSTRUCTION,
+    DEFAULT_HNSW_EF_SEARCH,
+    DEFAULT_HNSW_M,
+    load_vector_store,
+)
 
 
 DEFAULT_MODEL = "BAAI/bge-m3"
@@ -46,6 +52,13 @@ def add_embedding_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--embed-batch-size", type=int, default=32)
     parser.add_argument("--max-seq-length", type=int, default=None)
+
+
+def add_vector_index_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--vector-index", choices=["flat", "hnsw"], default="flat")
+    parser.add_argument("--hnsw-m", type=int, default=DEFAULT_HNSW_M)
+    parser.add_argument("--hnsw-ef-construction", type=int, default=DEFAULT_HNSW_EF_CONSTRUCTION)
+    parser.add_argument("--hnsw-ef-search", type=int, default=DEFAULT_HNSW_EF_SEARCH)
 
 
 def create_index_embedder(args: argparse.Namespace):
@@ -82,6 +95,7 @@ def main() -> int:
     index_parser.add_argument("--target-chunk-chars", type=int, default=900)
     index_parser.add_argument("--min-chunk-chars", type=int, default=200)
     index_parser.add_argument("--chunk-overlap", type=int, default=200)
+    index_parser.add_argument("--chunk-split-mode", choices=["streaming", "indexed"], default="indexed")
     index_parser.add_argument(
         "--strip-code-blocks",
         action="store_true",
@@ -104,6 +118,7 @@ def main() -> int:
     search_parser.add_argument("--query", required=True, help="Search query")
     search_parser.add_argument("--model", default=DEFAULT_MODEL, help="SentenceTransformer model")
     add_embedding_args(search_parser)
+    add_vector_index_args(search_parser)
     search_parser.add_argument("--top-k", type=int, default=5)
     search_parser.add_argument("--mode", choices=["dense", "bm25", "hybrid", "hybrid-rerank"], default="dense")
     search_parser.add_argument("--dense-top-k", type=int, default=50)
@@ -126,6 +141,7 @@ def main() -> int:
     index_eval_parser.add_argument("--target-chunk-chars", type=int, default=900)
     index_eval_parser.add_argument("--min-chunk-chars", type=int, default=200)
     index_eval_parser.add_argument("--chunk-overlap", type=int, default=200)
+    index_eval_parser.add_argument("--chunk-split-mode", choices=["streaming", "indexed"], default="indexed")
     index_eval_parser.add_argument(
         "--strip-code-blocks",
         action="store_true",
@@ -188,6 +204,7 @@ def run_index(args: argparse.Namespace) -> int:
         target_chunk_chars=args.target_chunk_chars,
         min_chunk_chars=args.min_chunk_chars,
         chunk_overlap=args.chunk_overlap,
+        chunk_split_mode=args.chunk_split_mode,
         strip_code_blocks=args.strip_code_blocks,
     )
     index_config = build_index_config(
@@ -419,7 +436,13 @@ def run_search(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"BM25 index file not found: {bm25_index_path}")
 
     embedder = create_index_embedder(args) if args.mode in {"dense", "hybrid", "hybrid-rerank"} else None
-    vector_store = MemoryVectorStore(persist_path=index_path if index_path.exists() else None)
+    vector_store = load_vector_store(
+        index_path=index_path,
+        vector_index=args.vector_index,
+        hnsw_m=args.hnsw_m,
+        hnsw_ef_construction=args.hnsw_ef_construction,
+        hnsw_ef_search=args.hnsw_ef_search,
+    )
     bm25_index = BM25Index(persist_path=bm25_index_path) if args.mode in {"bm25", "hybrid", "hybrid-rerank"} else None
     reranker = create_reranker(args) if args.mode == "hybrid-rerank" else None
 
@@ -455,6 +478,7 @@ def run_search(args: argparse.Namespace) -> int:
 
     print(f"Query: {args.query}")
     print(f"Mode: {args.mode}")
+    print(f"Vector index: {args.vector_index}")
     print(f"Results: {len(results)}")
     print("")
 
@@ -510,6 +534,7 @@ def run_index_and_eval(args: argparse.Namespace) -> int:
         target_chunk_chars=args.target_chunk_chars,
         min_chunk_chars=args.min_chunk_chars,
         chunk_overlap=args.chunk_overlap,
+        chunk_split_mode=args.chunk_split_mode,
         strip_code_blocks=args.strip_code_blocks,
     )
     index_config = build_index_config(

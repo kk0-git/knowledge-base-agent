@@ -11,11 +11,16 @@ from services.rag.bm25 import BM25Index
 from services.rag.chunker import HeadingChunker
 from services.rag.embedder import Embedder, create_embedder
 from services.rag.manager import RAGManager
-from services.rag.memory_vector_store import MemoryVectorStore
 from services.rag.query_rewrite import LLMQueryRewriter, QueryRewrite
 from services.rag.query_variants import QueryVariant, RankedList, build_query_variants, weighted_rrf_fuse
 from services.rag.reranker import DEFAULT_RERANKER_MODEL, CrossEncoderReranker, DashScopeReranker
 from services.rag.schema import SearchResult
+from services.rag.vector_store_loader import (
+    DEFAULT_HNSW_EF_CONSTRUCTION,
+    DEFAULT_HNSW_EF_SEARCH,
+    DEFAULT_HNSW_M,
+    load_vector_store,
+)
 
 
 SEARCH_MODES = {"dense", "bm25", "hybrid", "hybrid-rerank"}
@@ -75,6 +80,10 @@ class SearchService:
         embedding_provider: str = "local",
         embed_batch_size: int = 32,
         max_seq_length: int | None = None,
+        vector_index: str = "flat",
+        hnsw_m: int = DEFAULT_HNSW_M,
+        hnsw_ef_construction: int = DEFAULT_HNSW_EF_CONSTRUCTION,
+        hnsw_ef_search: int = DEFAULT_HNSW_EF_SEARCH,
     ) -> None:
         self.index_path = index_path
         self.bm25_index_path = bm25_index_path or derive_bm25_index_path(index_path)
@@ -83,11 +92,15 @@ class SearchService:
         self.embedding_provider = embedding_provider
         self.embed_batch_size = embed_batch_size
         self.max_seq_length = max_seq_length
+        self.vector_index = vector_index
+        self.hnsw_m = hnsw_m
+        self.hnsw_ef_construction = hnsw_ef_construction
+        self.hnsw_ef_search = hnsw_ef_search
 
         load_dotenv(project_root / ".env")
 
         self._embedder: Embedder | None = None
-        self._vector_store: MemoryVectorStore | None = None
+        self._vector_store = None
         self._bm25_index: BM25Index | None = None
         self._rewriter: LLMQueryRewriter | None = None
 
@@ -315,11 +328,17 @@ class SearchService:
             )
         return self._embedder
 
-    def get_vector_store(self) -> MemoryVectorStore:
+    def get_vector_store(self):
         if self._vector_store is None:
             if not self.index_path.exists():
                 raise FileNotFoundError(f"Vector index file not found: {self.index_path}")
-            self._vector_store = MemoryVectorStore(persist_path=self.index_path)
+            self._vector_store = load_vector_store(
+                index_path=self.index_path,
+                vector_index=self.vector_index,
+                hnsw_m=self.hnsw_m,
+                hnsw_ef_construction=self.hnsw_ef_construction,
+                hnsw_ef_search=self.hnsw_ef_search,
+            )
         return self._vector_store
 
     def get_bm25_index(self) -> BM25Index:

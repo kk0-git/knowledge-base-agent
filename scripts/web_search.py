@@ -12,6 +12,11 @@ if str(PROJECT_SRC) not in sys.path:
 
 import uvicorn
 
+from services.rag.vector_store_loader import (
+    DEFAULT_HNSW_EF_CONSTRUCTION,
+    DEFAULT_HNSW_EF_SEARCH,
+    DEFAULT_HNSW_M,
+)
 from web.app import create_app
 
 
@@ -22,10 +27,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run the local Knowledge Agent search web UI")
     parser.add_argument("--index", default="./rag-index/bge-m3-v2.json", help="Vector index JSON path")
     parser.add_argument("--bm25-index", default=None, help="BM25 index JSON path")
+    parser.add_argument("--vault", default=None, help="Vault root path for chat rg search")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="SentenceTransformer model")
     parser.add_argument("--embedding-provider", choices=["local", "openai_compatible"], default="local")
     parser.add_argument("--embed-batch-size", type=int, default=32)
     parser.add_argument("--max-seq-length", type=int, default=None)
+    parser.add_argument("--vector-index", choices=["flat", "hnsw"], default="flat")
+    parser.add_argument("--hnsw-m", type=int, default=DEFAULT_HNSW_M)
+    parser.add_argument("--hnsw-ef-construction", type=int, default=DEFAULT_HNSW_EF_CONSTRUCTION)
+    parser.add_argument("--hnsw-ef-search", type=int, default=DEFAULT_HNSW_EF_SEARCH)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--reload", action="store_true")
@@ -39,9 +49,14 @@ def main() -> int:
         bm25_index_path=bm25_index_path,
         model_name=args.model,
         project_root=PROJECT_ROOT,
+        vault_path=Path(args.vault) if args.vault else None,
         embedding_provider=args.embedding_provider,
         embed_batch_size=args.embed_batch_size,
         max_seq_length=args.max_seq_length,
+        vector_index=args.vector_index,
+        hnsw_m=args.hnsw_m,
+        hnsw_ef_construction=args.hnsw_ef_construction,
+        hnsw_ef_search=args.hnsw_ef_search,
     )
 
     uvicorn.run(

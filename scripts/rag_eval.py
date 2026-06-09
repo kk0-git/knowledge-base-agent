@@ -19,8 +19,13 @@ from services.rag.bm25 import BM25Index
 from services.rag.chunker import HeadingChunker
 from services.rag.embedder import create_embedder
 from services.rag.manager import RAGManager
-from services.rag.memory_vector_store import MemoryVectorStore
 from services.rag.reranker import DEFAULT_RERANKER_MODEL, CrossEncoderReranker, DashScopeReranker
+from services.rag.vector_store_loader import (
+    DEFAULT_HNSW_EF_CONSTRUCTION,
+    DEFAULT_HNSW_EF_SEARCH,
+    DEFAULT_HNSW_M,
+    load_vector_store,
+)
 
 
 DEFAULT_MODEL = "BAAI/bge-m3"
@@ -57,6 +62,10 @@ def main() -> int:
     parser.add_argument("--max-seq-length", type=int, default=None)
     parser.add_argument("--top-k", type=int, default=5, help="Search top K")
     parser.add_argument("--mode", choices=["dense", "bm25", "hybrid", "hybrid-rerank"], default="dense")
+    parser.add_argument("--vector-index", choices=["flat", "hnsw"], default="flat")
+    parser.add_argument("--hnsw-m", type=int, default=DEFAULT_HNSW_M)
+    parser.add_argument("--hnsw-ef-construction", type=int, default=DEFAULT_HNSW_EF_CONSTRUCTION)
+    parser.add_argument("--hnsw-ef-search", type=int, default=DEFAULT_HNSW_EF_SEARCH)
     parser.add_argument("--dense-top-k", type=int, default=50)
     parser.add_argument("--bm25-top-k", type=int, default=50)
     parser.add_argument("--rrf-k", type=int, default=60)
@@ -89,6 +98,10 @@ def main() -> int:
         embed_batch_size=args.embed_batch_size,
         max_seq_length=args.max_seq_length,
         mode=args.mode,
+        vector_index=args.vector_index,
+        hnsw_m=args.hnsw_m,
+        hnsw_ef_construction=args.hnsw_ef_construction,
+        hnsw_ef_search=args.hnsw_ef_search,
         reranker_type=args.reranker_type,
         reranker_model=args.reranker_model,
         rerank_batch_size=args.rerank_batch_size,
@@ -161,6 +174,10 @@ def build_manager(
     reranker_model: str = DEFAULT_RERANKER_MODEL,
     rerank_batch_size: int = 16,
     rerank_max_length: int = 512,
+    vector_index: str = "flat",
+    hnsw_m: int = DEFAULT_HNSW_M,
+    hnsw_ef_construction: int = DEFAULT_HNSW_EF_CONSTRUCTION,
+    hnsw_ef_search: int = DEFAULT_HNSW_EF_SEARCH,
 ) -> RAGManager:
     resolved_bm25_index_path = bm25_index_path or derive_bm25_index_path(index_path)
 
@@ -180,7 +197,13 @@ def build_manager(
         if mode in {"dense", "hybrid", "hybrid-rerank"}
         else None
     )
-    vector_store = MemoryVectorStore(persist_path=index_path if index_path.exists() else None)
+    vector_store = load_vector_store(
+        index_path=index_path,
+        vector_index=vector_index,
+        hnsw_m=hnsw_m,
+        hnsw_ef_construction=hnsw_ef_construction,
+        hnsw_ef_search=hnsw_ef_search,
+    )
     bm25_index = BM25Index(persist_path=resolved_bm25_index_path) if mode in {"bm25", "hybrid", "hybrid-rerank"} else None
 
     if mode == "hybrid-rerank":
@@ -437,6 +460,10 @@ def build_eval_payload(
             "eval": args.eval,
             "model": args.model,
             "mode": args.mode,
+            "vector_index": args.vector_index,
+            "hnsw_m": args.hnsw_m,
+            "hnsw_ef_construction": args.hnsw_ef_construction,
+            "hnsw_ef_search": args.hnsw_ef_search,
             "top_k": args.top_k,
             "hit_ks": hit_ks,
             "dense_top_k": args.dense_top_k,

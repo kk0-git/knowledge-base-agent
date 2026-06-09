@@ -5,6 +5,7 @@ description = "Local Obsidian vault audit tool"
 requires-python = ">=3.11"
 dependencies = [
     "docling>=2.96.1",
+    "faiss-cpu>=1.14.2",
     "fastapi>=0.115.0",
     "mineru-open-sdk>=0.2.5",
     "pymupdf4llm>=1.27.2.3",

@@ -21,6 +21,10 @@ class ChunkerConfig:
     min_chunk_chars: kept for compatibility; short heading sections are not
         merged in this Lumina-style chunker.
     chunk_overlap: overlap budget in characters for overlong-section splits.
+    chunk_split_mode: overlong-section split implementation. "indexed" advances
+        over the original section line array and applies overlap by moving the
+        next start index; "streaming" keeps the previous accumulator behavior
+        for comparison.
     strip_code_blocks: kept for compatibility. Fenced code blocks are preserved
         as ordinary Markdown text, but overlong-section splitting avoids cutting
         inside fenced code blocks when possible.
@@ -30,6 +34,7 @@ class ChunkerConfig:
     target_chunk_chars: int = 900
     min_chunk_chars: int = 200
     chunk_overlap: int = 200
+    chunk_split_mode: str = "indexed"
     strip_code_blocks: bool = False
 
 
@@ -83,6 +88,11 @@ class HeadingChunker:
         return self.chunk_markdown(note_path=note_path, markdown=markdown)
 
     def _chunk_section(self, note_path: str, section: MarkdownSection) -> list[TextChunk]:
+        if self.config.chunk_split_mode == "indexed":
+            return self._chunk_section_indexed(note_path, section)
+        if self.config.chunk_split_mode != "streaming":
+            raise ValueError(f"Unsupported chunk_split_mode: {self.config.chunk_split_mode}")
+
         line_items = [
             LineItem(line_number=section.start_line + index, text=line)
             for index, line in enumerate(section.lines)
@@ -143,7 +153,10 @@ class HeadingChunker:
                     )
                 split_index_in_section += 1
 
-            overlap_lines = get_overlap_lines(first_part, self.config.chunk_overlap)
+            overlap_lines = ensure_progressing_overlap(
+                first_part,
+                get_overlap_lines(first_part, self.config.chunk_overlap),
+            )
             current = overlap_lines + second_part
             current_length = line_items_char_length(current)
 
@@ -157,6 +170,82 @@ class HeadingChunker:
                     split_reason="section_end",
                 )
             )
+
+        return chunks
+
+    def _chunk_section_indexed(self, note_path: str, section: MarkdownSection) -> list[TextChunk]:
+        line_items = [
+            LineItem(line_number=section.start_line + index, text=line)
+            for index, line in enumerate(section.lines)
+        ]
+
+        chunks: list[TextChunk] = []
+        start_index = 0
+        split_index_in_section = 0
+
+        while start_index < len(line_items):
+            end_index = start_index
+            current_length = 0
+
+            while end_index < len(line_items):
+                current_length += len(line_items[end_index].text) + 1
+                end_index += 1
+                if current_length > self.config.max_chunk_chars:
+                    break
+
+            window = line_items[start_index:end_index]
+            if current_length <= self.config.max_chunk_chars:
+                if has_content(window):
+                    chunks.append(
+                        create_chunk(
+                            note_path=note_path,
+                            heading_path=section.heading_path,
+                            line_items=window,
+                            split_index_in_section=split_index_in_section,
+                            split_reason="section_end",
+                        )
+                    )
+                break
+
+            raw_split_point = find_split_point([line.text for line in window])
+            split_point, split_reason = adjust_split_point_for_fenced_code(
+                window,
+                raw_split_point,
+                self.config,
+            )
+            first_part_too_short = (
+                0 < split_point < len(window)
+                and line_items_char_length(window[:split_point]) < minimum_split_chars(self.config)
+            )
+
+            if split_point <= 0 or split_point >= len(window) or first_part_too_short:
+                split_point = len(window)
+                split_reason = "oversized_code_block" if split_reason == "oversized_code_block" else "force_split"
+
+            first_part = window[:split_point]
+            if not has_content(first_part):
+                start_index = max(start_index + 1, start_index + split_point)
+                continue
+
+            chunks.append(
+                create_chunk(
+                    note_path=note_path,
+                    heading_path=section.heading_path,
+                    line_items=first_part,
+                    split_index_in_section=split_index_in_section,
+                    split_reason=split_reason,
+                )
+            )
+            split_index_in_section += 1
+
+            overlap_lines = ensure_progressing_overlap(
+                first_part,
+                get_overlap_lines(first_part, self.config.chunk_overlap),
+            )
+            next_start_index = start_index + len(first_part) - len(overlap_lines)
+            if next_start_index <= start_index:
+                next_start_index = start_index + 1
+            start_index = next_start_index
 
         return chunks
 
@@ -377,8 +466,43 @@ def find_split_point(lines: list[str]) -> int:
         if LIST_ITEM_RE.match(lines[index]):
             return index
 
-    # Fallback: split at 75% of the accumulated lines.
-    return max(1, int(len(lines) * 0.75))
+    # Fallback: split near 75% of accumulated characters. The split trigger is
+    # character-based, so fallback should use the same scale instead of line count.
+    return find_char_ratio_split_point(lines, ratio=0.75)
+
+
+def find_char_ratio_split_point(lines: list[str], ratio: float) -> int:
+    if len(lines) <= 1:
+        return len(lines)
+
+    total_chars = sum(len(line) + 1 for line in lines)
+    target_chars = max(1, int(total_chars * ratio))
+    running_chars = 0
+
+    for index, line in enumerate(lines, start=1):
+        running_chars += len(line) + 1
+        if running_chars >= target_chars:
+            return min(index, len(lines) - 1)
+
+    return max(1, len(lines) - 1)
+
+
+def ensure_progressing_overlap(
+    first_part: list[LineItem],
+    overlap_lines: list[LineItem],
+) -> list[LineItem]:
+    if not first_part or not overlap_lines:
+        return overlap_lines
+
+    if len(overlap_lines) >= len(first_part):
+        return overlap_lines[1:]
+
+    first_line = first_part[0].line_number
+    overlap_first_line = overlap_lines[0].line_number
+    if overlap_first_line <= first_line:
+        return overlap_lines[1:]
+
+    return overlap_lines
 
 
 def adjust_split_point_for_fenced_code(

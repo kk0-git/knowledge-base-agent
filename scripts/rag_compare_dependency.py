@@ -22,8 +22,13 @@ from services.rag.bm25 import BM25Index
 from services.rag.chunker import HeadingChunker
 from services.rag.embedder import create_embedder
 from services.rag.manager import RAGManager
-from services.rag.memory_vector_store import MemoryVectorStore
 from services.rag.reranker import DEFAULT_RERANKER_MODEL, CrossEncoderReranker, DashScopeReranker
+from services.rag.vector_store_loader import (
+    DEFAULT_HNSW_EF_CONSTRUCTION,
+    DEFAULT_HNSW_EF_SEARCH,
+    DEFAULT_HNSW_M,
+    load_vector_store,
+)
 
 
 DEFAULT_MODEL = "BAAI/bge-m3"
@@ -52,6 +57,10 @@ def main() -> int:
     parser.add_argument("--embedding-provider", choices=["local", "openai_compatible"], default="local")
     parser.add_argument("--embed-batch-size", type=int, default=32)
     parser.add_argument("--max-seq-length", type=int, default=None)
+    parser.add_argument("--vector-index", choices=["flat", "hnsw"], default="flat")
+    parser.add_argument("--hnsw-m", type=int, default=DEFAULT_HNSW_M)
+    parser.add_argument("--hnsw-ef-construction", type=int, default=DEFAULT_HNSW_EF_CONSTRUCTION)
+    parser.add_argument("--hnsw-ef-search", type=int, default=DEFAULT_HNSW_EF_SEARCH)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--hit-ks", default="1,3,5,10,20")
     parser.add_argument("--dense-top-k", type=int, default=50)
@@ -266,7 +275,13 @@ def ensure_dependency(
         if name == "vector_store":
             if not index_path.exists():
                 raise FileNotFoundError(f"Vector index not found: {index_path}")
-            state.resources[name] = MemoryVectorStore(persist_path=index_path)
+            state.resources[name] = load_vector_store(
+                index_path=index_path,
+                vector_index=args.vector_index,
+                hnsw_m=args.hnsw_m,
+                hnsw_ef_construction=args.hnsw_ef_construction,
+                hnsw_ef_search=args.hnsw_ef_search,
+            )
         elif name == "embedder":
             state.resources[name] = create_embedder(
                 provider=args.embedding_provider,
@@ -330,6 +345,10 @@ def strategy_config(
         "eval": args.eval,
         "model": args.model,
         "embedding_provider": args.embedding_provider,
+        "vector_index": args.vector_index,
+        "hnsw_m": args.hnsw_m,
+        "hnsw_ef_construction": args.hnsw_ef_construction,
+        "hnsw_ef_search": args.hnsw_ef_search,
         "embed_batch_size": args.embed_batch_size,
         "max_seq_length": args.max_seq_length,
         "top_k": args.top_k,
