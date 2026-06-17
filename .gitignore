@@ -26,3 +26,8 @@ audit-output/
 # OS
 .DS_Store
 Thumbs.db
+
+DECISIONS.md
+eval-results/
+wiki-state/
+workspace-config.json

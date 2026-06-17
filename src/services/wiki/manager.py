@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,16 +46,25 @@ class WikiManager:
         self.tag_extractor = LLMTagExtractor(client=llm_client, model=llm_model)
         self.synthesizer = WikiSynthesizer(client=llm_client, model=llm_model)
 
-    def tag_changed_notes(self, *, force: bool = False, limit: int | None = None) -> dict:
+    def tag_changed_notes(
+        self,
+        *,
+        force: bool = False,
+        limit: int | None = None,
+        changed_note_paths: list[str] | None = None,
+    ) -> dict:
         state = self.state_store.load()
-        markdown_files = list(scan_markdown_files(self.vault_root))
+        markdown_files = list(scan_markdown_files(self.vault_root, excluded_roots=[self.wiki_dir]))
         current_paths = {file.relative_to(self.vault_root).as_posix(): file for file in markdown_files}
         existing_tag_tree = build_existing_tag_tree(state, markdown_files, self.vault_root)
+        changed_filter = set(changed_note_paths) if changed_note_paths is not None else None
 
         files = dict(state.files)
         tagged = 0
         skipped = 0
         failed = 0
+        tagged_paths: list[str] = []
+        failed_paths: list[str] = []
 
         for note_path, file_path in sorted(current_paths.items()):
             if limit is not None and tagged >= limit:
@@ -61,6 +72,9 @@ class WikiManager:
 
             content_hash = calculate_content_hash(file_path)
             previous = files.get(note_path)
+            if changed_filter is not None and note_path not in changed_filter:
+                skipped += 1
+                continue
             if not force and previous and previous.content_hash == content_hash:
                 skipped += 1
                 continue
@@ -81,8 +95,10 @@ class WikiManager:
                 )
                 files[note_path] = record
                 tagged += 1
+                tagged_paths.append(note_path)
             except Exception as exc:
                 failed += 1
+                failed_paths.append(note_path)
                 files[note_path] = NoteTagRecord(
                     note_path=note_path,
                     content_hash=content_hash,
@@ -111,6 +127,8 @@ class WikiManager:
             "failed": failed,
             "deleted": len(deleted_paths),
             "tags": len(new_state.tags),
+            "tagged_paths": tagged_paths,
+            "failed_paths": failed_paths,
         }
 
     def synthesize_dirty_wikis(
@@ -119,6 +137,7 @@ class WikiManager:
         force: bool = False,
         limit: int | None = None,
         policy_filter: str | None = None,
+        tag_filter: str | None = None,
     ) -> dict:
         state = rebuild_tag_index(
             self.state_store.load(),
@@ -128,6 +147,11 @@ class WikiManager:
         generated = 0
         skipped = 0
         failed = 0
+        failed_tags: list[dict] = []
+        retried_tags: list[dict] = []
+
+        if tag_filter is not None and tag_filter not in tags:
+            raise ValueError(f"Tag not found in wiki state: {tag_filter}")
 
         for tag, tag_record in sorted(
             tags.items(),
@@ -135,6 +159,9 @@ class WikiManager:
         ):
             if limit is not None and generated >= limit:
                 break
+            if tag_filter and tag != tag_filter:
+                skipped += 1
+                continue
             if policy_filter and tag_record.wiki_policy != policy_filter:
                 skipped += 1
                 continue
@@ -148,6 +175,7 @@ class WikiManager:
                 skipped += 1
                 continue
 
+            retry_info = {"attempts": 1, "errors": []}
             try:
                 all_source_records = [
                     state.files[path]
@@ -170,6 +198,8 @@ class WikiManager:
                     current_tag=tag,
                     current_record=tag_record,
                     all_tags=tags,
+                    wiki_dir=self.wiki_dir,
+                    vault_root=self.vault_root,
                 )
                 synthesis_input = WikiSynthesisInput(
                     tag=tag,
@@ -178,10 +208,20 @@ class WikiManager:
                     related_wiki_pages=related_wiki_pages,
                     source_limit_notice=source_limit_notice,
                 )
-                if tag_record.wiki_policy == "overview":
-                    body = self.synthesizer.synthesize_overview(synthesis_input)
-                else:
-                    body = self.synthesizer.synthesize(synthesis_input)
+                body, retry_info = synthesize_with_retry(
+                    synthesizer=self.synthesizer,
+                    synthesis_input=synthesis_input,
+                    wiki_policy=tag_record.wiki_policy,
+                )
+                if retry_info["attempts"] > 1:
+                    retried_tags.append(
+                        {
+                            "tag": tag,
+                            "attempts": retry_info["attempts"],
+                            "errors": retry_info["errors"],
+                            "succeeded": True,
+                        }
+                    )
                 source_hashes = {
                     record.note_path: record.content_hash
                     for record in all_source_records
@@ -195,6 +235,10 @@ class WikiManager:
                     generated_at=tag_record.generated_at or now_iso(),
                     updated_at=now_iso(),
                     source_hashes=source_hashes,
+                    last_error=None,
+                    last_error_type=None,
+                    last_error_at=None,
+                    retry_count=0,
                 )
                 wiki_path.write_text(
                     render_wiki_markdown(
@@ -209,15 +253,52 @@ class WikiManager:
                 )
                 tags[tag] = new_record
                 generated += 1
-            except Exception:
+            except Exception as exc:
                 failed += 1
+                error_detail = wiki_synthesis_error_to_dict(
+                    tag,
+                    exc,
+                    tag_record,
+                    attempts=int(retry_info.get("attempts", 1)),
+                    retry_errors=list(retry_info.get("errors", [])),
+                )
+                failed_tags.append(error_detail)
+                tags[tag] = replace(
+                    tag_record,
+                    dirty=True,
+                    last_error=error_detail["message"],
+                    last_error_type=error_detail["error_type"],
+                    last_error_at=error_detail["error_at"],
+                    retry_count=tag_record.retry_count + error_detail["attempts"],
+                )
 
         self.state_store.save(WikiState(files=state.files, tags=tags))
         return {
             "generated": generated,
             "skipped": skipped,
             "failed": failed,
+            "failed_tags": failed_tags,
+            "retried_tags": retried_tags,
             "tags": len(tags),
+        }
+
+    def synthesize_tag(self, tag: str, *, force: bool = False) -> dict:
+        return self.synthesize_dirty_wikis(force=force, tag_filter=tag)
+
+    def read_wiki(self, tag: str) -> dict:
+        state = rebuild_tag_index(
+            self.state_store.load(),
+            overview_note_threshold=self.overview_note_threshold,
+        )
+        if tag not in state.tags:
+            raise ValueError(f"Tag not found in wiki state: {tag}")
+        wiki_path = wiki_path_for_tag(self.wiki_dir, tag)
+        if not wiki_path.exists():
+            raise FileNotFoundError(f"Wiki file has not been generated for tag: {tag}")
+        return {
+            "tag": tag,
+            "wiki_path": display_path(wiki_path, self.vault_root),
+            "content": wiki_path.read_text(encoding="utf-8", errors="ignore"),
         }
 
     def report(self) -> dict:
@@ -227,6 +308,8 @@ class WikiManager:
         )
         tag_rows = []
         for tag, record in sorted(state.tags.items(), key=lambda item: (-len(item[1].source_paths), item[0])):
+            wiki_path = wiki_path_for_tag(self.wiki_dir, tag)
+            wiki_exists = wiki_path.exists()
             tag_rows.append(
                 {
                     "tag": tag,
@@ -239,7 +322,25 @@ class WikiManager:
                     "dirty": record.dirty,
                     "wiki_policy": record.wiki_policy,
                     "wiki_policy_source": record.wiki_policy_source,
-                    "wiki_path": record.wiki_path,
+                    "wiki_path": display_path(wiki_path, self.vault_root),
+                    "wiki_exists": wiki_exists,
+                    "wiki_preview": read_wiki_preview(wiki_path) if wiki_exists else "",
+                    "wiki_modified_at": datetime.fromtimestamp(
+                        wiki_path.stat().st_mtime,
+                        tz=timezone.utc,
+                    ).isoformat()
+                    if wiki_exists
+                    else None,
+                    "last_error": record.last_error,
+                    "last_error_type": record.last_error_type,
+                    "last_error_at": record.last_error_at,
+                    "retry_count": record.retry_count,
+                    "retryable": is_retryable_wiki_error(
+                        record.last_error_type or "",
+                        record.last_error or "",
+                    )
+                    if record.last_error
+                    else False,
                     "review_hints": build_review_hints(tag, record),
                     "eligible": record.wiki_policy != "skip"
                     and should_generate_tag(record, self.min_notes_per_tag, self.min_tag_depth),
@@ -250,6 +351,7 @@ class WikiManager:
             "tags": len(state.tags),
             "eligible_tags": sum(1 for row in tag_rows if row["eligible"]),
             "dirty_tags": sum(1 for row in tag_rows if row["dirty"]),
+            "failed_wikis": sum(1 for row in tag_rows if row.get("last_error")),
             "tag_rows": tag_rows,
         }
 
@@ -304,7 +406,11 @@ def rebuild_tag_index(state: WikiState, *, overview_note_threshold: int = 30) ->
             wiki_policy_source=policy_source,
             generated_at=previous.generated_at if previous else None,
             updated_at=previous.updated_at if previous else None,
-            source_hashes=previous.source_hashes if previous else {},
+            source_hashes=source_hashes,
+            last_error=previous.last_error if previous else None,
+            last_error_type=previous.last_error_type if previous else None,
+            last_error_at=previous.last_error_at if previous else None,
+            retry_count=previous.retry_count if previous else 0,
         )
 
     return WikiState(files=state.files, tags=tags)
@@ -421,13 +527,15 @@ def build_related_wiki_pages(
     current_tag: str,
     current_record: WikiTagRecord,
     all_tags: dict[str, WikiTagRecord],
+    wiki_dir: Path,
+    vault_root: Path,
     limit: int = 8,
 ) -> list[RelatedWikiPage]:
     pages: list[tuple[int, RelatedWikiPage]] = []
     current_sources = set(current_record.source_paths)
 
     for tag, record in all_tags.items():
-        if tag == current_tag or not record.wiki_path:
+        if tag == current_tag:
             continue
 
         overlap = len(current_sources & set(record.source_paths))
@@ -449,7 +557,7 @@ def build_related_wiki_pages(
                 score,
                 RelatedWikiPage(
                     tag=tag,
-                    wiki_path=record.wiki_path,
+                    wiki_path=display_path(wiki_path_for_tag(wiki_dir, tag), vault_root),
                     relation=", ".join(relation_parts),
                 ),
             )
@@ -550,12 +658,27 @@ def is_prefix(prefix: list[str], value: list[str]) -> bool:
     return len(prefix) < len(value) and value[: len(prefix)] == prefix
 
 
-def scan_markdown_files(vault_root: Path):
+def scan_markdown_files(vault_root: Path, excluded_roots: list[Path] | None = None):
+    excluded_resolved = [
+        root.resolve()
+        for root in (excluded_roots or [])
+    ]
     for path in vault_root.rglob("*.md"):
+        resolved_path = path.resolve()
+        if any(is_relative_to_path(resolved_path, root) for root in excluded_resolved):
+            continue
         rel_parts = path.relative_to(vault_root).parts
-        if any(part in DEFAULT_EXCLUDED_DIRS for part in rel_parts):
+        if any(part in DEFAULT_EXCLUDED_DIRS or part.startswith("wiki_") for part in rel_parts):
             continue
         yield path
+
+
+def is_relative_to_path(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def build_existing_tag_tree(
@@ -635,5 +758,112 @@ def display_path(path: Path, root: Path) -> str:
         return path.as_posix()
 
 
+def read_wiki_preview(path: Path, max_chars: int = 180) -> str:
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    lines: list[str] = []
+    skip_section = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("---"):
+            continue
+        if line.startswith("# "):
+            continue
+        if line.startswith("## "):
+            heading = line.lstrip("#").strip()
+            skip_section = heading in {"相关 wiki", "来源"}
+            continue
+        if skip_section:
+            continue
+        if line.startswith("[[") or line.startswith("- [["):
+            continue
+        cleaned = line.lstrip("- ").strip()
+        if cleaned:
+            lines.append(cleaned)
+        if len(" ".join(lines)) >= max_chars:
+            break
+    preview = " ".join(lines)
+    return preview[:max_chars].strip()
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def synthesize_with_retry(
+    *,
+    synthesizer: WikiSynthesizer,
+    synthesis_input: WikiSynthesisInput,
+    wiki_policy: str,
+    max_retries: int = 2,
+    base_delay_seconds: float = 3.0,
+) -> tuple[str, dict]:
+    errors: list[dict] = []
+    max_attempts = max_retries + 1
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if wiki_policy == "overview":
+                body = synthesizer.synthesize_overview(synthesis_input)
+            else:
+                body = synthesizer.synthesize(synthesis_input)
+            return body, {"attempts": attempt, "errors": errors}
+        except Exception as exc:
+            retryable = is_retryable_wiki_error(type(exc).__name__, str(exc))
+            errors.append(
+                {
+                    "attempt": attempt,
+                    "error_type": type(exc).__name__,
+                    "message": str(exc) or type(exc).__name__,
+                    "retryable": retryable,
+                }
+            )
+            if not retryable or attempt >= max_attempts:
+                raise
+
+            delay = base_delay_seconds * (2 ** (attempt - 1)) + random.uniform(0, 0.75)
+            time.sleep(delay)
+
+    raise RuntimeError("unreachable wiki synthesis retry state")
+
+
+def wiki_synthesis_error_to_dict(
+    tag: str,
+    exc: Exception,
+    record: WikiTagRecord,
+    *,
+    attempts: int = 1,
+    retry_errors: list[dict] | None = None,
+) -> dict:
+    error_type = type(exc).__name__
+    message = str(exc) or error_type
+    return {
+        "tag": tag,
+        "error_type": error_type,
+        "message": message,
+        "retryable": is_retryable_wiki_error(error_type, message),
+        "error_at": now_iso(),
+        "attempts": attempts,
+        "retry_count": record.retry_count + attempts,
+        "retry_errors": retry_errors or [],
+    }
+
+
+def is_retryable_wiki_error(error_type: str, message: str) -> bool:
+    text = f"{error_type} {message}".lower()
+    retryable_markers = [
+        "timeout",
+        "timed out",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "connection",
+        "ssl",
+        "eof",
+        "rate limit",
+        "temporarily",
+    ]
+    return any(marker in text for marker in retryable_markers)

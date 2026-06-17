@@ -2,22 +2,29 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict
+import threading
+import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from knowledge_base_agent.config import load_llm_config
 from knowledge_base_agent.llm import create_llm_client
+from knowledge_base_agent.llm.schema import LLMRequest
 from services.rag.agent_answer import (
     AgentAnswerConfig,
     AgentAnswerPipeline,
     agent_retrieval_result_to_dict,
 )
 from services.rag.intent_router import ConversationCommand, LLMIntentRouter
+from services.rag.index_sync import RAGIndexSyncConfig, sync_rag_index
 from services.rag.online_search import OnlineSearchClient
 from services.rag.reranker import DEFAULT_RERANKER_MODEL
 from services.rag.search_service import SearchOptions, SearchService
@@ -26,6 +33,20 @@ from services.rag.vector_store_loader import (
     DEFAULT_HNSW_EF_SEARCH,
     DEFAULT_HNSW_M,
 )
+from services.wiki.manager import WikiManager, rebuild_tag_index, set_tag_policy
+from services.wiki.report_writer import write_obsidian_wiki_report
+from services.wiki.state_store import WikiStateStore
+from services.wiki.tag_consolidation import (
+    LLMTagConsolidator,
+    propose_deterministic_cleanup,
+    tag_cleanup_proposal_to_dict,
+)
+from services.wiki.tag_refinement import LLMTagRefiner, tag_refinement_proposal_to_dict
+from services.workflows.context_builder import ContextBuilder
+from services.workflows.interview import build_interview_messages
+from services.workflows.runner import WorkflowRunner, task_result_to_dict
+from services.workflows.schema import ScopeSpec, WorkflowSpec, WritebackSpec
+from services.workflows.scope_resolver import ScopeResolver
 
 
 class SearchRequest(BaseModel):
@@ -48,7 +69,12 @@ class SearchRequest(BaseModel):
 
 class AgentRequest(BaseModel):
     query: str = Field(default="")
+    chat_mode: str = Field(default="answer")
     command: str = Field(default="auto")
+    scope_type: str = Field(default="tag")
+    scope_value: str | None = Field(default=None)
+    scope_paths: list[str] = Field(default_factory=list)
+    chat_history: list[dict[str, str]] = Field(default_factory=list)
     notes_top_k: int = Field(default=5, ge=1, le=50)
     regex_top_k: int = Field(default=8, ge=1, le=50)
     bm25_top_k: int = Field(default=8, ge=1, le=50)
@@ -60,6 +86,293 @@ class AgentRequest(BaseModel):
     online_provider: str | None = Field(default=None)
     online_top_k: int = Field(default=5, ge=1, le=20)
     speculative_notes_search: bool = Field(default=True)
+    interview_max_chars_per_note: int = Field(default=4000, ge=500, le=12000)
+    interview_max_context_chars: int = Field(default=24000, ge=2000, le=60000)
+
+
+class WikiSynthesizeTagRequest(BaseModel):
+    tag: str = Field(default="")
+    force: bool = Field(default=True)
+
+
+class WikiSyncRequest(BaseModel):
+    force: bool = Field(default=False)
+    limit: int | None = Field(default=None, ge=0)
+    include_embedding: bool = Field(default=True)
+    allow_full_rebuild: bool = Field(default=False)
+
+
+class WikiRefineTagRequest(BaseModel):
+    tag: str = Field(default="")
+
+
+class WikiConsolidateTagsRequest(BaseModel):
+    include_llm: bool = Field(default=False)
+
+
+class WikiSetPolicyRequest(BaseModel):
+    tag: str = Field(default="")
+    policy: str = Field(default="")
+
+
+class WorkspaceConfigRequest(BaseModel):
+    vault_path: str = Field(default="")
+    wiki_dir: str = Field(default="")
+    wiki_state_path: str = Field(default="")
+    workspace_state_path: str = Field(default="")
+    index_path: str = Field(default="")
+    bm25_index_path: str = Field(default="")
+    min_notes_per_tag: int = Field(default=2, ge=1)
+    overview_note_threshold: int = Field(default=12, ge=1)
+
+
+class WorkflowScopeRequest(BaseModel):
+    type: str = Field(default="search")
+    value: str | None = Field(default=None)
+    paths: list[str] = Field(default_factory=list)
+    top_k: int = Field(default=8, ge=1, le=100)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowWritebackRequest(BaseModel):
+    type: str = Field(default="none")
+    path: str | None = Field(default=None)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowRunRequest(BaseModel):
+    task_type: str = Field(default="answer")
+    scope: WorkflowScopeRequest = Field(default_factory=WorkflowScopeRequest)
+    user_request: str = Field(default="")
+    context_mode: str | None = Field(default=None)
+    writeback: WorkflowWritebackRequest = Field(default_factory=WorkflowWritebackRequest)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
+@dataclass
+class WorkspaceRuntimeConfig:
+    vault_path: Path | None
+    wiki_dir: Path | None
+    wiki_state_path: Path | None
+    workspace_state_path: Path | None
+    index_path: Path
+    bm25_index_path: Path
+    min_notes_per_tag: int
+    overview_note_threshold: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "vault_path": str(self.vault_path) if self.vault_path else "",
+            "wiki_dir": str(self.wiki_dir) if self.wiki_dir else "",
+            "wiki_state_path": str(self.wiki_state_path) if self.wiki_state_path else "",
+            "workspace_state_path": str(self.workspace_state_path) if self.workspace_state_path else "",
+            "index_path": str(self.index_path),
+            "bm25_index_path": str(self.bm25_index_path),
+            "min_notes_per_tag": self.min_notes_per_tag,
+            "overview_note_threshold": self.overview_note_threshold,
+        }
+
+
+@dataclass
+class PipelineTask:
+    task_id: str
+    kind: str
+    status: str
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    current_step: str | None = None
+    events: list[dict[str, Any]] | None = None
+    result: Any = None
+    error: str | None = None
+    error_type: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "kind": self.kind,
+            "status": self.status,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "current_step": self.current_step,
+            "events": list(self.events or []),
+            "result": self.result,
+            "error": self.error,
+            "error_type": self.error_type,
+        }
+
+
+class PipelineTaskContext:
+    def __init__(self, manager: "PipelineTaskManager", task_id: str) -> None:
+        self.manager = manager
+        self.task_id = task_id
+
+    def emit(self, event: str, payload: dict[str, Any] | None = None) -> None:
+        self.manager.emit(self.task_id, event, payload or {})
+
+
+class PipelineTaskManager:
+    def __init__(self, *, max_workers: int = 1, max_events: int = 200) -> None:
+        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="pipeline-task")
+        self.max_events = max_events
+        self.lock = threading.Lock()
+        self.tasks: dict[str, PipelineTask] = {}
+
+    def submit(self, kind: str, fn: Callable[[PipelineTaskContext], Any]) -> PipelineTask:
+        task_id = uuid.uuid4().hex
+        task = PipelineTask(
+            task_id=task_id,
+            kind=kind,
+            status="queued",
+            created_at=utc_now_iso(),
+            events=[],
+        )
+        with self.lock:
+            self.tasks[task_id] = task
+        self.executor.submit(self._run, task_id, fn)
+        return task
+
+    def get(self, task_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            task = self.tasks.get(task_id)
+            return task.to_dict() if task else None
+
+    def list_recent(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.lock:
+            tasks = sorted(self.tasks.values(), key=lambda task: task.created_at, reverse=True)
+            return [task.to_dict() for task in tasks[:limit]]
+
+    def emit(self, task_id: str, event: str, payload: dict[str, Any]) -> None:
+        with self.lock:
+            task = self.tasks.get(task_id)
+            if not task:
+                return
+            task.current_step = event
+            task.events = task.events or []
+            task.events.append(
+                {
+                    "at": utc_now_iso(),
+                    "event": event,
+                    "payload": payload,
+                }
+            )
+            if len(task.events) > self.max_events:
+                task.events = task.events[-self.max_events :]
+
+    def _run(self, task_id: str, fn: Callable[[PipelineTaskContext], Any]) -> None:
+        with self.lock:
+            task = self.tasks[task_id]
+            task.status = "running"
+            task.started_at = utc_now_iso()
+            task.current_step = "started"
+        context = PipelineTaskContext(self, task_id)
+        context.emit("started", {})
+        try:
+            result = fn(context)
+            with self.lock:
+                task = self.tasks[task_id]
+                task.status = "succeeded"
+                task.result = result
+                task.finished_at = utc_now_iso()
+                task.current_step = "succeeded"
+        except Exception as exc:
+            with self.lock:
+                task = self.tasks[task_id]
+                task.status = "failed"
+                task.error_type = type(exc).__name__
+                task.error = f"{type(exc).__name__}: {exc}"
+                task.result = {"traceback": traceback.format_exc()}
+                task.finished_at = utc_now_iso()
+                task.current_step = "failed"
+
+
+def load_workspace_runtime_config(
+    *,
+    config_path: Path,
+    default_config: WorkspaceRuntimeConfig,
+) -> WorkspaceRuntimeConfig:
+    if not config_path.exists():
+        return default_config
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        request = WorkspaceConfigRequest(**data)
+        return workspace_config_from_request(
+            request=request,
+            project_root=config_path.parent,
+            fallback=default_config,
+        )
+    except Exception:
+        return default_config
+
+
+def save_workspace_runtime_config(path: Path, config: WorkspaceRuntimeConfig) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def workspace_config_from_request(
+    *,
+    request: WorkspaceConfigRequest,
+    project_root: Path,
+    fallback: WorkspaceRuntimeConfig,
+) -> WorkspaceRuntimeConfig:
+    vault = parse_optional_path(request.vault_path)
+    wiki_dir = parse_optional_path(request.wiki_dir)
+    wiki_state = parse_optional_path(request.wiki_state_path)
+    workspace_state = parse_optional_path(request.workspace_state_path)
+    index = parse_optional_path(request.index_path)
+    bm25_index = parse_optional_path(request.bm25_index_path)
+
+    if vault and not wiki_dir:
+        wiki_dir = vault / "wiki"
+    if not wiki_state:
+        wiki_state = fallback.wiki_state_path or (project_root / "wiki-state" / "wiki_state.json")
+    if not workspace_state:
+        workspace_state = fallback.workspace_state_path or (project_root / "wiki-state" / "workspace_state.json")
+    if not index:
+        index = fallback.index_path
+    if not bm25_index:
+        bm25_index = fallback.bm25_index_path
+
+    return WorkspaceRuntimeConfig(
+        vault_path=vault,
+        wiki_dir=wiki_dir,
+        wiki_state_path=wiki_state,
+        workspace_state_path=workspace_state,
+        index_path=index,
+        bm25_index_path=bm25_index,
+        min_notes_per_tag=request.min_notes_per_tag,
+        overview_note_threshold=request.overview_note_threshold,
+    )
+
+
+def parse_optional_path(value: str) -> Path | None:
+    cleaned = str(value or "").strip().strip('"')
+    return Path(cleaned).expanduser() if cleaned else None
+
+
+def validate_workspace_config(config: WorkspaceRuntimeConfig) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if config.vault_path is None:
+        errors.append("请填写笔记库路径。")
+    elif not config.vault_path.exists() or not config.vault_path.is_dir():
+        errors.append(f"笔记库路径不存在或不是目录：{config.vault_path}")
+    if config.wiki_dir is None:
+        warnings.append("未设置 wiki 输出目录，将无法写入 wiki 报告。")
+    if config.wiki_state_path is None:
+        errors.append("请填写 wiki state 路径。")
+    if config.workspace_state_path is None:
+        errors.append("请填写 workspace state 路径。")
+    if not config.index_path.parent.exists():
+        warnings.append(f"索引目录不存在，将在同步时创建：{config.index_path.parent}")
+    return {
+        "ok": not errors,
+        "message": "；".join(errors or warnings or ["配置可用。"]),
+        "errors": errors,
+        "warnings": warnings,
+    }
 
 
 def create_app(
@@ -75,8 +388,44 @@ def create_app(
     hnsw_m: int = DEFAULT_HNSW_M,
     hnsw_ef_construction: int = DEFAULT_HNSW_EF_CONSTRUCTION,
     hnsw_ef_search: int = DEFAULT_HNSW_EF_SEARCH,
+    max_chunk_chars: int = 1500,
+    target_chunk_chars: int = 900,
+    min_chunk_chars: int = 200,
+    chunk_overlap: int = 200,
+    chunk_split_mode: str = "indexed",
+    strip_code_blocks: bool = False,
+    wiki_state_path: Path | None = None,
+    wiki_dir: Path | None = None,
+    wiki_min_notes_per_tag: int = 2,
+    wiki_overview_note_threshold: int = 12,
+    sync_on_start: bool = False,
 ) -> FastAPI:
-    app = FastAPI(title="Knowledge Agent Search")
+    app = FastAPI(title="知识库助手")
+    config_path = project_root / "workspace-config.json"
+    runtime_config = load_workspace_runtime_config(
+        config_path=config_path,
+        default_config=WorkspaceRuntimeConfig(
+            vault_path=vault_path,
+            wiki_dir=wiki_dir,
+            wiki_state_path=wiki_state_path,
+            workspace_state_path=project_root / "wiki-state" / "workspace_state.json",
+            index_path=index_path,
+            bm25_index_path=bm25_index_path or index_path.with_suffix(".bm25.json"),
+            min_notes_per_tag=wiki_min_notes_per_tag,
+            overview_note_threshold=wiki_overview_note_threshold,
+        ),
+    )
+    startup_sync_status: dict[str, Any] = {
+        "enabled": sync_on_start,
+        "running": False,
+        "started_at": None,
+        "finished_at": None,
+        "failed": False,
+        "error": None,
+        "result": None,
+        "task_id": None,
+    }
+    task_manager = PipelineTaskManager(max_workers=1)
     service = SearchService(
         index_path=index_path,
         bm25_index_path=bm25_index_path,
@@ -92,12 +441,36 @@ def create_app(
     )
 
     @app.get("/", response_class=HTMLResponse)
+    def home() -> str:
+        return CHAT_HTML
+
+    @app.get("/search", response_class=HTMLResponse)
     def index() -> str:
         return INDEX_HTML
 
     @app.get("/chat", response_class=HTMLResponse)
     def chat() -> str:
         return CHAT_HTML
+
+    @app.get("/topics", response_class=HTMLResponse)
+    def topics() -> str:
+        return TOPICS_HTML
+
+    @app.get("/audit", response_class=HTMLResponse)
+    def audit() -> str:
+        return AUDIT_HTML
+
+    @app.get("/organize", response_class=HTMLResponse)
+    def organize() -> str:
+        return AUDIT_HTML
+
+    @app.get("/wiki", response_class=HTMLResponse)
+    def wiki() -> str:
+        return WIKI_HTML
+
+    @app.get("/admin/wiki", response_class=HTMLResponse)
+    def admin_wiki() -> str:
+        return WIKI_HTML
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -113,7 +486,60 @@ def create_app(
                 "ef_construction": hnsw_ef_construction,
                 "ef_search": hnsw_ef_search,
             },
+            "wiki": {
+                "enabled": runtime_config.vault_path is not None and runtime_config.wiki_state_path is not None,
+                "state": str(runtime_config.wiki_state_path) if runtime_config.wiki_state_path else None,
+                "wiki_dir": str(runtime_config.wiki_dir) if runtime_config.wiki_dir else None,
+                "min_notes_per_tag": runtime_config.min_notes_per_tag,
+                "overview_note_threshold": runtime_config.overview_note_threshold,
+                "sync_on_start": sync_on_start,
+                "startup_sync": startup_sync_status,
+            },
+            "chunker": {
+                "max_chunk_chars": max_chunk_chars,
+                "target_chunk_chars": target_chunk_chars,
+                "min_chunk_chars": min_chunk_chars,
+                "chunk_overlap": chunk_overlap,
+                "chunk_split_mode": chunk_split_mode,
+                "strip_code_blocks": strip_code_blocks,
+            },
         }
+
+    @app.get("/settings", response_class=HTMLResponse)
+    def settings() -> str:
+        return SETTINGS_HTML
+
+    @app.get("/api/workspace/config")
+    def workspace_config() -> dict[str, Any]:
+        return {
+            "config": runtime_config.to_dict(),
+            "config_path": str(config_path),
+            "validation": validate_workspace_config(runtime_config),
+        }
+
+    @app.post("/api/workspace/config")
+    def save_workspace_config(request: WorkspaceConfigRequest) -> dict[str, Any]:
+        nonlocal runtime_config
+        try:
+            next_config = workspace_config_from_request(
+                request=request,
+                project_root=project_root,
+                fallback=runtime_config,
+            )
+            validation = validate_workspace_config(next_config)
+            if not validation["ok"]:
+                raise HTTPException(status_code=400, detail=validation["message"])
+            save_workspace_runtime_config(config_path, next_config)
+            runtime_config = next_config
+            return {
+                "config": runtime_config.to_dict(),
+                "config_path": str(config_path),
+                "validation": validation,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/chat/starters")
     def chat_starters() -> dict[str, Any]:
@@ -135,11 +561,604 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return asdict(response)
 
+    def build_wiki_manager() -> WikiManager:
+        active_vault_path = runtime_config.vault_path
+        active_wiki_state_path = runtime_config.wiki_state_path
+        if active_vault_path is None:
+            raise HTTPException(status_code=400, detail="vault path is required for wiki")
+        if active_wiki_state_path is None:
+            raise HTTPException(status_code=400, detail="wiki state path is required")
+        llm_config = load_llm_config(project_root)
+        llm_client = create_llm_client(llm_config)
+        return WikiManager(
+            vault_root=active_vault_path,
+            state_store=WikiStateStore(active_wiki_state_path),
+            llm_client=llm_client,
+            llm_model=llm_config.model,
+            wiki_dir=runtime_config.wiki_dir,
+            min_notes_per_tag=runtime_config.min_notes_per_tag,
+            overview_note_threshold=runtime_config.overview_note_threshold,
+        )
+
+    def build_answer_pipeline(request: AgentRequest | None = None) -> AgentAnswerPipeline:
+        if runtime_config.vault_path is None:
+            raise HTTPException(status_code=400, detail="vault path is required for answer workflow")
+        request = request or AgentRequest()
+        llm_config = load_llm_config(project_root)
+        llm_client = create_llm_client(llm_config)
+        router = build_web_router(request.command, llm_client, llm_config)
+        manager = service.build_manager(
+            SearchOptions(
+                query=request.query,
+                mode="hybrid",
+                dense_top_k=request.dense_top_k,
+                bm25_top_k=request.hybrid_bm25_top_k,
+                rrf_k=request.rrf_k,
+            )
+        )
+        return AgentAnswerPipeline(
+            router=router,
+            llm_client=llm_client,
+            llm_model=llm_config.model,
+            manager=manager,
+            vault_root=runtime_config.vault_path,
+            online_client=OnlineSearchClient(provider=request.online_provider),
+            config=AgentAnswerConfig(
+                notes_top_k=request.notes_top_k,
+                regex_top_k=request.regex_top_k,
+                bm25_top_k=request.bm25_top_k,
+                dense_top_k=request.dense_top_k,
+                hybrid_bm25_top_k=request.hybrid_bm25_top_k,
+                rrf_k=request.rrf_k,
+                max_chars_per_item=request.max_chars_per_item,
+                max_context_chars=request.max_context_chars,
+                online_top_k=request.online_top_k,
+                speculative_notes_search=request.speculative_notes_search,
+            ),
+            answer_temperature=llm_config.temperature,
+        )
+
+    def build_workflow_runner(
+        *,
+        task_type: str,
+        scope_type: str | None = None,
+        answer_request: AgentRequest | None = None,
+    ) -> WorkflowRunner:
+        if runtime_config.vault_path is None:
+            raise HTTPException(status_code=400, detail="vault path is required for workflows")
+        rag_manager = None
+        if task_type == "answer" or scope_type == "search":
+            rag_manager = service.build_manager(
+                SearchOptions(
+                    query=answer_request.query if answer_request else "",
+                    mode="hybrid",
+                )
+            )
+        wiki_manager = build_wiki_manager() if task_type == "synthesize_wiki" else None
+        llm_client = None
+        llm_model = None
+        llm_temperature = 0.2
+        if task_type in {"organize_suggestions", "generate_review", "organize"}:
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+            llm_model = llm_config.model
+            llm_temperature = llm_config.temperature
+        return WorkflowRunner(
+            scope_resolver=ScopeResolver(
+                vault_root=runtime_config.vault_path,
+                wiki_state_store=WikiStateStore(runtime_config.wiki_state_path) if runtime_config.wiki_state_path else None,
+                wiki_dir=runtime_config.wiki_dir,
+                rag_manager=rag_manager,
+                overview_note_threshold=runtime_config.overview_note_threshold,
+            ),
+            context_builder=ContextBuilder(vault_root=runtime_config.vault_path),
+            answer_pipeline=build_answer_pipeline(answer_request) if answer_request else None,
+            wiki_manager=wiki_manager,
+            vault_root=runtime_config.vault_path,
+            wiki_state_store=WikiStateStore(runtime_config.wiki_state_path) if runtime_config.wiki_state_path else None,
+            wiki_dir=runtime_config.wiki_dir,
+            overview_note_threshold=runtime_config.overview_note_threshold,
+            llm_client=llm_client,
+            llm_model=llm_model,
+            llm_temperature=llm_temperature,
+        )
+
+    def run_workspace_sync(
+        *,
+        force: bool = False,
+        limit: int | None = None,
+        include_embedding: bool = True,
+        allow_full_rebuild: bool = False,
+        task_context: PipelineTaskContext | None = None,
+    ) -> dict[str, Any]:
+        if task_context:
+            task_context.emit("workspace_sync_started", {"include_embedding": include_embedding})
+        manager = build_wiki_manager()
+        rag_result = None
+        if include_embedding:
+            if task_context:
+                task_context.emit("rag_sync_started", {"index": str(runtime_config.index_path)})
+            if runtime_config.vault_path is None:
+                raise HTTPException(status_code=400, detail="vault path is required for RAG sync")
+            rag_result = sync_rag_index(
+                RAGIndexSyncConfig(
+                    vault_path=runtime_config.vault_path,
+                    index_path=runtime_config.index_path,
+                    bm25_index_path=runtime_config.bm25_index_path,
+                    project_root=project_root,
+                    model_name=model_name,
+                    embedding_provider=embedding_provider,
+                    embed_batch_size=embed_batch_size,
+                    max_seq_length=max_seq_length,
+                    max_chunk_chars=max_chunk_chars,
+                    target_chunk_chars=target_chunk_chars,
+                    min_chunk_chars=min_chunk_chars,
+                    chunk_overlap=chunk_overlap,
+                    chunk_split_mode=chunk_split_mode,
+                    strip_code_blocks=strip_code_blocks,
+                    allow_full_rebuild=allow_full_rebuild,
+                    excluded_roots=(runtime_config.wiki_dir,) if runtime_config.wiki_dir else (),
+                ),
+                progress=task_context.emit if task_context else None,
+            )
+            if task_context:
+                task_context.emit("rag_sync_done", rag_result)
+        elif task_context:
+            task_context.emit("rag_sync_skipped", {"reason": "disabled"})
+        if task_context:
+            task_context.emit("wiki_tag_sync_started", {})
+        tag_result = manager.tag_changed_notes(force=force, limit=limit)
+        if task_context:
+            task_context.emit("wiki_tag_sync_done", tag_result)
+        report = manager.report()
+        report_path = None
+        if runtime_config.wiki_dir:
+            if task_context:
+                task_context.emit("report_write_started", {})
+            report_path = write_obsidian_wiki_report(
+                report=report,
+                wiki_dir=runtime_config.wiki_dir,
+                sync_result={"rag": rag_result, "wiki": tag_result},
+            )
+            if task_context:
+                task_context.emit("report_write_done", {"report_path": str(report_path)})
+        return {
+            "rag": rag_result,
+            "wiki": tag_result,
+            "report_path": str(report_path) if report_path else None,
+        }
+
+    @app.get("/api/wiki/report")
+    def wiki_report() -> dict[str, Any]:
+        try:
+            data = build_wiki_manager().report()
+            data["obsidian_vault_name"] = runtime_config.vault_path.name if runtime_config.vault_path else None
+            return data
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/wiki/read", response_class=PlainTextResponse)
+    def wiki_read(tag: str) -> str:
+        try:
+            result = build_wiki_manager().read_wiki(tag)
+            return result["content"]
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/wiki/startup-sync-status")
+    def wiki_startup_sync_status() -> dict[str, Any]:
+        status = dict(startup_sync_status)
+        task_id = status.get("task_id")
+        if task_id:
+            status["task"] = task_manager.get(str(task_id))
+        return status
+
+    @app.get("/api/tasks")
+    def tasks() -> dict[str, Any]:
+        return {"tasks": task_manager.list_recent()}
+
+    @app.get("/api/tasks/{task_id}")
+    def task_status(task_id: str) -> dict[str, Any]:
+        task = task_manager.get(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task not found: {task_id}")
+        return task
+
+    @app.post("/api/wiki/sync")
+    def wiki_sync(request: WikiSyncRequest) -> dict[str, Any]:
+        try:
+            task = task_manager.submit(
+                "workspace_sync",
+                lambda context: {
+                    "result": run_workspace_sync(
+                        force=request.force,
+                        limit=request.limit,
+                        include_embedding=request.include_embedding,
+                        allow_full_rebuild=request.allow_full_rebuild,
+                        task_context=context,
+                    ),
+                    "report": build_wiki_manager().report(),
+                },
+            )
+            return {
+                "task_id": task.task_id,
+                "status": task.status,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def run_startup_sync(context: PipelineTaskContext) -> dict[str, Any]:
+        startup_sync_status.update(
+            {
+                "running": True,
+                "started_at": utc_now_iso(),
+                "finished_at": None,
+                "failed": False,
+                "error": None,
+                "result": None,
+            }
+        )
+        try:
+            result = run_workspace_sync(
+                force=False,
+                limit=None,
+                include_embedding=True,
+                allow_full_rebuild=False,
+                task_context=context,
+            )
+            startup_sync_status.update({"result": result, "failed": False})
+            return {
+                "result": result,
+                "report": build_wiki_manager().report(),
+            }
+        except Exception as exc:
+            startup_sync_status.update(
+                {
+                    "failed": True,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            raise
+        finally:
+            startup_sync_status.update(
+                {
+                    "running": False,
+                    "finished_at": utc_now_iso(),
+                }
+            )
+
+    @app.on_event("startup")
+    def start_optional_sync() -> None:
+        if not sync_on_start:
+            return
+        if runtime_config.vault_path is None or runtime_config.wiki_state_path is None:
+            startup_sync_status.update(
+                {
+                    "failed": True,
+                    "error": "vault path and wiki state path are required for sync_on_start",
+                    "finished_at": utc_now_iso(),
+                }
+            )
+            return
+        task = task_manager.submit("startup_workspace_sync", run_startup_sync)
+        startup_sync_status.update({"task_id": task.task_id, "running": True})
+
+    @app.post("/api/wiki/consolidate-tags")
+    def wiki_consolidate_tags(request: WikiConsolidateTagsRequest) -> dict[str, Any]:
+        try:
+            if runtime_config.vault_path is None:
+                raise HTTPException(status_code=400, detail="vault path is required for wiki")
+            if runtime_config.wiki_state_path is None:
+                raise HTTPException(status_code=400, detail="wiki state path is required")
+            state = rebuild_tag_index(
+                WikiStateStore(runtime_config.wiki_state_path).load(),
+                overview_note_threshold=runtime_config.overview_note_threshold,
+            )
+            deterministic = [
+                tag_cleanup_proposal_to_dict(proposal)
+                for proposal in propose_deterministic_cleanup(state)
+            ]
+            llm_proposals: list[dict[str, Any]] = []
+            if request.include_llm:
+                llm_config = load_llm_config(project_root)
+                llm_client = create_llm_client(llm_config)
+                llm_proposals = [
+                    tag_cleanup_proposal_to_dict(proposal)
+                    for proposal in LLMTagConsolidator(
+                        client=llm_client,
+                        model=llm_config.model,
+                    ).propose_cleanup(state=state, vault_root=runtime_config.vault_path)
+                ]
+            return {
+                "deterministic_proposals": deterministic,
+                "llm_proposals": llm_proposals,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/wiki/refine-tag")
+    def wiki_refine_tag(request: WikiRefineTagRequest) -> dict[str, Any]:
+        tag = request.tag.strip()
+        if not tag:
+            raise HTTPException(status_code=400, detail="tag is required")
+        try:
+            if runtime_config.vault_path is None:
+                raise HTTPException(status_code=400, detail="vault path is required for wiki")
+            if runtime_config.wiki_state_path is None:
+                raise HTTPException(status_code=400, detail="wiki state path is required")
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+            state = WikiStateStore(runtime_config.wiki_state_path).load()
+            proposal = LLMTagRefiner(
+                client=llm_client,
+                model=llm_config.model,
+            ).refine_tag(state=state, vault_root=runtime_config.vault_path, tag=tag)
+            return {"tag_refinement": tag_refinement_proposal_to_dict(proposal)}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/wiki/set-policy")
+    def wiki_set_policy(request: WikiSetPolicyRequest) -> dict[str, Any]:
+        tag = request.tag.strip()
+        policy = request.policy.strip()
+        if not tag:
+            raise HTTPException(status_code=400, detail="tag is required")
+        if policy not in {"generate", "overview", "skip"}:
+            raise HTTPException(status_code=400, detail="policy must be generate, overview, or skip")
+        try:
+            if runtime_config.wiki_state_path is None:
+                raise HTTPException(status_code=400, detail="wiki state path is required")
+            store = WikiStateStore(runtime_config.wiki_state_path)
+            state = rebuild_tag_index(
+                store.load(),
+                overview_note_threshold=runtime_config.overview_note_threshold,
+            )
+            updated = set_tag_policy(state, tag=tag, wiki_policy=policy)
+            store.save(updated)
+            return {
+                "tag": tag,
+                "policy": policy,
+                "report": build_wiki_manager().report(),
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/wiki/synthesize-tag")
+    def wiki_synthesize_tag(request: WikiSynthesizeTagRequest) -> dict[str, Any]:
+        tag = request.tag.strip()
+        if not tag:
+            raise HTTPException(status_code=400, detail="tag is required")
+        try:
+            def run_task(context: PipelineTaskContext) -> dict[str, Any]:
+                context.emit("wiki_synthesis_started", {"tag": tag})
+                runner = build_workflow_runner(task_type="synthesize_wiki", scope_type="tag")
+                workflow_result = runner.run(
+                    WorkflowSpec(
+                        task_type="synthesize_wiki",
+                        scope=ScopeSpec(type="tag", value=tag),
+                        user_request=f"Generate wiki for {tag}",
+                        writeback=WritebackSpec(type="wiki_file"),
+                        options={"force": request.force},
+                    )
+                )
+                result = workflow_result.output["synthesize"]
+                context.emit("wiki_synthesis_done", result)
+                manager = build_wiki_manager()
+                report = manager.report()
+                if runtime_config.wiki_dir:
+                    context.emit("report_write_started", {})
+                    report_path = write_obsidian_wiki_report(
+                        report=report,
+                        wiki_dir=runtime_config.wiki_dir,
+                        sync_result={"wiki": result},
+                    )
+                    context.emit("report_write_done", {"report_path": str(report_path)})
+                return {
+                    "tag": tag,
+                    "result": result,
+                    "report": manager.report(),
+                    "workflow": task_result_to_dict(workflow_result),
+                }
+
+            task = task_manager.submit("synthesize_topic", run_task)
+            return {
+                "task_id": task.task_id,
+                "tag": tag,
+                "status": task.status,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/workflows/run")
+    def workflow_run(request: WorkflowRunRequest) -> dict[str, Any]:
+        try:
+            scope = ScopeSpec(
+                type=request.scope.type,
+                value=request.scope.value,
+                paths=tuple(request.scope.paths),
+                top_k=request.scope.top_k,
+                options=request.scope.options,
+            )
+            writeback = WritebackSpec(
+                type=request.writeback.type,
+                path=request.writeback.path,
+                options=request.writeback.options,
+            )
+            spec = WorkflowSpec(
+                task_type=request.task_type,
+                scope=scope,
+                user_request=request.user_request,
+                context_mode=request.context_mode,
+                writeback=writeback,
+                options=request.options,
+            )
+
+            def run_task(context: PipelineTaskContext) -> dict[str, Any]:
+                context.emit("workflow_started", {"task_type": spec.task_type, "scope_type": spec.scope.type})
+                answer_request = workflow_answer_request(request) if spec.task_type == "answer" else None
+                runner = build_workflow_runner(
+                    task_type=spec.task_type,
+                    scope_type=spec.scope.type,
+                    answer_request=answer_request,
+                )
+                result = runner.run(spec)
+                payload = {"workflow": task_result_to_dict(result)}
+                if spec.task_type == "synthesize_wiki" and runtime_config.wiki_dir:
+                    context.emit("report_write_started", {})
+                    report = build_wiki_manager().report()
+                    synthesize_result = result.output.get("synthesize", {})
+                    report_path = write_obsidian_wiki_report(
+                        report=report,
+                        wiki_dir=runtime_config.wiki_dir,
+                        sync_result={"wiki": synthesize_result},
+                    )
+                    context.emit("report_write_done", {"report_path": str(report_path)})
+                    payload["report"] = report
+                    payload["report_path"] = str(report_path)
+                context.emit("workflow_done", {"task_type": spec.task_type})
+                return payload
+
+            task = task_manager.submit(f"workflow:{request.task_type}", run_task)
+            return {
+                "task_id": task.task_id,
+                "status": task.status,
+                "task_type": request.task_type,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def stream_study_or_interview(request: AgentRequest, llm_client, llm_config):
+        if runtime_config.vault_path is None:
+            raise HTTPException(status_code=400, detail="vault path is required for interview review")
+        if runtime_config.wiki_state_path is None:
+            raise HTTPException(status_code=400, detail="wiki state path is required for interview review")
+
+        yield sse_event("status", {"stage": "interview_scope_started", "message": "loading source notes"})
+        rag_manager = None
+        if request.scope_type == "search":
+            rag_manager = service.build_manager(
+                SearchOptions(
+                    query=request.scope_value or request.query,
+                    mode="hybrid",
+                    dense_top_k=request.dense_top_k,
+                    bm25_top_k=request.hybrid_bm25_top_k,
+                    rrf_k=request.rrf_k,
+                )
+            )
+        resolver = ScopeResolver(
+            vault_root=runtime_config.vault_path,
+            wiki_state_store=WikiStateStore(runtime_config.wiki_state_path),
+            wiki_dir=runtime_config.wiki_dir,
+            rag_manager=rag_manager,
+            overview_note_threshold=runtime_config.overview_note_threshold,
+        )
+        scope = resolver.resolve(
+            ScopeSpec(
+                type=request.scope_type,
+                value=request.scope_value or None,
+                paths=tuple(request.scope_paths or ()),
+                top_k=request.notes_top_k,
+            )
+        )
+        context = ContextBuilder(
+            vault_root=runtime_config.vault_path,
+            max_chars_per_note=request.interview_max_chars_per_note,
+            max_context_chars=request.interview_max_context_chars,
+        ).build(scope, mode="interview_context")
+        yield sse_event(
+            "context",
+            {
+                "items": list(context.items),
+                "mode": request.chat_mode,
+                "scope": {
+                    "type": request.scope_type,
+                    "value": request.scope_value,
+                    "paths": request.scope_paths,
+                },
+                "stats": context.stats,
+            },
+        )
+        yield sse_event(
+            "status",
+            {
+                "stage": "interview_started",
+                "message": f"loaded {context.stats.get('context_items', 0)} source notes",
+            },
+        )
+
+        started_at = current_time()
+        first_delta_ms: int | None = None
+        answer_parts: list[str] = []
+        llm_request = LLMRequest(
+            model=llm_config.model,
+            messages=build_interview_messages(
+                query=request.query,
+                context=context,
+                chat_history=list(request.chat_history or []),
+                mode=request.chat_mode,
+            ),
+            temperature=llm_config.temperature,
+        )
+        for delta in llm_client.stream_complete(llm_request):
+            if first_delta_ms is None:
+                first_delta_ms = elapsed_since(started_at)
+            answer_parts.append(delta)
+            yield sse_event("answer_delta", {"text": delta})
+
+        answer_text = "".join(answer_parts)
+        answer_ms = elapsed_since(started_at)
+        telemetry = {
+            "command": "StudyReview" if request.chat_mode == "study" else "InterviewReview",
+            "context": context.stats,
+            "generation": {
+                "ttft_ms": first_delta_ms,
+                "answer_ms": answer_ms,
+                "output_chars": len(answer_text),
+                "prompt_chars": len(context.context_text),
+            },
+            "scope": scope.metadata,
+            "total_ms": answer_ms,
+        }
+        yield sse_event(
+            "answer",
+            {
+                "answer": answer_text,
+                "model": llm_config.model,
+                "prompt_chars": len(context.context_text),
+            },
+        )
+        yield sse_event(
+            "done",
+            {
+                "timing": {"answer_ms": answer_ms, "total_ms": answer_ms},
+                "telemetry": telemetry,
+                "command": "StudyReview" if request.chat_mode == "study" else "InterviewReview",
+            },
+        )
+
     @app.post("/api/agent/stream")
     def agent_stream(request: AgentRequest) -> StreamingResponse:
         if not request.query.strip():
             raise HTTPException(status_code=400, detail="query is required")
-        if vault_path is None:
+        if runtime_config.vault_path is None:
             raise HTTPException(status_code=400, detail="vault path is required for chat agent")
 
         def event_stream():
@@ -148,6 +1167,10 @@ def create_app(
 
                 llm_config = load_llm_config(project_root)
                 llm_client = create_llm_client(llm_config)
+                if request.chat_mode in {"interview", "study"}:
+                    yield from stream_study_or_interview(request, llm_client, llm_config)
+                    return
+
                 router = build_web_router(request.command, llm_client, llm_config)
 
                 yield sse_event("status", {"stage": "pipeline_ready", "message": "pipeline initialized"})
@@ -166,7 +1189,7 @@ def create_app(
                     llm_client=llm_client,
                     llm_model=llm_config.model,
                     manager=manager,
-                    vault_root=vault_path,
+                    vault_root=runtime_config.vault_path,
                     online_client=OnlineSearchClient(provider=request.online_provider),
                     config=AgentAnswerConfig(
                         notes_top_k=request.notes_top_k,
@@ -273,6 +1296,26 @@ def build_web_router(command: str, llm_client, llm_config):
     )
 
 
+def workflow_answer_request(request: WorkflowRunRequest) -> AgentRequest:
+    options = dict(request.options or {})
+    query = request.user_request or request.scope.value or ""
+    return AgentRequest(
+        query=str(query),
+        command=str(options.get("command", "auto")),
+        notes_top_k=int(options.get("notes_top_k", 5)),
+        regex_top_k=int(options.get("regex_top_k", 8)),
+        bm25_top_k=int(options.get("bm25_top_k", 8)),
+        dense_top_k=int(options.get("dense_top_k", 50)),
+        hybrid_bm25_top_k=int(options.get("hybrid_bm25_top_k", 50)),
+        rrf_k=int(options.get("rrf_k", 60)),
+        max_chars_per_item=int(options.get("max_chars_per_item", 1000)),
+        max_context_chars=int(options.get("max_context_chars", 8000)),
+        online_provider=options.get("online_provider"),
+        online_top_k=int(options.get("online_top_k", 5)),
+        speculative_notes_search=bool(options.get("speculative_notes_search", True)),
+    )
+
+
 def sse_event(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -335,12 +1378,1846 @@ def elapsed_since(started_at: float) -> int:
     return int((time.perf_counter() - started_at) * 1000)
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+WIKI_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wiki 维护</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f6f3;
+      --panel: #ffffff;
+      --text: #171717;
+      --muted: #666666;
+      --line: #d9d9d2;
+      --accent: #0f766e;
+      --danger: #b42318;
+      --chip: #eef2f1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 24px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.92);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    h1 { margin: 0; font-size: 18px; }
+    nav { display: flex; gap: 12px; }
+    nav a { color: var(--accent); text-decoration: none; font-size: 14px; }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 22px;
+    }
+    .page-intro {
+      margin-bottom: 16px;
+    }
+    .page-intro h2 {
+      margin: 0 0 6px;
+      font-size: 24px;
+      line-height: 1.2;
+    }
+    .page-intro p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .topic-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 12px 0 14px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .topic-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 16px;
+    }
+    .topic-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      min-height: 210px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .topic-card.dirty {
+      border-color: #dfb94a;
+      box-shadow: 0 0 0 1px rgba(223, 185, 74, 0.16);
+    }
+    .topic-card.missing {
+      border-style: dashed;
+    }
+    .topic-title {
+      font-size: 17px;
+      font-weight: 750;
+      line-height: 1.25;
+      word-break: break-word;
+    }
+    .topic-preview {
+      color: #383838;
+      line-height: 1.55;
+      font-size: 14px;
+      flex: 1;
+    }
+    .topic-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .topic-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    details.admin-tools {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-top: 14px;
+    }
+    details.admin-tools > summary {
+      cursor: pointer;
+      font-weight: 700;
+      color: #333;
+    }
+    details.admin-tools[open] > summary {
+      margin-bottom: 12px;
+    }
+    .toolbar, .summary, .status {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+    .maintenance {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .maintenance-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .proposal-box {
+      display: none;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfbfa;
+      padding: 10px;
+      max-height: 420px;
+      overflow: auto;
+      white-space: pre-wrap;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .proposal-box.visible { display: block; }
+    .toolbar {
+      display: grid;
+      grid-template-columns: 1fr auto auto auto auto auto;
+      gap: 10px;
+      align-items: center;
+    }
+    input[type="search"] {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 10px;
+      background: #fff;
+      color: var(--text);
+    }
+    label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    button {
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: white;
+      border-radius: 6px;
+      padding: 8px 11px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button.secondary {
+      background: #fff;
+      color: var(--accent);
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      background: #fbfbfa;
+    }
+    .metric .value { font-size: 22px; font-weight: 700; }
+    .metric .label { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      font-size: 13px;
+    }
+    th {
+      background: #f0f1ee;
+      color: #333;
+      font-weight: 700;
+      position: sticky;
+      top: 50px;
+      z-index: 5;
+    }
+    tr:last-child td { border-bottom: 0; }
+    .tag { font-weight: 700; }
+    .path { color: var(--muted); word-break: break-all; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 2px 8px;
+      background: var(--chip);
+      margin: 0 5px 5px 0;
+      font-size: 12px;
+      color: #333;
+    }
+    .pill.overview { background: #e7f3f1; color: #0f5f58; }
+    .pill.generate { background: #eef0ff; color: #303986; }
+    .pill.skip { background: #f5e9e7; color: var(--danger); }
+    .pill.dirty { background: #fff4d7; color: #835b00; }
+    .status {
+      display: none;
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
+    .status.visible { display: block; }
+    .error { color: var(--danger); }
+    .admin-hidden { display: none; }
+    @media (max-width: 780px) {
+      header { align-items: flex-start; gap: 10px; flex-direction: column; }
+      .topic-grid { grid-template-columns: 1fr; }
+      .toolbar { grid-template-columns: 1fr; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      table { display: block; overflow-x: auto; }
+      th { top: 0; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Wiki 维护</h1>
+    <nav>
+      <a href="/chat">对话</a>
+      <a href="/topics">知识主题</a>
+      <a href="/organize">整理</a>
+      <a href="/search">检索调试</a>
+      <a href="/admin/wiki">维护</a>
+      <a href="/settings">设置</a>
+    </nav>
+  </header>
+  <main>
+    <section class="page-intro">
+      <h2>Wiki 维护后台</h2>
+      <p>用于同步、整理 tag、调整策略和查看原始状态。日常阅读请使用知识主题页面。</p>
+      <div id="topicSummary" class="topic-summary"></div>
+    </section>
+    <section class="toolbar">
+      <input id="filterText" type="search" placeholder="搜索主题、策略、路径或维护提示..." />
+      <label><input id="eligibleOnly" type="checkbox" checked /> 仅可生成</label>
+      <label><input id="dirtyOnly" type="checkbox" /> 仅需更新</label>
+      <label><input id="syncEmbedding" type="checkbox" checked /> 同步 RAG 索引</label>
+      <button id="refreshBtn" class="secondary">刷新报告</button>
+      <button id="syncBtn">同步工作区</button>
+    </section>
+    <section id="status" class="status"></section>
+    <section id="topicCards" class="topic-grid admin-hidden"></section>
+    <details class="admin-tools">
+      <summary>维护工具与原始数据</summary>
+      <section class="summary">
+        <div class="summary-grid">
+          <div class="metric"><div id="filesMetric" class="value">-</div><div class="label">files</div></div>
+          <div class="metric"><div id="tagsMetric" class="value">-</div><div class="label">tags</div></div>
+          <div class="metric"><div id="eligibleMetric" class="value">-</div><div class="label">eligible tags</div></div>
+          <div class="metric"><div id="dirtyMetric" class="value">-</div><div class="label">dirty tags</div></div>
+        </div>
+      </section>
+      <section class="maintenance">
+        <div class="maintenance-row">
+          <strong>Tag 维护</strong>
+          <label><input id="includeLlmConsolidation" type="checkbox" /> 包含 LLM 建议</label>
+          <button id="consolidateBtn" class="secondary">整理标签</button>
+        </div>
+        <div class="maintenance-row">
+          <span id="selectedTagLabel" class="path">未选择 tag</span>
+          <button id="refineSelectedBtn" class="secondary" disabled>分析选中 tag</button>
+          <button id="policyGenerateBtn" class="secondary" disabled>设为知识页</button>
+          <button id="policyOverviewBtn" class="secondary" disabled>设为导航页</button>
+          <button id="policySkipBtn" class="secondary" disabled>设为跳过</button>
+        </div>
+        <pre id="proposalBox" class="proposal-box"></pre>
+      </section>
+      <table>
+        <thead>
+          <tr>
+            <th>Tag</th>
+          <th>笔记数</th>
+            <th>Policy</th>
+            <th>Evidence</th>
+            <th>Hints</th>
+          <th>Wiki 路径</th>
+          <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="tagRows"></tbody>
+      </table>
+    </details>
+  </main>
+  <script>
+    let report = null;
+    let selectedTag = "";
+    const $ = (id) => document.getElementById(id);
+
+    $("refreshBtn").addEventListener("click", loadReport);
+    $("syncBtn").addEventListener("click", syncChangedNotes);
+    $("consolidateBtn").addEventListener("click", consolidateTags);
+    $("refineSelectedBtn").addEventListener("click", () => refineTag(selectedTag));
+    $("policyGenerateBtn").addEventListener("click", () => setPolicy(selectedTag, "generate"));
+    $("policyOverviewBtn").addEventListener("click", () => setPolicy(selectedTag, "overview"));
+    $("policySkipBtn").addEventListener("click", () => setPolicy(selectedTag, "skip"));
+    $("filterText").addEventListener("input", renderReport);
+    $("eligibleOnly").addEventListener("change", renderReport);
+    $("dirtyOnly").addEventListener("change", renderReport);
+    loadReport();
+
+    async function loadReport() {
+      setStatus("正在加载 Wiki 报告...");
+      try {
+        const response = await fetch("/api/wiki/report");
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Failed to load report");
+        report = data;
+        renderReport();
+        setStatus(`已加载 ${data.tags} 个 tag，其中 ${data.eligible_tags} 个可生成。`);
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      }
+    }
+
+    function renderSummary() {
+      $("filesMetric").textContent = report?.files ?? "-";
+      $("tagsMetric").textContent = report?.tags ?? "-";
+      $("eligibleMetric").textContent = report?.eligible_tags ?? "-";
+      $("dirtyMetric").textContent = report?.dirty_tags ?? "-";
+      const rows = getFilteredRows();
+      const dirty = rows.filter((row) => row.dirty).length;
+      const missing = rows.filter((row) => row.eligible && !row.wiki_exists).length;
+      const generated = rows.filter((row) => row.wiki_exists).length;
+      const failed = rows.filter((row) => row.last_error).length;
+      $("topicSummary").innerHTML = [
+        failed ? `<span class="pill skip">${failed} 个主题合成失败</span>` : "",
+        `<span class="pill dirty">${dirty} 个主题需要更新</span>`,
+        `<span class="pill">${missing} 个主题尚未合成</span>`,
+        `<span class="pill">${generated} 个主题可阅读</span>`
+      ].filter(Boolean).join("");
+    }
+
+    function renderReport() {
+      renderSummary();
+      renderTopics();
+      renderRows();
+    }
+
+    function getFilteredRows() {
+      if (!report) {
+        return [];
+      }
+      const query = $("filterText").value.trim().toLowerCase();
+      const eligibleOnly = $("eligibleOnly").checked;
+      const dirtyOnly = $("dirtyOnly").checked;
+      return report.tag_rows.filter((row) => {
+        if (eligibleOnly && !row.eligible) return false;
+        if (dirtyOnly && !row.dirty) return false;
+        if (!query) return true;
+        const text = JSON.stringify(row).toLowerCase();
+        return text.includes(query);
+      }).sort(topicSort);
+    }
+
+    function renderTopics() {
+      const container = $("topicCards");
+      const rows = getFilteredRows();
+      if (!rows.length) {
+        container.innerHTML = `<article class="topic-card missing"><div class="topic-title">没有匹配的主题</div><div class="topic-preview">调整搜索条件或关闭“仅可生成”后再看。</div></article>`;
+        return;
+      }
+      container.innerHTML = rows.map(renderTopicCard).join("");
+      container.querySelectorAll("[data-synthesize-tag]").forEach((button) => {
+        button.addEventListener("click", () => synthesizeTag(button.dataset.synthesizeTag));
+      });
+      container.querySelectorAll("[data-select-tag]").forEach((button) => {
+        button.addEventListener("click", () => selectTag(button.dataset.selectTag));
+      });
+      container.querySelectorAll("[data-copy-path]").forEach((button) => {
+        button.addEventListener("click", () => navigator.clipboard.writeText(button.dataset.copyPath || ""));
+      });
+      container.querySelectorAll("[data-read-tag]").forEach((button) => {
+        button.addEventListener("click", () => {
+          window.open(`/api/wiki/read?tag=${encodeURIComponent(button.dataset.readTag)}`, "_blank");
+        });
+      });
+    }
+
+    function renderRows() {
+      const tbody = $("tagRows");
+      if (!report) {
+        tbody.innerHTML = "";
+        return;
+      }
+      const rows = getFilteredRows();
+      tbody.innerHTML = rows.map(renderRow).join("");
+      tbody.querySelectorAll("[data-synthesize-tag]").forEach((button) => {
+        button.addEventListener("click", () => synthesizeTag(button.dataset.synthesizeTag));
+      });
+      tbody.querySelectorAll("[data-select-tag]").forEach((button) => {
+        button.addEventListener("click", () => selectTag(button.dataset.selectTag));
+      });
+      tbody.querySelectorAll("[data-refine-tag]").forEach((button) => {
+        button.addEventListener("click", () => refineTag(button.dataset.refineTag));
+      });
+      tbody.querySelectorAll("[data-copy-path]").forEach((button) => {
+        button.addEventListener("click", () => navigator.clipboard.writeText(button.dataset.copyPath || ""));
+      });
+    }
+
+    function renderTopicCard(row) {
+      const policy = escapeHtml(row.wiki_policy || "");
+      const status = row.last_error ? "合成失败" : (row.dirty ? "需要更新" : (row.wiki_exists ? "已生成" : "未合成"));
+      const preview = row.wiki_preview || "尚未生成知识页。可以先生成，再把它作为跨笔记主题入口阅读。";
+      const cardClass = row.last_error ? "missing" : (row.dirty ? "dirty" : (!row.wiki_exists ? "missing" : ""));
+      const errorBlock = row.last_error
+        ? `<div class="path error">${escapeHtml(row.last_error_type || "Error")}: ${escapeHtml(row.last_error)} · retry=${row.retry_count || 0}</div>`
+        : "";
+      const readButton = row.wiki_exists
+        ? `<button class="secondary" data-read-tag="${escapeHtml(row.tag)}">阅读</button>`
+        : `<button class="secondary" disabled>阅读</button>`;
+      return `
+        <article class="topic-card ${cardClass}">
+          <div class="topic-title">${formatTagTitle(row.tag)}</div>
+          <div class="topic-preview">${escapeHtml(preview)}</div>
+          <div class="topic-meta">
+            <span class="pill">${row.note_count} 篇笔记</span>
+            <span class="pill ${policy}">${policyLabel(row.wiki_policy)}</span>
+            <span class="pill ${row.last_error ? "skip" : (row.dirty ? "dirty" : "")}">${status}</span>
+          </div>
+          ${errorBlock}
+          <div class="path">${escapeHtml(row.wiki_path || "")}</div>
+          <div class="topic-actions">
+            ${readButton}
+            <button data-synthesize-tag="${escapeHtml(row.tag)}" ${row.eligible ? "" : "disabled"}>${row.wiki_exists ? "重新合成" : "生成"}</button>
+            <button class="secondary" data-select-tag="${escapeHtml(row.tag)}">维护</button>
+            ${row.wiki_path ? `<button class="secondary" data-copy-path="${escapeHtml(row.wiki_path)}">复制路径</button>` : ""}
+          </div>
+        </article>
+      `;
+    }
+
+    function topicSort(a, b) {
+      const rank = (row) => {
+        if (row.dirty && row.wiki_exists) return 0;
+        if (row.eligible && !row.wiki_exists) return 1;
+        if (row.wiki_exists && row.wiki_policy === "generate") return 2;
+        if (row.wiki_exists && row.wiki_policy === "overview") return 3;
+        return 4;
+      };
+      const rankDelta = rank(a) - rank(b);
+      if (rankDelta !== 0) return rankDelta;
+      return (b.note_count || 0) - (a.note_count || 0) || String(a.tag).localeCompare(String(b.tag));
+    }
+
+    function formatTagTitle(tag) {
+      return escapeHtml(String(tag || "").split("/").filter(Boolean).join(" / "));
+    }
+
+    function policyLabel(policy) {
+      if (policy === "overview") return "导航页";
+      if (policy === "generate") return "知识页";
+      if (policy === "skip") return "跳过";
+      return escapeHtml(policy || "-");
+    }
+
+    function renderRow(row) {
+      const policy = escapeHtml(row.wiki_policy || "");
+      const source = escapeHtml(row.wiki_policy_source || "");
+      const evidence = Object.entries(row.evidence_counts || {})
+        .map(([name, count]) => `<span class="pill">${escapeHtml(name)}: ${count}</span>`)
+        .join("");
+      const hints = (row.review_hints || [])
+        .map((hint) => `<span class="pill dirty">${escapeHtml(hint)}</span>`)
+        .join("");
+      const errorHint = row.last_error
+        ? `<div class="path error">${escapeHtml(row.last_error_type || "Error")}: ${escapeHtml(row.last_error)}<br/>retry=${row.retry_count || 0}, retryable=${row.retryable ? "yes" : "no"}</div>`
+        : "";
+      const wikiPath = row.wiki_path || "";
+      const actionDisabled = row.eligible ? "" : "disabled";
+      return `
+        <tr>
+          <td><div class="tag">${escapeHtml(row.tag)}</div>${row.last_error ? '<span class="pill skip">failed</span>' : ""}${row.dirty ? '<span class="pill dirty">dirty</span>' : ""}</td>
+          <td>${row.note_count}</td>
+          <td><span class="pill ${policy}">${policy}</span><div class="path">${source}</div></td>
+          <td>${evidence || '<span class="path">none</span>'}</td>
+          <td>${errorHint}${hints || (!errorHint ? '<span class="path">none</span>' : "")}</td>
+          <td>
+            <div class="path">${escapeHtml(wikiPath || "(not generated)")}</div>
+            ${wikiPath ? `<button class="secondary" data-copy-path="${escapeHtml(wikiPath)}">复制</button>` : ""}
+          </td>
+          <td>
+            <button class="secondary" data-select-tag="${escapeHtml(row.tag)}">选择</button>
+            <button class="secondary" data-refine-tag="${escapeHtml(row.tag)}">分析</button>
+            <button data-synthesize-tag="${escapeHtml(row.tag)}" ${actionDisabled}>合成</button>
+          </td>
+        </tr>
+      `;
+    }
+
+    function selectTag(tag) {
+      selectedTag = tag || "";
+      $("selectedTagLabel").textContent = selectedTag ? `已选择：${selectedTag}` : "未选择 tag";
+      const disabled = !selectedTag;
+      $("refineSelectedBtn").disabled = disabled;
+      $("policyGenerateBtn").disabled = disabled;
+      $("policyOverviewBtn").disabled = disabled;
+      $("policySkipBtn").disabled = disabled;
+    }
+
+    async function consolidateTags() {
+      setStatus("正在生成标签整理建议...");
+      setButtonsDisabled(true);
+      try {
+        const response = await fetch("/api/wiki/consolidate-tags", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({include_llm: $("includeLlmConsolidation").checked})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Failed to consolidate tags");
+        showProposal(data);
+        const deterministic = data.deterministic_proposals?.length ?? 0;
+        const llm = data.llm_proposals?.length ?? 0;
+        setStatus(`标签整理建议已生成。deterministic=${deterministic}, llm=${llm}`);
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setButtonsDisabled(false);
+        selectTag(selectedTag);
+      }
+    }
+
+    async function refineTag(tag) {
+      if (!tag) return;
+      selectTag(tag);
+      setStatus(`正在分析 tag：${tag}...`);
+      setButtonsDisabled(true);
+      try {
+        const response = await fetch("/api/wiki/refine-tag", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({tag})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Failed to refine tag");
+        showProposal(data);
+        const proposal = data.tag_refinement || {};
+        setStatus(`分析完成。decision=${proposal.decision || "-"}, problem=${proposal.problem || "-"}`);
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setButtonsDisabled(false);
+        selectTag(selectedTag);
+      }
+    }
+
+    async function setPolicy(tag, policy) {
+      if (!tag) return;
+      setStatus(`正在设置 ${tag} 的策略为 ${policy}...`);
+      setButtonsDisabled(true);
+      try {
+        const response = await fetch("/api/wiki/set-policy", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({tag, policy})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Failed to set policy");
+        report = data.report;
+        renderReport();
+        selectTag(tag);
+        setStatus(`策略已更新：${tag} -> ${policy}`);
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setButtonsDisabled(false);
+        selectTag(selectedTag);
+      }
+    }
+
+    function showProposal(data) {
+      const box = $("proposalBox");
+      box.textContent = JSON.stringify(data, null, 2);
+      box.className = "proposal-box visible";
+    }
+
+    async function synthesizeTag(tag) {
+      if (!tag) return;
+      setStatus(`正在为 ${tag} 合成 wiki...`);
+      setButtonsDisabled(true);
+      try {
+        const response = await fetch("/api/wiki/synthesize-tag", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({tag, force: true})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Failed to synthesize tag");
+        const task = await waitForTask(data.task_id, "正在合成 wiki");
+        if (task.status !== "succeeded") {
+          throw new Error(task.error || "Wiki synthesis task failed");
+        }
+        const payload = task.result || {};
+        report = payload.report;
+        renderReport();
+        const result = payload.result || {};
+        const failedTags = result.failed_tags || [];
+        const retriedTags = result.retried_tags || [];
+        const failureText = failedTags.length
+          ? `；失败：${failedTags.map((item) => `${item.tag}(${item.error_type}, attempts=${item.attempts})`).join("，")}`
+          : "";
+        const retryText = retriedTags.length
+          ? `；重试后成功：${retriedTags.map((item) => `${item.tag}(${item.attempts})`).join("，")}`
+          : "";
+        setStatus(`已为 ${tag} 合成 ${result.generated} 个 wiki。skipped=${result.skipped}, failed=${result.failed}${retryText}${failureText}`, failedTags.length > 0);
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setButtonsDisabled(false);
+        selectTag(selectedTag);
+      }
+    }
+
+    async function syncChangedNotes() {
+      setStatus("正在同步 RAG 索引和 wiki tags...");
+      setButtonsDisabled(true);
+      try {
+        const response = await fetch("/api/wiki/sync", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            force: false,
+            limit: null,
+            include_embedding: $("syncEmbedding").checked,
+            allow_full_rebuild: false
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Failed to sync workspace");
+        const task = await waitForTask(data.task_id, "正在同步工作区");
+        if (task.status !== "succeeded") {
+          throw new Error(task.error || "Workspace sync task failed");
+        }
+        const payload = task.result || {};
+        report = payload.report;
+        renderReport();
+        const result = payload.result || {};
+        setStatus(formatSyncResult(result));
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setButtonsDisabled(false);
+      }
+    }
+
+    function formatSyncResult(result) {
+      const rag = result.rag;
+      const wiki = result.wiki || {};
+      const lines = ["同步完成。"];
+      if (rag) {
+        lines.push(
+          `RAG: mode=${rag.mode ?? "-"}, added=${rag.added_files ?? "-"}, modified=${rag.modified_files ?? "-"}, deleted=${rag.deleted_files ?? "-"}, embedded_chunks=${rag.embedded_chunks ?? "-"}, total_chunks=${rag.total_chunks ?? "-"}`
+        );
+        if (rag.reason) {
+          lines.push(`RAG note: ${rag.reason}`);
+        }
+      } else {
+        lines.push("RAG: skipped by request");
+      }
+      lines.push(
+        `Wiki tags: markdown_files=${wiki.markdown_files ?? "-"}, tagged=${wiki.tagged ?? "-"}, skipped=${wiki.skipped ?? "-"}, failed=${wiki.failed ?? "-"}, deleted=${wiki.deleted ?? "-"}, tags=${wiki.tags ?? "-"}`
+      );
+      return lines.join("\n");
+    }
+
+    async function waitForTask(taskId, label) {
+      if (!taskId) throw new Error("Task id missing");
+      while (true) {
+        const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+        const task = await response.json();
+        if (!response.ok) throw new Error(task.detail || "Task status request failed");
+        const lastEvent = (task.events || []).slice(-1)[0];
+        const step = lastEvent ? lastEvent.event : task.current_step;
+        setStatus(`${label}... ${step || task.status}`);
+        if (["succeeded", "failed", "cancelled"].includes(task.status)) {
+          return task;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+
+    function setButtonsDisabled(disabled) {
+      document.querySelectorAll("button").forEach((button) => {
+        if (button.id !== "refreshBtn") button.disabled = disabled;
+      });
+    }
+
+    function setStatus(message, isError = false) {
+      const node = $("status");
+      node.textContent = message;
+      node.className = `status visible ${isError ? "error" : ""}`;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+TOPICS_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>知识主题</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f7f4;
+      --panel: #ffffff;
+      --text: #171717;
+      --muted: #666666;
+      --line: #d9d9d2;
+      --accent: #0f766e;
+      --danger: #b42318;
+      --warn-bg: #fff7df;
+      --chip: #eef2f1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 24px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.94);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    h1 { margin: 0; font-size: 18px; }
+    nav { display: flex; gap: 12px; flex-wrap: wrap; }
+    nav a { color: var(--accent); text-decoration: none; font-size: 14px; }
+    main {
+      width: min(920px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 26px 0 48px;
+    }
+    .hero {
+      margin-bottom: 18px;
+    }
+    .hero h2 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      line-height: 1.16;
+    }
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+    .notice {
+      margin-top: 14px;
+      padding: 10px 12px;
+      border: 1px solid #ead18a;
+      background: var(--warn-bg);
+      border-radius: 8px;
+      color: #694900;
+      display: none;
+    }
+    .notice.visible { display: block; }
+    .controls {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+      align-items: center;
+    }
+    .tabs {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .tab {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: #333;
+      border-radius: 999px;
+      padding: 7px 11px;
+      cursor: pointer;
+      font-weight: 650;
+    }
+    .tab.active {
+      border-color: var(--accent);
+      background: #e7f3f1;
+      color: #0f5f58;
+    }
+    input[type="search"] {
+      width: min(280px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #fff;
+      color: var(--text);
+    }
+    .topics {
+      display: grid;
+      gap: 22px;
+    }
+    .topic-group {
+      display: grid;
+      gap: 10px;
+    }
+    .group-title {
+      margin: 4px 0 0;
+      font-size: 14px;
+      line-height: 1.4;
+      color: #424242;
+      font-weight: 760;
+    }
+    .group-title span {
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .topic {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+    }
+    .topic.needs-update { border-color: #dfb94a; }
+    .topic.missing { border-style: dashed; }
+    .topic-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 8px;
+    }
+    .topic-title {
+      font-size: 17px;
+      font-weight: 760;
+      margin: 0;
+      line-height: 1.25;
+      word-break: break-word;
+    }
+    .topic-badges {
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+      flex-shrink: 0;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: var(--chip);
+      color: #3f3f3f;
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: nowrap;
+    }
+    .badge.update {
+      background: #fff1bf;
+      color: #704c00;
+    }
+    .badge.missing {
+      background: #f3f3ef;
+      color: #555;
+    }
+    .badge.generated {
+      background: #e7f3f1;
+      color: #0f5f58;
+    }
+    .wiki-link {
+      color: #3f3f3f;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      word-break: break-all;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    button, .open-link {
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: white;
+      border-radius: 7px;
+      padding: 8px 11px;
+      cursor: pointer;
+      font-weight: 700;
+      text-decoration: none;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    button.secondary, .open-link.secondary {
+      background: #fff;
+      color: var(--accent);
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .empty {
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 24px;
+      color: var(--muted);
+      text-align: center;
+      background: rgba(255, 255, 255, 0.6);
+    }
+    .status {
+      display: none;
+      margin-bottom: 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
+    .status.visible { display: block; }
+    .status.error { color: var(--danger); }
+    @media (max-width: 760px) {
+      header { flex-direction: column; align-items: flex-start; }
+      .controls { flex-direction: column; align-items: stretch; }
+      input[type="search"] { width: 100%; }
+      .topic { grid-template-columns: 1fr; }
+      .topic-head { flex-direction: column; }
+      .topic-badges { justify-content: flex-start; }
+      .actions { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>知识主题</h1>
+    <nav>
+      <a href="/chat">对话</a>
+      <a href="/topics">知识主题</a>
+      <a href="/organize">整理</a>
+      <a href="/search">检索调试</a>
+      <a href="/admin/wiki">维护</a>
+      <a href="/settings">设置</a>
+    </nav>
+  </header>
+  <main>
+    <section class="hero">
+      <h2>我的知识主题</h2>
+      <p>这里只展示可以阅读或合成的主题页。完整内容在 Obsidian 中阅读，维护操作放在后台。</p>
+      <div id="notice" class="notice"></div>
+    </section>
+    <section class="controls">
+      <div class="tabs">
+        <button class="tab active" data-filter="all">全部</button>
+        <button class="tab" data-filter="dirty">需要更新</button>
+        <button class="tab" data-filter="missing">未合成</button>
+        <button class="tab" data-filter="generated">已生成</button>
+      </div>
+      <input id="topicSearch" type="search" placeholder="搜索主题..." />
+    </section>
+    <section id="status" class="status"></section>
+    <section id="topics" class="topics"></section>
+  </main>
+  <script>
+    let report = null;
+    let activeFilter = "all";
+    const $ = (id) => document.getElementById(id);
+
+    document.querySelectorAll("[data-filter]").forEach((button) => {
+      button.addEventListener("click", () => {
+        activeFilter = button.dataset.filter;
+        document.querySelectorAll("[data-filter]").forEach((node) => node.classList.remove("active"));
+        button.classList.add("active");
+        renderTopics();
+      });
+    });
+    $("topicSearch").addEventListener("input", renderTopics);
+    loadReport();
+
+    async function loadReport() {
+      setStatus("正在加载知识主题...");
+      try {
+        const response = await fetch("/api/wiki/report");
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "知识主题加载失败");
+        report = data;
+        renderNotice();
+        renderTopics();
+        setStatus("");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      }
+    }
+
+    function renderNotice() {
+      const rows = topicRows();
+      const dirty = rows.filter((row) => row.dirty && row.wiki_exists).length;
+      const missing = rows.filter((row) => row.eligible && !row.wiki_exists).length;
+      const notice = $("notice");
+      const parts = [];
+      if (dirty) parts.push(`${dirty} 个主题需要更新`);
+      if (missing) parts.push(`${missing} 个主题尚未合成`);
+      if (!parts.length) {
+        notice.className = "notice";
+        notice.textContent = "";
+        return;
+      }
+      notice.textContent = parts.join("；") + "。需要更新表示源笔记已变更，重新合成后 wiki 会刷新。";
+      notice.className = "notice visible";
+    }
+
+    function topicRows() {
+      if (!report) return [];
+      return report.tag_rows
+        .filter((row) => row.eligible || row.wiki_exists)
+        .sort(topicSort);
+    }
+
+    function filteredRows() {
+      const query = $("topicSearch").value.trim().toLowerCase();
+      return topicRows().filter((row) => {
+        if (activeFilter === "dirty" && !(row.dirty && row.wiki_exists)) return false;
+        if (activeFilter === "missing" && !(!row.wiki_exists && row.eligible)) return false;
+        if (activeFilter === "generated" && !row.wiki_exists) return false;
+        if (!query) return true;
+        return String(row.tag || "").toLowerCase().includes(query)
+          || String(row.wiki_path || "").toLowerCase().includes(query);
+      });
+    }
+
+    function renderTopics() {
+      const container = $("topics");
+      const rows = filteredRows();
+      if (!rows.length) {
+        container.innerHTML = `<div class="empty">没有匹配的知识主题。</div>`;
+        return;
+      }
+      container.innerHTML = groupedRows(rows).map(renderGroup).join("");
+      container.querySelectorAll("[data-synthesize-tag]").forEach((button) => {
+        button.addEventListener("click", () => synthesizeTag(button.dataset.synthesizeTag));
+      });
+    }
+
+    function groupedRows(rows) {
+      const groups = [
+        {key: "dirty", title: "需要更新", rows: []},
+        {key: "missing", title: "尚未合成", rows: []},
+        {key: "generated", title: "已生成", rows: []}
+      ];
+      for (const row of rows) {
+        if (row.dirty && row.wiki_exists) {
+          groups[0].rows.push(row);
+        } else if (row.eligible && !row.wiki_exists) {
+          groups[1].rows.push(row);
+        } else if (row.wiki_exists) {
+          groups[2].rows.push(row);
+        }
+      }
+      return groups.filter((group) => group.rows.length);
+    }
+
+    function renderGroup(group) {
+      return `
+        <section class="topic-group">
+          <h3 class="group-title">${group.title} <span>${group.rows.length}</span></h3>
+          ${group.rows.map(renderTopic).join("")}
+        </section>
+      `;
+    }
+
+    function renderTopic(row) {
+      const title = formatTagTitle(row.tag);
+      const klass = row.wiki_exists ? (row.dirty ? "needs-update" : "") : "missing";
+      const wikiLink = row.wiki_exists
+        ? `[[${escapeHtml(row.wiki_path)}]]`
+        : "合成后会生成 Obsidian wiki 文件";
+      const openHref = row.wiki_exists ? obsidianUrl(row.wiki_path) : "";
+      const statusBadge = row.wiki_exists
+        ? (row.dirty ? `<span class="badge update">需要更新</span>` : `<span class="badge generated">已生成</span>`)
+        : `<span class="badge missing">未合成</span>`;
+      return `
+        <article class="topic ${klass}">
+          <div>
+            <div class="topic-head">
+              <div class="topic-title">${title}</div>
+              <div class="topic-badges">
+                <span class="badge">${row.note_count} 篇笔记</span>
+                ${statusBadge}
+              </div>
+            </div>
+            <div class="wiki-link">${wikiLink}</div>
+          </div>
+          <div class="actions">
+            ${row.wiki_exists ? `<a class="open-link" href="${openHref}">在 Obsidian 中打开</a>` : ""}
+            <button class="${row.wiki_exists ? "secondary" : ""}" data-synthesize-tag="${escapeHtml(row.tag)}" ${row.eligible ? "" : "disabled"}>${row.wiki_exists ? "重新合成" : "合成 wiki"}</button>
+          </div>
+        </article>
+      `;
+    }
+
+    async function synthesizeTag(tag) {
+      if (!tag) return;
+      setStatus(`正在合成 ${tag}...`);
+      setButtonsDisabled(true);
+      try {
+        const response = await fetch("/api/wiki/synthesize-tag", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({tag, force: true})
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Failed to synthesize topic");
+        const task = await waitForTask(data.task_id, "正在合成 wiki");
+        if (task.status !== "succeeded") {
+          throw new Error(task.error || "Wiki synthesis task failed");
+        }
+        const payload = task.result || {};
+        report = payload.report;
+        renderNotice();
+        renderTopics();
+        const result = payload.result || {};
+        const failedTags = result.failed_tags || [];
+        const retriedTags = result.retried_tags || [];
+        const retryText = retriedTags.length
+          ? `；重试后成功：${retriedTags.map((item) => `${item.tag}(${item.attempts})`).join("，")}`
+          : "";
+        const failureText = failedTags.length
+          ? `；失败：${failedTags.map((item) => `${item.tag}(${item.error_type}, attempts=${item.attempts})`).join("，")}`
+          : "";
+        setStatus(`已更新 ${tag}${retryText}${failureText}`, failedTags.length > 0);
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setButtonsDisabled(false);
+      }
+    }
+
+    async function waitForTask(taskId, label) {
+      if (!taskId) throw new Error("Task id missing");
+      while (true) {
+        const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+        const task = await response.json();
+        if (!response.ok) throw new Error(task.detail || "Task status request failed");
+        const lastEvent = (task.events || []).slice(-1)[0];
+        const step = lastEvent ? lastEvent.event : task.current_step;
+        setStatus(`${label}... ${step || task.status}`);
+        if (["succeeded", "failed", "cancelled"].includes(task.status)) {
+          return task;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+
+    function topicSort(a, b) {
+      const rank = (row) => {
+        if (row.dirty && row.wiki_exists) return 0;
+        if (row.eligible && !row.wiki_exists) return 1;
+        if (row.wiki_exists) return 2;
+        return 3;
+      };
+      const rankDelta = rank(a) - rank(b);
+      if (rankDelta !== 0) return rankDelta;
+      return (b.note_count || 0) - (a.note_count || 0) || String(a.tag).localeCompare(String(b.tag));
+    }
+
+    function obsidianUrl(path) {
+      const vault = report?.obsidian_vault_name || "";
+      return `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(path || "")}`;
+    }
+
+    function formatTagTitle(tag) {
+      return escapeHtml(String(tag || "").split("/").filter(Boolean).join(" / "));
+    }
+
+    function setButtonsDisabled(disabled) {
+      document.querySelectorAll("button").forEach((button) => {
+        if (!button.classList.contains("tab")) button.disabled = disabled;
+      });
+    }
+
+    function setStatus(message, isError = false) {
+      const node = $("status");
+      node.textContent = message;
+      node.className = message ? `status visible ${isError ? "error" : ""}` : "status";
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+AUDIT_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>知识整理</title>
+  <style>
+    :root {
+      --bg: #f7f7f4;
+      --panel: #ffffff;
+      --text: #181816;
+      --muted: #67645d;
+      --line: #d9d7ce;
+      --accent: #0f766e;
+      --accent-soft: #e7f3f1;
+      --danger: #b42318;
+      --warn: #986a00;
+      --warn-bg: #fff7df;
+      --code: #f1f0ea;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 18px;
+      padding: 16px 24px;
+      background: rgba(255, 255, 255, 0.94);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    h1 { margin: 0 0 6px; font-size: 22px; line-height: 1.2; }
+    header p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    nav { display: flex; gap: 12px; flex-wrap: wrap; }
+    nav a { color: var(--accent); text-decoration: none; font-size: 14px; font-weight: 650; }
+    main {
+      width: min(1080px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 24px 0 48px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: 180px minmax(240px, 1fr) 140px auto;
+      gap: 12px;
+      align-items: end;
+    }
+    label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+    select, input, button {
+      font: inherit;
+    }
+    select, input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 10px;
+      background: #fff;
+      color: var(--text);
+    }
+    button {
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      border-radius: 6px;
+      padding: 9px 14px;
+      cursor: pointer;
+      font-weight: 700;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .hint {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .status {
+      display: none;
+      margin-bottom: 16px;
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 8px;
+      padding: 12px 14px;
+      color: var(--muted);
+    }
+    .status.visible { display: block; }
+    .status.error { border-color: #f0b8b8; color: var(--danger); background: #fff6f6; }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .metric {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .metric strong {
+      display: block;
+      font-size: 24px;
+      line-height: 1.1;
+      margin-bottom: 6px;
+    }
+    .metric span { color: var(--muted); font-size: 13px; }
+    .issues {
+      display: grid;
+      gap: 10px;
+    }
+    .issue {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--warn);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .issue.error { border-left-color: var(--danger); }
+    .issue.info { border-left-color: var(--accent); }
+    .issue-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 6px;
+    }
+    .issue-code {
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      background: var(--code);
+      border-radius: 4px;
+      padding: 2px 5px;
+      font-size: 12px;
+    }
+    .issue-path {
+      color: var(--muted);
+      font-size: 13px;
+      word-break: break-all;
+    }
+    .issue-message {
+      margin: 7px 0 0;
+      line-height: 1.55;
+    }
+    .empty {
+      background: var(--panel);
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      color: var(--muted);
+      text-align: center;
+    }
+    .markdown {
+      white-space: pre-wrap;
+      background: var(--code);
+      border-radius: 8px;
+      padding: 12px;
+      overflow: auto;
+      color: #333;
+      font-size: 13px;
+      line-height: 1.5;
+      display: none;
+    }
+    details { margin-top: 14px; }
+    summary { cursor: pointer; color: var(--accent); font-weight: 700; }
+    @media (max-width: 820px) {
+      header { display: block; }
+      nav { margin-top: 12px; }
+      .form-grid { grid-template-columns: 1fr; }
+      .summary { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>知识整理</h1>
+      <p>先做结构检查，再给出整理建议。这个入口会把确定性审计和 LLM 整理结果放到同一份报告里。</p>
+    </div>
+    <nav>
+      <a href="/chat">对话</a>
+      <a href="/topics">知识主题</a>
+      <a href="/organize">整理</a>
+      <a href="/search">检索调试</a>
+      <a href="/admin/wiki">维护</a>
+      <a href="/settings">设置</a>
+    </nav>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="form-grid">
+        <div>
+          <label for="scopeType">范围</label>
+          <select id="scopeType">
+            <option value="tag" selected>Tag</option>
+            <option value="folder">文件夹</option>
+            <option value="all_vault">全部 Vault</option>
+            <option value="selected_notes">指定笔记</option>
+          </select>
+        </div>
+        <div>
+          <label for="scopeValue">Tag / 文件夹</label>
+          <input id="scopeValue" placeholder="例如：java/servlet" />
+        </div>
+        <div>
+          <label for="maxIssues">最多问题数</label>
+          <input id="maxIssues" type="number" min="1" max="1000" value="50" />
+        </div>
+        <div>
+          <button id="runBtn">开始整理</button>
+        </div>
+      </div>
+      <div class="hint">
+        指定笔记模式下，在输入框中按行填写相对路径。全部 Vault 可能输出较多，建议先限制最多问题数。
+      </div>
+    </section>
+
+    <div id="status" class="status"></div>
+    <section id="summary" class="summary"></section>
+    <section id="review" class="issues"></section>
+    <section id="issues" class="issues"></section>
+    <details id="markdownBox" style="display:none;">
+      <summary>查看 Markdown 报告</summary>
+      <pre id="markdown" class="markdown"></pre>
+    </details>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    $("scopeType").addEventListener("change", updateScopeHint);
+    $("runBtn").addEventListener("click", runAudit);
+    updateScopeHint();
+
+    async function runAudit() {
+      const scopeType = $("scopeType").value;
+      const value = $("scopeValue").value.trim();
+      const maxIssues = Number($("maxIssues").value || 50);
+      const paths = scopeType === "selected_notes"
+        ? value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+        : [];
+      if ((scopeType === "tag" || scopeType === "folder") && !value) {
+        setStatus("请填写 tag 或文件夹。", true);
+        return;
+      }
+      if (scopeType === "selected_notes" && paths.length === 0) {
+        setStatus("请填写至少一条笔记相对路径。", true);
+        return;
+      }
+
+      setBusy(true);
+      clearResults();
+      setStatus("正在提交整理任务...");
+      try {
+        const response = await fetch("/api/workflows/run", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            task_type: "organize",
+            scope: {
+              type: scopeType,
+              value: scopeType === "selected_notes" ? null : value,
+              paths,
+            },
+            options: {
+              max_issues: maxIssues,
+              max_notes: 8,
+              max_chars_per_note: 1800,
+              review_mode: "auto"
+            }
+          })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "提交整理失败");
+        const task = await waitForTask(data.task_id);
+        if (task.status !== "succeeded") {
+          throw new Error(task.error || "整理任务失败");
+        }
+        const workflow = task.result?.workflow || {};
+        const organize = workflow.output?.organize || {};
+        const audit = organize.audit || workflow.output?.audit || {};
+        const review = organize.review || null;
+        renderAudit(audit);
+        renderReview(review);
+        setStatus("整理完成。");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function waitForTask(taskId) {
+      while (true) {
+        const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+        const task = await response.json();
+        if (!response.ok) throw new Error(task.detail || "读取任务状态失败");
+        const lastEvent = (task.events || []).slice(-1)[0];
+        const step = lastEvent ? lastEvent.event : task.current_step;
+        setStatus(`任务状态：${task.status}${step ? ` / ${step}` : ""}`);
+        if (!["queued", "running"].includes(task.status)) return task;
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
+    }
+
+    function renderAudit(audit) {
+      const summary = audit.summary || {};
+      $("summary").innerHTML = [
+        metric(summary.notes_checked, "检查笔记"),
+        metric(summary.issues, "问题总数"),
+        metric(summary.errors, "错误"),
+        metric(summary.warnings, "警告"),
+        metric(summary.info, "提示"),
+      ].join("");
+
+      const issues = audit.issues || [];
+      if (!issues.length) {
+        $("issues").innerHTML = `<div class="empty">没有发现问题。</div>`;
+      } else {
+        $("issues").innerHTML = issues.map(renderIssue).join("");
+      }
+
+      if (audit.markdown) {
+        $("markdownBox").style.display = "block";
+        $("markdown").style.display = "block";
+        $("markdown").textContent = audit.markdown;
+      }
+    }
+
+    function renderReview(review) {
+      if (!review) {
+        $("review").innerHTML = "";
+        return;
+      }
+      const suggestions = review.suggestions || {};
+      const validation = review.validation || suggestions._validation || {};
+      const nextActions = Array.isArray(suggestions.next_actions) ? suggestions.next_actions : [];
+      const questions = Array.isArray(suggestions.review_questions) ? suggestions.review_questions : [];
+      const summary = suggestions.summary || "";
+      const validationLine = validation.warning_count || validation.correction_count
+        ? `<p class="issue-message">建议校验：${validation.correction_count || 0} 个自动修正，${validation.warning_count || 0} 个需要人工确认。</p>`
+        : "";
+      $("review").innerHTML = `
+        <article class="issue info">
+          <div class="issue-head">
+            <div>
+              <span class="issue-code">organize_review</span>
+              <div class="issue-path">整理建议 · 模式 ${escapeHtml(review.review_mode || "")}</div>
+            </div>
+            <strong>建议</strong>
+          </div>
+          ${summary ? `<p class="issue-message">${escapeHtml(summary)}</p>` : ""}
+          ${nextActions.length ? `<p class="issue-message"><strong>下一步：</strong>${escapeHtml(nextActions.slice(0, 4).join("；"))}</p>` : ""}
+          ${questions.length ? `<p class="issue-message"><strong>可用于复习：</strong>${escapeHtml(questions.slice(0, 3).map((item) => item.question || "").filter(Boolean).join("；"))}</p>` : ""}
+          ${validationLine}
+        </article>
+      `;
+    }
+
+    function renderIssue(issue) {
+      const line = issue.line ? `:${issue.line}` : "";
+      const severity = issue.severity || "warning";
+      return `
+        <article class="issue ${escapeHtml(severity)}">
+          <div class="issue-head">
+            <div>
+              <span class="issue-code">${escapeHtml(issue.code || "issue")}</span>
+              <div class="issue-path">${escapeHtml(issue.path || "")}${line}</div>
+            </div>
+            <strong>${escapeHtml(severity)}</strong>
+          </div>
+          <p class="issue-message">${escapeHtml(issue.message || "")}</p>
+        </article>
+      `;
+    }
+
+    function metric(value, label) {
+      return `<div class="metric"><strong>${escapeHtml(value ?? 0)}</strong><span>${escapeHtml(label)}</span></div>`;
+    }
+
+    function updateScopeHint() {
+      const scopeType = $("scopeType").value;
+      const input = $("scopeValue");
+      if (scopeType === "all_vault") {
+        input.placeholder = "全部 Vault 不需要填写";
+        input.value = "";
+        input.disabled = true;
+      } else if (scopeType === "selected_notes") {
+        input.placeholder = "每行一个相对路径，例如：courses/js/Servlet.md";
+        input.disabled = false;
+      } else if (scopeType === "folder") {
+        input.placeholder = "例如：courses/js";
+        input.disabled = false;
+      } else {
+        input.placeholder = "例如：java/servlet";
+        input.disabled = false;
+      }
+    }
+
+    function clearResults() {
+      $("summary").innerHTML = "";
+      $("review").innerHTML = "";
+      $("issues").innerHTML = "";
+      $("markdownBox").style.display = "none";
+      $("markdown").textContent = "";
+    }
+
+    function setBusy(busy) {
+      $("runBtn").disabled = busy;
+    }
+
+    function setStatus(message, isError = false) {
+      const node = $("status");
+      node.textContent = message || "";
+      node.className = message ? `status visible ${isError ? "error" : ""}` : "status";
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+SETTINGS_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>工作区设置</title>
+  <style>
+    :root { --bg:#f7f5ef; --panel:#fff; --line:#ddd7c8; --text:#26231d; --muted:#716b5f; --accent:#1f6f78; --danger:#b54747; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:Inter,"Segoe UI","Microsoft YaHei",sans-serif; }
+    main { max-width:980px; margin:0 auto; padding:28px; }
+    header { display:flex; justify-content:space-between; align-items:flex-start; gap:20px; margin-bottom:20px; }
+    h1 { margin:0 0 8px; font-size:28px; }
+    p { margin:0; color:var(--muted); line-height:1.6; }
+    nav { display:flex; gap:12px; flex-wrap:wrap; }
+    nav a { color:var(--accent); text-decoration:none; font-size:14px; }
+    section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:18px; margin-bottom:16px; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+    label { display:block; font-size:13px; color:var(--muted); margin-bottom:6px; }
+    input { width:100%; border:1px solid var(--line); border-radius:6px; padding:10px 11px; font-size:14px; background:#fff; color:var(--text); }
+    .full { grid-column:1 / -1; }
+    .actions { display:flex; gap:10px; align-items:center; margin-top:14px; }
+    button { border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:6px; padding:9px 14px; cursor:pointer; font-size:14px; }
+    button.secondary { background:transparent; color:var(--accent); }
+    .status { margin-top:12px; font-size:14px; color:var(--muted); }
+    .status.error { color:var(--danger); }
+    .hint { font-size:13px; color:var(--muted); margin-top:8px; }
+    code { background:#f0ece2; padding:2px 5px; border-radius:4px; }
+    @media (max-width:760px) { .grid { grid-template-columns:1fr; } header { display:block; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>工作区设置</h1>
+        <p>设置当前笔记库路径和相关状态文件。浏览器不能直接选择本机目录，第一版使用路径输入。</p>
+      </div>
+      <nav>
+        <a href="/chat">对话</a>
+        <a href="/topics">知识主题</a>
+        <a href="/organize">整理</a>
+        <a href="/search">检索调试</a>
+        <a href="/admin/wiki">维护</a>
+        <a href="/settings">设置</a>
+      </nav>
+    </header>
+
+    <section>
+      <div class="grid">
+        <div class="full">
+          <label for="vaultPath">笔记库路径</label>
+          <input id="vaultPath" placeholder="D:\31002\Documents\MyNote" />
+          <div class="hint">这是 Obsidian vault 根目录。后端会验证目录是否存在。</div>
+        </div>
+        <div><label for="wikiDir">Wiki 输出目录</label><input id="wikiDir" placeholder="D:\31002\Documents\MyNote\wiki_full" /></div>
+        <div><label for="wikiStatePath">Wiki State</label><input id="wikiStatePath" placeholder="./wiki-state/wiki_state.full-test.json" /></div>
+        <div><label for="workspaceStatePath">Workspace State</label><input id="workspaceStatePath" placeholder="./wiki-state/workspace_state.json" /></div>
+        <div><label for="indexPath">向量索引</label><input id="indexPath" placeholder="./rag-index/mixed-siliconflow-bge-m3.json" /></div>
+        <div><label for="bm25IndexPath">BM25 索引</label><input id="bm25IndexPath" placeholder="./rag-index/mixed-siliconflow-bge-m3.bm25.json" /></div>
+        <div><label for="minNotes">最少笔记数</label><input id="minNotes" type="number" min="1" value="2" /></div>
+        <div><label for="overviewThreshold">Overview 阈值</label><input id="overviewThreshold" type="number" min="1" value="12" /></div>
+      </div>
+      <div class="actions"><button id="saveBtn">保存设置</button><button id="reloadBtn" class="secondary">重新加载</button></div>
+      <div id="status" class="status">正在加载配置...</div>
+    </section>
+
+    <section>
+      <p>保存路径后，Wiki、同步、对话中的文件检索会使用新的笔记库路径。搜索服务的向量索引在服务启动时加载；如果切换到另一套索引文件，建议重启 Web 服务后再检索。</p>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    async function loadConfig() {
+      setStatus("正在加载配置...");
+      const response = await fetch("/api/workspace/config");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "配置加载失败");
+      fillForm(data.config);
+      renderValidation(data.validation, data.config_path);
+    }
+    function fillForm(config) {
+      $("vaultPath").value = config.vault_path || "";
+      $("wikiDir").value = config.wiki_dir || "";
+      $("wikiStatePath").value = config.wiki_state_path || "";
+      $("workspaceStatePath").value = config.workspace_state_path || "";
+      $("indexPath").value = config.index_path || "";
+      $("bm25IndexPath").value = config.bm25_index_path || "";
+      $("minNotes").value = config.min_notes_per_tag || 2;
+      $("overviewThreshold").value = config.overview_note_threshold || 12;
+    }
+    function collectForm() {
+      return {
+        vault_path: $("vaultPath").value.trim(), wiki_dir: $("wikiDir").value.trim(),
+        wiki_state_path: $("wikiStatePath").value.trim(), workspace_state_path: $("workspaceStatePath").value.trim(),
+        index_path: $("indexPath").value.trim(), bm25_index_path: $("bm25IndexPath").value.trim(),
+        min_notes_per_tag: Number($("minNotes").value || 2), overview_note_threshold: Number($("overviewThreshold").value || 12),
+      };
+    }
+    async function saveConfig() {
+      setStatus("正在保存配置...");
+      const response = await fetch("/api/workspace/config", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(collectForm()) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "保存失败");
+      fillForm(data.config);
+      renderValidation(data.validation, data.config_path);
+    }
+    function renderValidation(validation, configPath) { setStatus(`${validation.message} 配置文件：${configPath}`, validation.ok ? "" : "error"); }
+    function setStatus(message, kind="") { $("status").textContent = message; $("status").className = kind ? `status ${kind}` : "status"; }
+    $("saveBtn").addEventListener("click", () => saveConfig().catch((error) => setStatus(error.message, "error")));
+    $("reloadBtn").addEventListener("click", () => loadConfig().catch((error) => setStatus(error.message, "error")));
+    loadConfig().catch((error) => setStatus(error.message, "error"));
+  </script>
+</body>
+</html>
+"""
 INDEX_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Knowledge Agent Search</title>
+  <title>检索调试</title>
   <style>
     :root {
       color-scheme: light;
@@ -639,8 +3516,18 @@ INDEX_HTML = r"""<!doctype html>
 <body>
   <main>
     <div class="topbar">
-      <h1>Knowledge Agent Search</h1>
-      <div id="status" class="status">ready</div>
+      <div>
+        <h1>检索调试</h1>
+        <div id="status" class="status">就绪</div>
+      </div>
+      <nav class="topnav">
+        <a href="/chat">对话</a>
+        <a href="/topics">知识主题</a>
+        <a href="/organize">整理</a>
+        <a href="/search">检索调试</a>
+        <a href="/admin/wiki">维护</a>
+      <a href="/settings">设置</a>
+      </nav>
     </div>
 
     <section class="search-panel">
@@ -658,7 +3545,7 @@ INDEX_HTML = r"""<!doctype html>
         <summary>高级选项</summary>
         <div class="advanced-grid">
           <div class="field">
-            <label for="mode">mode</label>
+            <label for="mode">模式</label>
             <select id="mode">
               <option value="hybrid" selected>hybrid</option>
               <option value="dense">dense</option>
@@ -667,7 +3554,7 @@ INDEX_HTML = r"""<!doctype html>
             </select>
           </div>
           <div class="field">
-            <label for="rerankerType">reranker</label>
+            <label for="rerankerType">Reranker</label>
             <select id="rerankerType">
               <option value="off" selected>off</option>
               <option value="local">local</option>
@@ -920,7 +3807,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function setBusy(isBusy) {
       $("searchBtn").disabled = isBusy;
-      $("status").textContent = isBusy ? "searching" : "ready";
+      $("status").textContent = isBusy ? "检索中" : "就绪";
     }
 
     function escapeHtml(value) {
@@ -942,7 +3829,7 @@ CHAT_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Knowledge Agent Chat</title>
+  <title>知识库对话</title>
   <style>
     :root {
       color-scheme: light;
@@ -995,6 +3882,13 @@ CHAT_HTML = r"""<!doctype html>
       text-decoration: none;
       font-size: 14px;
       font-weight: 600;
+    }
+
+    .topnav {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
     }
 
     .status {
@@ -1221,6 +4115,29 @@ CHAT_HTML = r"""<!doctype html>
       flex-wrap: wrap;
     }
 
+    .advanced-options {
+      flex: 1 1 100%;
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: var(--soft);
+    }
+
+    .advanced-options summary {
+      cursor: pointer;
+      color: var(--accent-dark);
+      font-weight: 700;
+      font-size: 13px;
+    }
+
+    .advanced-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
     select, input, button {
       font: inherit;
     }
@@ -1286,10 +4203,17 @@ CHAT_HTML = r"""<!doctype html>
     <header>
       <div class="topbar">
         <div>
-          <h1>Knowledge Agent Chat</h1>
-          <div id="status" class="status">ready</div>
+          <h1>知识库对话</h1>
+          <div id="status" class="status">就绪</div>
         </div>
-        <a href="/">Search</a>
+        <nav class="topnav">
+          <a href="/chat">对话</a>
+          <a href="/topics">知识主题</a>
+          <a href="/organize">整理</a>
+          <a href="/search">检索调试</a>
+          <a href="/admin/wiki">维护</a>
+      <a href="/settings">设置</a>
+        </nav>
       </div>
     </header>
 
@@ -1297,27 +4221,50 @@ CHAT_HTML = r"""<!doctype html>
 
     <section class="composer">
       <div id="starters" class="starters"></div>
-      <textarea id="query" placeholder="输入问题，例如：Redis Stream 任务队列怎么消费事件"></textarea>
+      <textarea id="query" placeholder="询问、检索、整理或基于你的笔记生成内容..."></textarea>
       <div class="composer-row">
         <button id="sendBtn">发送</button>
-        <label class="field">command
-          <select id="command">
-            <option value="auto" selected>auto</option>
-            <option value="Notes">Notes</option>
-            <option value="RegexSearchFiles">RegexSearchFiles</option>
-            <option value="Notes+Online">Notes+Online</option>
-          </select>
-        </label>
-        <label class="field">top
-          <input id="notesTopK" type="number" min="1" max="50" value="5" />
-        </label>
-        <label class="field">online
-          <input id="onlineProvider" type="text" placeholder="disabled / tavily / brave" />
-        </label>
-        <label class="field">
-          <input id="speculative" type="checkbox" checked />
-          speculative notes
-        </label>
+        <details class="advanced-options">
+          <summary>高级选项</summary>
+          <div class="advanced-grid">
+            <label class="field">模式
+              <select id="chatMode">
+                <option value="answer" selected>问答</option>
+                <option value="interview">模拟面试</option>
+                <option value="study">复习助教</option>
+              </select>
+            </label>
+            <label class="field">范围
+              <select id="scopeType">
+                <option value="tag" selected>Tag</option>
+                <option value="folder">文件夹</option>
+                <option value="selected_notes">指定笔记</option>
+                <option value="search">搜索结果</option>
+              </select>
+            </label>
+            <label class="field">范围值
+              <input id="scopeValue" type="text" placeholder="个人/面试/agent面试" />
+            </label>
+            <label class="field">指令
+              <select id="command">
+                <option value="auto" selected>auto</option>
+                <option value="Notes">Notes</option>
+                <option value="RegexSearchFiles">RegexSearchFiles</option>
+                <option value="Notes+Online">Notes+Online</option>
+              </select>
+            </label>
+            <label class="field">引用数
+              <input id="notesTopK" type="number" min="1" max="50" value="5" />
+            </label>
+            <label class="field">联网
+              <input id="onlineProvider" type="text" placeholder="disabled / tavily / brave" />
+            </label>
+            <label class="field">
+              <input id="speculative" type="checkbox" checked />
+              预先检索本地笔记
+            </label>
+          </div>
+        </details>
       </div>
     </section>
   </main>
@@ -1326,6 +4273,7 @@ CHAT_HTML = r"""<!doctype html>
     const $ = (id) => document.getElementById(id);
     const messages = $("messages");
     let currentAssistant = null;
+    let chatHistory = [];
     let currentPayload = {
       router: null,
       retrieval: null,
@@ -1373,7 +4321,12 @@ CHAT_HTML = r"""<!doctype html>
 
       const body = {
         query,
+        chat_mode: $("chatMode").value,
         command: $("command").value,
+        scope_type: $("scopeType").value,
+        scope_value: $("scopeValue").value.trim() || null,
+        scope_paths: scopePaths(),
+        chat_history: chatHistory.slice(-12),
         notes_top_k: numberValue("notesTopK"),
         online_provider: $("onlineProvider").value.trim() || null,
         speculative_notes_search: $("speculative").checked
@@ -1390,6 +4343,11 @@ CHAT_HTML = r"""<!doctype html>
           throw new Error(data.detail || "request failed");
         }
         await readSseStream(response.body);
+        if (currentPayload.answer?.answer) {
+          chatHistory.push({role: "user", content: query});
+          chatHistory.push({role: "assistant", content: currentPayload.answer.answer});
+          chatHistory = chatHistory.slice(-12);
+        }
       } catch (error) {
         currentPayload.errors.push({message: error.message});
         renderAssistant(currentAssistant, currentPayload);
@@ -1454,7 +4412,7 @@ CHAT_HTML = r"""<!doctype html>
     function appendUserMessage(text) {
       const node = document.createElement("article");
       node.className = "message user";
-      node.innerHTML = `<div class="role">User</div><div class="answer">${escapeHtml(text)}</div>`;
+      node.innerHTML = `<div class="role">你</div><div class="answer">${escapeHtml(text)}</div>`;
       messages.appendChild(node);
       scrollToBottom();
     }
@@ -1462,7 +4420,7 @@ CHAT_HTML = r"""<!doctype html>
     function appendAssistantMessage() {
       const node = document.createElement("article");
       node.className = "message assistant";
-      node.innerHTML = `<div class="role">Assistant</div><div class="answer">正在处理...</div>`;
+      node.innerHTML = `<div class="role">助手</div><div class="answer">正在处理...</div>`;
       messages.appendChild(node);
       scrollToBottom();
       return node;
@@ -1597,6 +4555,14 @@ CHAT_HTML = r"""<!doctype html>
       return Number($(id).value);
     }
 
+    function scopePaths() {
+      if ($("scopeType").value !== "selected_notes") return [];
+      return $("scopeValue").value
+        .split(/\r?\n/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+
     function setBusy(isBusy, text) {
       $("sendBtn").disabled = isBusy;
       $("status").textContent = text;
@@ -1618,3 +4584,6 @@ CHAT_HTML = r"""<!doctype html>
 </body>
 </html>
 """
+
+
+

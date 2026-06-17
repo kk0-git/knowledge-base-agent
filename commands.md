@@ -167,3 +167,203 @@ rag-index/bge-m3-v2.bm25.json     # 本地 BM25
 mixed-siliconflow-bge-m3.json     # API 向量索引
 mixed-siliconflow-bge-m3.bm25.json # API BM25
 ```
+
+## 7. Wiki / Obsidian 工作流
+
+日常只记两个动作：
+
+```text
+更新主题 Wiki：同步工作区 -> 更新指定 topic wiki -> 刷新 _Wiki Report.md
+同步 RAG 索引：同步 embedding/BM25 -> 同步 tag state -> 刷新 _Wiki Report.md
+```
+
+### 7.1 更新主题 Wiki（Obsidian 常用）
+
+适合配置到 Obsidian Shell Commands。该命令会先同步工作区，再更新指定主题 Wiki；如果只想跳过 embedding，可额外追加 `--no-rag`。
+Shell Commands 中建议使用 Prompt 变量 `{{tag}}`，不要依赖选中文本变量。
+
+```powershell
+cd D:\Workspaces\Personal\agent\obsidian_vault\knowledge_agent
+uv run python scripts\workspace_sync.py update-topic `
+  --vault "D:\31002\Documents\MyNote" `
+  --state ./wiki-state/wiki_state.full-test.json `
+  --wiki-dir "D:\31002\Documents\MyNote\wiki_full" `
+  --min-notes-per-tag 2 `
+  --overview-note-threshold 12 `
+  --tag "{{tag}}" `
+  --force
+```
+
+成功输出：
+
+```text
+OK: synced 1 changed notes, refreshed topic wiki.
+Topic wiki updated.
+Report: D:\31002\Documents\MyNote\wiki_full\_Wiki Report.md
+```
+
+### 7.2 同步 RAG 索引（搜索/对话前使用）
+
+用于更新 embedding、BM25、tag state 和 `_Wiki Report.md`，不自动合成 wiki 正文。
+这条命令影响搜索、聊天和 eval；不需要在每次更新 wiki 时运行。
+
+```powershell
+uv run python scripts\workspace_sync.py watch `
+  --vault "D:\31002\Documents\MyNote" `
+  --state ./wiki-state/wiki_state.full-test.json `
+  --wiki-dir "D:\31002\Documents\MyNote\wiki_full" `
+  --min-notes-per-tag 2 `
+  --overview-note-threshold 12 `
+  --once
+```
+
+### 7.3 只刷新 Obsidian 状态面板
+
+```powershell
+uv run python scripts\wiki_debug.py write-report `
+  --vault "D:\31002\Documents\MyNote" `
+  --state ./wiki-state/wiki_state.full-test.json `
+  --wiki-dir "D:\31002\Documents\MyNote\wiki_full" `
+  --min-notes-per-tag 2 `
+  --overview-note-threshold 12
+```
+
+### 7.4 后台轮询同步
+
+不自动合成 wiki 正文，只自动维护 RAG index、tag state 和 `_Wiki Report.md`：
+
+```powershell
+uv run python scripts\workspace_sync.py watch `
+  --vault "D:\31002\Documents\MyNote" `
+  --state ./wiki-state/wiki_state.full-test.json `
+  --wiki-dir "D:\31002\Documents\MyNote\wiki_full" `
+  --min-notes-per-tag 2 `
+  --overview-note-threshold 12 `
+  --quiet-seconds 10800 `
+  --poll-seconds 60
+```
+
+Obsidian Shell Commands 插件配置见：`docs/OBSIDIAN_WORKFLOW.md`。
+
+## 8. Workflow Debug
+
+用于验证统一工作流抽象的 `scope -> context` 是否正确。
+
+前端入口：
+
+```text
+http://127.0.0.1:8001/audit
+```
+
+```powershell
+uv run python scripts\workflow_debug.py inspect-scope `
+  --vault "D:\31002\Documents\MyNote" `
+  --state ./wiki-state/wiki_state.full-test.json `
+  --wiki-dir "D:\31002\Documents\MyNote\wiki_full" `
+  --scope-type tag `
+  --value "java/servlet" `
+  --context-mode wiki_context
+```
+
+预期会输出该 tag 命中的源笔记数、context items 数量和前几个 sample item。
+
+### 8.1 确定性审计
+
+不触发 LLM，用规则检查指定范围内的笔记和 wiki state。
+
+```powershell
+uv run python scripts\workflow_debug.py audit `
+  --vault "D:\31002\Documents\MyNote" `
+  --state ./wiki-state/wiki_state.full-test.json `
+  --wiki-dir "D:\31002\Documents\MyNote\wiki_full" `
+  --scope-type tag `
+  --value "java/servlet" `
+  --max-issues 20
+```
+
+当前会检查绝对图片路径、重复标题、空标题、标题无正文，以及 wiki 合成失败/缺失等状态问题。
+
+### 8.3 统一整理 workflow（推荐入口）
+
+`organize` 会把确定性结构审计和 LLM 整理建议合并到一个报告中：
+
+- 结构检查：坏链接、空 section、短 note、图片路径、wiki 状态等确定性问题。
+- 整理建议：主题覆盖、核心/边缘笔记、补链、补 tag、wiki 候选、复习问题。
+
+```powershell
+uv run python scripts\workflow_debug.py organize `
+  --vault "D:\31002\Documents\MyNote" `
+  --state ./wiki-state/wiki_state.full-test.json `
+  --wiki-dir "D:\31002\Documents\MyNote\wiki_full" `
+  --scope-type tag `
+  --value "学习/全栈" `
+  --max-issues 20 `
+  --max-notes 8 `
+  --max-chars-per-note 1600 `
+  --review-mode topic
+```
+
+输出：
+
+```text
+eval-results/organize-tag-学习-全栈.json
+eval-results/organize-tag-学习-全栈.md
+```
+
+旧命令仍可用于分开调试：
+
+- `workflow_debug.py audit`：只跑确定性审计。
+- `workflow_debug.py review-notes`：只跑 LLM 整理建议。
+
+### 8.4 复习 chat mode
+
+复习不单独生成题库，而是在 `/chat` 中选择模式，再选择 `Tag / 文件夹 / 指定笔记 / 搜索结果` 作为 source notes。
+
+- `模拟面试`：LLM 扮演考官。笔记是私有参考答案，不在正文里讲解；重点是抓住用户回答里的模糊点继续追问。
+- `复习助教`：LLM 扮演助教。笔记是教案；可以指出遗漏、解释概念、引用来源，并用一个小问题确认理解。
+
+本地测试入口：
+
+```text
+http://127.0.0.1:8003/chat
+```
+
+示例选择：
+
+```text
+模式：模拟面试
+范围：文件夹
+范围值：个人/面试/agent面试
+输入：开始面试复习，先问我一个问题
+```
+
+API smoke test：
+
+```powershell
+@'
+import json
+import urllib.request
+
+payload = {
+    "query": "开始面试复习，先问我一个问题",
+    "chat_mode": "interview",
+    "scope_type": "folder",
+    "scope_value": "个人/面试/agent面试",
+    "notes_top_k": 5,
+}
+req = urllib.request.Request(
+    "http://127.0.0.1:8003/api/agent/stream",
+    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(req, timeout=120) as resp:
+    print(resp.read(2000).decode("utf-8", errors="replace"))
+'@ | uv run python -
+```
+
+把 `"chat_mode": "interview"` 改成 `"study"` 可测试复习助教模式。
+
+
+
+

@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
-WIKI_STATE_SCHEMA_VERSION = 2
+WIKI_STATE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,10 @@ class WikiTagRecord:
     generated_at: str | None = None
     updated_at: str | None = None
     source_hashes: dict[str, str] = field(default_factory=dict)
+    last_error: str | None = None
+    last_error_type: str | None = None
+    last_error_at: str | None = None
+    retry_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -113,6 +117,10 @@ def wiki_tag_record_from_dict(data: dict[str, Any]) -> WikiTagRecord:
             str(path): str(content_hash)
             for path, content_hash in data.get("source_hashes", {}).items()
         },
+        last_error=data.get("last_error"),
+        last_error_type=data.get("last_error_type"),
+        last_error_at=data.get("last_error_at"),
+        retry_count=int(data.get("retry_count", 0)),
     )
 
 

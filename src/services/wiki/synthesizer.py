@@ -14,7 +14,7 @@ RELATED_WIKI_HEADING = "\u76f8\u5173 wiki"
 SOURCES_HEADING = "\u6765\u6e90"
 
 
-WIKI_SYSTEM_PROMPT = """You are a personal knowledge-base wiki synthesis assistant.
+DEFAULT_WIKI_SYSTEM_PROMPT = """You are a personal knowledge-base wiki synthesis assistant.
 
 Task: synthesize multiple source notes under the same wiki candidate into one readable and auditable wiki page.
 
@@ -33,7 +33,7 @@ Rules:
 """
 
 
-WIKI_OVERVIEW_SYSTEM_PROMPT = """You are a personal knowledge-base wiki overview assistant.
+DEFAULT_WIKI_OVERVIEW_SYSTEM_PROMPT = """You are a personal knowledge-base wiki overview assistant.
 
 The current tag is a broad topic. Generate a navigation-oriented overview, not a detailed tutorial.
 
@@ -50,6 +50,18 @@ Rules:
 - Related wiki pages may be provided as navigation context.
 - Do not write a related wiki section yourself. The system will render it after your article body.
 """
+
+
+def load_prompt(filename: str, fallback: str) -> str:
+    prompt_path = Path(__file__).with_name("prompts") / filename
+    try:
+        return prompt_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return fallback.strip()
+
+
+WIKI_SYSTEM_PROMPT = load_prompt("synthesize_wiki.md", DEFAULT_WIKI_SYSTEM_PROMPT)
+WIKI_OVERVIEW_SYSTEM_PROMPT = load_prompt("synthesize_overview.md", DEFAULT_WIKI_OVERVIEW_SYSTEM_PROMPT)
 
 
 @dataclass(frozen=True)
