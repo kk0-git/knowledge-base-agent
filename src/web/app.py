@@ -43,7 +43,17 @@ from services.wiki.tag_consolidation import (
 )
 from services.wiki.tag_refinement import LLMTagRefiner, tag_refinement_proposal_to_dict
 from services.workflows.context_builder import ContextBuilder
-from services.workflows.interview import build_interview_messages
+from services.workflows.interview import (
+    build_interview_messages,
+    deterministic_interview_plan,
+    generate_session_summary,
+    interview_plan_from_dict,
+    interview_session_state_from_dict,
+    interview_plan_to_dict,
+    prepare_interview_plan,
+)
+from services.workflows.interview_profile import InterviewProfileStore, render_candidate_profile_context
+from services.workflows.interview_sessions import InterviewSessionStore
 from services.workflows.runner import WorkflowRunner, task_result_to_dict
 from services.workflows.schema import ScopeSpec, WorkflowSpec, WritebackSpec
 from services.workflows.scope_resolver import ScopeResolver
@@ -88,6 +98,50 @@ class AgentRequest(BaseModel):
     speculative_notes_search: bool = Field(default=True)
     interview_max_chars_per_note: int = Field(default=4000, ge=500, le=12000)
     interview_max_context_chars: int = Field(default=24000, ge=2000, le=60000)
+    interview_plan: dict[str, Any] | None = Field(default=None)
+    interview_state: dict[str, Any] | None = Field(default=None)
+
+
+class InterviewSummaryRequest(BaseModel):
+    scope_type: str = Field(default="tag")
+    scope_value: str | None = Field(default=None)
+    scope_paths: list[str] = Field(default_factory=list)
+    chat_history: list[dict[str, str]] = Field(default_factory=list)
+    answer: str = Field(default="")
+    interview_plan: dict[str, Any] | None = Field(default=None)
+    notes_top_k: int = Field(default=5, ge=1, le=50)
+    dense_top_k: int = Field(default=50, ge=1, le=500)
+    hybrid_bm25_top_k: int = Field(default=50, ge=1, le=500)
+    rrf_k: int = Field(default=60, ge=1, le=500)
+    interview_max_chars_per_note: int = Field(default=4000, ge=500, le=12000)
+    interview_max_context_chars: int = Field(default=24000, ge=2000, le=60000)
+
+
+class InterviewSessionCreateRequest(BaseModel):
+    source_type: str = Field(default="tag")
+    source_value: str | None = Field(default=None)
+    source_paths: list[str] = Field(default_factory=list)
+    source_note_paths: list[str] = Field(default_factory=list)
+    interview_plan: dict[str, Any] | None = Field(default=None)
+    interview_state: dict[str, Any] | None = Field(default=None)
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class InterviewSessionAppendTurnRequest(BaseModel):
+    user_content: str = Field(default="")
+    assistant_content: str = Field(default="")
+    interview_plan: dict[str, Any] | None = Field(default=None)
+    interview_state: dict[str, Any] | None = Field(default=None)
+    source_note_paths: list[str] = Field(default_factory=list)
+
+
+class InterviewSessionReviewRequest(BaseModel):
+    user_message_id: str = Field(default="")
+    assistant_message_id: str = Field(default="")
+    feedback: dict[str, Any] = Field(default_factory=dict)
+    reference_answer: str = Field(default="")
+    expression_example: str = Field(default="")
+    profile_signals: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class WikiSynthesizeTagRequest(BaseModel):
@@ -356,20 +410,20 @@ def validate_workspace_config(config: WorkspaceRuntimeConfig) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
     if config.vault_path is None:
-        errors.append("请填写笔记库路径。")
+        errors.append("vault path is required")
     elif not config.vault_path.exists() or not config.vault_path.is_dir():
-        errors.append(f"笔记库路径不存在或不是目录：{config.vault_path}")
+        errors.append(f"vault path does not exist or is not a directory: {config.vault_path}")
     if config.wiki_dir is None:
-        warnings.append("未设置 wiki 输出目录，将无法写入 wiki 报告。")
+        warnings.append("wiki output directory is not configured")
     if config.wiki_state_path is None:
-        errors.append("请填写 wiki state 路径。")
+        errors.append("wiki state path is required")
     if config.workspace_state_path is None:
-        errors.append("请填写 workspace state 路径。")
+        errors.append("workspace state path is required")
     if not config.index_path.parent.exists():
-        warnings.append(f"索引目录不存在，将在同步时创建：{config.index_path.parent}")
+        warnings.append(f"index directory does not exist and will be created on sync: {config.index_path.parent}")
     return {
         "ok": not errors,
-        "message": "；".join(errors or warnings or ["配置可用。"]),
+        "message": "; ".join(errors or warnings or ["config is ready"]),
         "errors": errors,
         "warnings": warnings,
     }
@@ -400,7 +454,7 @@ def create_app(
     wiki_overview_note_threshold: int = 12,
     sync_on_start: bool = False,
 ) -> FastAPI:
-    app = FastAPI(title="知识库助手")
+    app = FastAPI(title="Knowledge Agent")
     config_path = project_root / "workspace-config.json"
     runtime_config = load_workspace_runtime_config(
         config_path=config_path,
@@ -415,6 +469,8 @@ def create_app(
             overview_note_threshold=wiki_overview_note_threshold,
         ),
     )
+    interview_session_store = InterviewSessionStore(project_root / "interview-sessions")
+    interview_profile_store = InterviewProfileStore(project_root / "profile" / "interview_profile.json")
     startup_sync_status: dict[str, Any] = {
         "enabled": sync_on_start,
         "running": False,
@@ -545,11 +601,11 @@ def create_app(
     def chat_starters() -> dict[str, Any]:
         return {
             "starters": [
-                "Redis Stream 任务队列怎么消费事件？",
-                "进程是什么？和线程有什么区别？",
-                "FastAPI CORS 跨域怎么配置？",
-                "我有哪些关于 LLM Agent 架构的笔记？",
-                "WinError 10060 可能是什么原因？",
+                "How should Redis Stream consumers handle events?",
+                "What is a process, and how is it different from a thread?",
+                "How do I configure FastAPI CORS?",
+                "What notes do I have about LLM Agent architecture?",
+                "What can cause WinError 10060?",
             ]
         }
 
@@ -1096,6 +1152,49 @@ def create_app(
                 "stats": context.stats,
             },
         )
+        plan = None
+        plan_error: str | None = None
+        plan_source: str | None = None
+        plan_started_at = current_time()
+        plan_ms: int | None = None
+        if request.chat_mode == "interview":
+            if request.interview_plan:
+                try:
+                    plan = interview_plan_from_dict(request.interview_plan, context=context)
+                    plan_source = "client_reused"
+                    plan_ms = elapsed_since(plan_started_at)
+                except Exception as exc:
+                    plan_error = f"client plan rejected: {exc}"
+            if plan is None:
+                try:
+                    yield sse_event(
+                        "status",
+                        {"stage": "interview_plan_started", "message": "preparing interview plan"},
+                    )
+                    plan = prepare_interview_plan(
+                        context=context,
+                        llm_client=llm_client,
+                        model=llm_config.model,
+                        temperature=min(llm_config.temperature, 0.2),
+                    )
+                    plan_source = "generated"
+                    plan_ms = elapsed_since(plan_started_at)
+                except Exception as exc:
+                    plan_error = str(exc) if not plan_error else f"{plan_error}; generated plan failed: {exc}"
+                    plan = deterministic_interview_plan(context)
+                    plan_source = "deterministic_fallback"
+                    plan_ms = elapsed_since(plan_started_at)
+            yield sse_event(
+                "interview_plan",
+                {
+                    "available": True,
+                    "fallback_used": plan_source == "deterministic_fallback",
+                    "source": plan_source,
+                    "plan": interview_plan_to_dict(plan),
+                    "error": plan_error,
+                    "latency_ms": plan_ms,
+                },
+            )
         yield sse_event(
             "status",
             {
@@ -1107,6 +1206,17 @@ def create_app(
         started_at = current_time()
         first_delta_ms: int | None = None
         answer_parts: list[str] = []
+        session_state = interview_session_state_from_dict(request.interview_state)
+        candidate_profile_context = None
+        if request.chat_mode == "interview":
+            try:
+                candidate_profile_context = render_candidate_profile_context(
+                    profile=interview_profile_store.load(),
+                    current_topic=session_state.current_topic if session_state else None,
+                    plan=plan,
+                )
+            except Exception as exc:
+                candidate_profile_context = f"(candidate profile unavailable: {exc})"
         llm_request = LLMRequest(
             model=llm_config.model,
             messages=build_interview_messages(
@@ -1114,6 +1224,10 @@ def create_app(
                 context=context,
                 chat_history=list(request.chat_history or []),
                 mode=request.chat_mode,
+                plan=plan,
+                plan_error=plan_error,
+                session_state=session_state,
+                candidate_profile_context=candidate_profile_context,
             ),
             temperature=llm_config.temperature,
         )
@@ -1125,9 +1239,24 @@ def create_app(
 
         answer_text = "".join(answer_parts)
         answer_ms = elapsed_since(started_at)
+        session_summary: str | None = None
+        summary_ms: int | None = None
         telemetry = {
             "command": "StudyReview" if request.chat_mode == "study" else "InterviewReview",
             "context": context.stats,
+            "interview_plan": {
+                "available": plan is not None,
+                "fallback_used": plan_source == "deterministic_fallback",
+                "source": plan_source,
+                "error": plan_error,
+                "latency_ms": plan_ms,
+            },
+            "interview_state": request.interview_state,
+            "session_summary": {
+                "available": session_summary is not None,
+                "latency_ms": summary_ms,
+                "deferred": request.chat_mode == "interview",
+            },
             "generation": {
                 "ttft_ms": first_delta_ms,
                 "answer_ms": answer_ms,
@@ -1143,6 +1272,7 @@ def create_app(
                 "answer": answer_text,
                 "model": llm_config.model,
                 "prompt_chars": len(context.context_text),
+                "session_summary": session_summary,
             },
         )
         yield sse_event(
@@ -1153,6 +1283,185 @@ def create_app(
                 "command": "StudyReview" if request.chat_mode == "study" else "InterviewReview",
             },
         )
+
+    @app.post("/api/interview/sessions")
+    def create_interview_session(request: InterviewSessionCreateRequest) -> dict[str, Any]:
+        try:
+            session = interview_session_store.create_session(
+                source_type=request.source_type,
+                source_value=request.source_value,
+                source_paths=request.source_paths,
+                source_note_paths=request.source_note_paths,
+                interview_plan=request.interview_plan,
+                interview_state=request.interview_state,
+                extra=request.extra,
+            )
+            return {"session": session}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/interview/sessions")
+    def list_interview_sessions(limit: int = 50) -> dict[str, Any]:
+        try:
+            return {"sessions": interview_session_store.list_sessions(limit=limit)}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/interview/sessions/{session_id}")
+    def get_interview_session(session_id: str) -> dict[str, Any]:
+        try:
+            return interview_session_store.load_session_bundle(session_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/interview/sessions/{session_id}/turns")
+    def append_interview_turn(session_id: str, request: InterviewSessionAppendTurnRequest) -> dict[str, Any]:
+        if not request.user_content.strip() or not request.assistant_content.strip():
+            raise HTTPException(status_code=400, detail="user_content and assistant_content are required")
+        try:
+            result = interview_session_store.append_turn(
+                session_id=session_id,
+                user_content=request.user_content,
+                assistant_content=request.assistant_content,
+                interview_plan=request.interview_plan,
+                interview_state=request.interview_state,
+                source_note_paths=request.source_note_paths,
+            )
+            return {
+                "user_message": result["user_message"],
+                "assistant_message": result["assistant_message"],
+                "session": result["session"],
+            }
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/interview/sessions/{session_id}/reviews")
+    def save_interview_turn_review(session_id: str, request: InterviewSessionReviewRequest) -> dict[str, Any]:
+        if not request.user_message_id or not request.assistant_message_id:
+            raise HTTPException(status_code=400, detail="message ids are required")
+        try:
+            review = interview_session_store.save_turn_review(
+                session_id=session_id,
+                user_message_id=request.user_message_id,
+                assistant_message_id=request.assistant_message_id,
+                feedback=request.feedback,
+                reference_answer=request.expression_example or request.reference_answer,
+                profile_signals=request.profile_signals,
+            )
+            return {"review": review}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/interview/sessions/{session_id}/end")
+    def end_interview_session(session_id: str) -> dict[str, Any]:
+        try:
+            session = interview_session_store.load_session(session_id)
+            if session.get("status") == "completed":
+                return {"session": session}
+            reviews_doc = interview_session_store.load_reviews(session_id)
+            reviews = reviews_doc.get("reviews", [])
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+            final_review, profile_update = interview_profile_store.update_from_session(
+                session=session,
+                reviews=reviews,
+                llm_client=llm_client,
+                model=llm_config.model,
+                temperature=min(llm_config.temperature, 0.1),
+            )
+            final_review = {
+                **final_review,
+                "message_count": len(session.get("messages") or []),
+                "review_count": len(reviews),
+                "source_note_count": (session.get("context") or {}).get("source_note_count", 0),
+            }
+            completed = interview_session_store.mark_completed(
+                session_id=session_id,
+                final_review=final_review,
+                profile_update=profile_update,
+            )
+            return {"session": completed}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            try:
+                failed = interview_session_store.mark_end_failed(session_id, str(exc))
+                return {"session": failed}
+            except Exception:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/interview/summary")
+    def interview_summary(request: InterviewSummaryRequest) -> dict[str, Any]:
+        if runtime_config.vault_path is None:
+            raise HTTPException(status_code=400, detail="vault path is required for interview summary")
+        if runtime_config.wiki_state_path is None:
+            raise HTTPException(status_code=400, detail="wiki state path is required for interview summary")
+        if not request.answer.strip():
+            raise HTTPException(status_code=400, detail="answer is required")
+
+        started_at = current_time()
+        try:
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+            rag_manager = None
+            if request.scope_type == "search":
+                rag_manager = service.build_manager(
+                    SearchOptions(
+                        query=request.scope_value or "",
+                        mode="hybrid",
+                        dense_top_k=request.dense_top_k,
+                        bm25_top_k=request.hybrid_bm25_top_k,
+                        rrf_k=request.rrf_k,
+                    )
+                )
+            resolver = ScopeResolver(
+                vault_root=runtime_config.vault_path,
+                wiki_state_store=WikiStateStore(runtime_config.wiki_state_path),
+                wiki_dir=runtime_config.wiki_dir,
+                rag_manager=rag_manager,
+                overview_note_threshold=runtime_config.overview_note_threshold,
+            )
+            scope = resolver.resolve(
+                ScopeSpec(
+                    type=request.scope_type,
+                    value=request.scope_value or None,
+                    paths=tuple(request.scope_paths or ()),
+                    top_k=request.notes_top_k,
+                )
+            )
+            context = ContextBuilder(
+                vault_root=runtime_config.vault_path,
+                max_chars_per_note=request.interview_max_chars_per_note,
+                max_context_chars=request.interview_max_context_chars,
+            ).build(scope, mode="interview_context")
+            plan = interview_plan_from_dict(request.interview_plan, context=context)
+            summary = generate_session_summary(
+                context=context,
+                chat_history=list(request.chat_history or []),
+                answer_text=request.answer,
+                llm_client=llm_client,
+                model=llm_config.model,
+                plan=plan,
+                temperature=min(llm_config.temperature, 0.2),
+            )
+            return {
+                "available": True,
+                "feedback": summary.get("feedback", {}),
+                "expression_example": summary.get("expression_example", ""),
+                "reference_answer": summary.get("expression_example", ""),
+                "profile_signals": summary.get("profile_signals", []),
+                "latency_ms": elapsed_since(started_at),
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/agent/stream")
     def agent_stream(request: AgentRequest) -> StreamingResponse:
@@ -3829,373 +4138,62 @@ CHAT_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>知识库对话</title>
+  <title>Knowledge Agent - &#23545;&#35805;</title>
   <style>
-    :root {
-      color-scheme: light;
-      --bg: #f7f7f4;
-      --panel: #ffffff;
-      --text: #171717;
-      --muted: #666666;
-      --line: #d9d9d2;
-      --accent: #0f766e;
-      --accent-dark: #115e59;
-      --soft: #eef2f1;
-      --danger: #b42318;
-      --code: #f2f4f3;
-    }
-
+    :root { color-scheme: light; --bg:#f7f7f4; --panel:#fff; --text:#171717; --muted:#666; --line:#d9d9d2; --accent:#0f766e; --accent-dark:#115e59; --soft:#eef2f1; --danger:#b42318; --code:#f2f4f3; }
     * { box-sizing: border-box; }
-
-    body {
-      margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--bg);
-      color: var(--text);
-    }
-
-    main {
-      width: min(980px, calc(100vw - 28px));
-      margin: 0 auto;
-      min-height: 100vh;
-      display: grid;
-      grid-template-rows: auto 1fr auto;
-      gap: 12px;
-      padding: 18px 0;
-    }
-
-    .topbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 14px;
-    }
-
-    .topbar h1 {
-      margin: 0;
-      font-size: 22px;
-      line-height: 1.2;
-    }
-
-    .topbar a {
-      color: var(--accent-dark);
-      text-decoration: none;
-      font-size: 14px;
-      font-weight: 600;
-    }
-
-    .topnav {
-      display: flex;
-      gap: 12px;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-
-    .status {
-      color: var(--muted);
-      font-size: 13px;
-      margin-top: 4px;
-    }
-
-    .messages {
-      overflow-y: auto;
-      display: grid;
-      align-content: start;
-      gap: 12px;
-      padding: 2px;
-    }
-
-    .message {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-      padding: 13px;
-    }
-
-    .message.user {
-      margin-left: auto;
-      width: min(760px, 90%);
-      background: #fdfdfb;
-    }
-
-    .message.assistant {
-      margin-right: auto;
-      width: min(860px, 100%);
-    }
-
-    .role {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-      margin-bottom: 8px;
-    }
-
-    .answer {
-      line-height: 1.68;
-      font-size: 15px;
-    }
-
-    .status-line {
-      display: inline-block;
-      margin: 0 0 10px;
-      padding: 5px 8px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: var(--soft);
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.4;
-    }
-
-    .markdown-body h2,
-    .markdown-body h3,
-    .markdown-body h4,
-    .markdown-body h5 {
-      margin: 12px 0 7px;
-      line-height: 1.35;
-    }
-
-    .markdown-body h2 {
-      font-size: 18px;
-    }
-
-    .markdown-body h3 {
-      font-size: 16px;
-    }
-
-    .markdown-body p {
-      margin: 7px 0;
-    }
-
-    .markdown-body ul {
-      margin: 7px 0;
-      padding-left: 22px;
-    }
-
-    .markdown-body li {
-      margin: 4px 0;
-    }
-
-    .markdown-body code {
-      background: var(--code);
-      border: 1px solid var(--line);
-      border-radius: 4px;
-      padding: 1px 4px;
-      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
-      font-size: 0.92em;
-    }
-
-    .markdown-body pre {
-      margin: 10px 0;
-      padding: 10px;
-      background: var(--code);
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      overflow-x: auto;
-    }
-
-    .markdown-body pre code {
-      border: 0;
-      padding: 0;
-      background: transparent;
-    }
-
-    .citation {
-      display: inline-block;
-      color: var(--accent-dark);
-      background: var(--soft);
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 0 6px;
-      font-weight: 700;
-      line-height: 1.4;
-    }
-
-    details {
-      margin-top: 12px;
-      border-top: 1px solid var(--line);
-      padding-top: 10px;
-    }
-
-    summary {
-      cursor: pointer;
-      color: var(--accent-dark);
-      font-weight: 700;
-      font-size: 14px;
-    }
-
-    .reference-list {
-      display: grid;
-      gap: 8px;
-      margin-top: 10px;
-    }
-
-    .reference {
-      background: var(--soft);
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 9px;
-      font-size: 13px;
-    }
-
-    .reference .ref-id {
-      font-weight: 800;
-      color: var(--accent-dark);
-    }
-
-    .reference .path {
-      overflow-wrap: anywhere;
-      margin-top: 4px;
-    }
-
-    .reference pre {
-      white-space: pre-wrap;
-      margin: 8px 0 0;
-      padding: 8px;
-      background: var(--code);
-      border-radius: 6px;
-      max-height: 180px;
-      overflow: auto;
-      line-height: 1.55;
-    }
-
-    .debug-box {
-      margin-top: 10px;
-      background: var(--code);
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 10px;
-      white-space: pre-wrap;
-      overflow-x: auto;
-      font-size: 12px;
-      line-height: 1.5;
-    }
-
-    .composer {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px;
-    }
-
-    .starters {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-bottom: 10px;
-    }
-
-    .starter-chip {
-      min-height: 30px;
-      border-color: var(--line);
-      background: var(--soft);
-      color: var(--accent-dark);
-      font-size: 13px;
-      font-weight: 600;
-      padding: 5px 9px;
-    }
-
-    textarea {
-      width: 100%;
-      min-height: 78px;
-      resize: vertical;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 10px;
-      font: inherit;
-      line-height: 1.55;
-    }
-
-    .composer-row {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      margin-top: 10px;
-      flex-wrap: wrap;
-    }
-
-    .advanced-options {
-      flex: 1 1 100%;
-      margin-top: 8px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 8px 10px;
-      background: var(--soft);
-    }
-
-    .advanced-options summary {
-      cursor: pointer;
-      color: var(--accent-dark);
-      font-weight: 700;
-      font-size: 13px;
-    }
-
-    .advanced-grid {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 10px;
-    }
-
-    select, input, button {
-      font: inherit;
-    }
-
-    select, input[type="number"], input[type="text"] {
-      min-height: 36px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #fff;
-      padding: 7px 9px;
-    }
-
-    button {
-      min-height: 36px;
-      border: 1px solid var(--accent);
-      border-radius: 6px;
-      background: var(--accent);
-      color: white;
-      font-weight: 700;
-      padding: 7px 14px;
-      cursor: pointer;
-    }
-
-    button.secondary {
-      background: white;
-      color: var(--accent-dark);
-      border-color: var(--line);
-    }
-
-    button:disabled {
-      opacity: .58;
-      cursor: not-allowed;
-    }
-
-    .field {
-      display: inline-flex;
-      gap: 6px;
-      align-items: center;
-      color: var(--muted);
-      font-size: 13px;
-    }
-
-    .error {
-      color: var(--danger);
-    }
-
-    @media (max-width: 720px) {
-      main {
-        width: min(100vw - 18px, 980px);
-        padding: 10px 0;
-      }
-      .topbar {
-        display: block;
-      }
-      .message.user, .message.assistant {
-        width: 100%;
-      }
-    }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+    main { width: min(980px, calc(100vw - 28px)); margin: 0 auto; min-height: 100vh; display: grid; grid-template-rows: auto 1fr auto; gap: 12px; padding: 18px 0; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+    .topbar h1 { margin: 0; font-size: 22px; line-height: 1.2; }
+    .topnav { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .topnav a { color: var(--accent-dark); text-decoration: none; font-size: 14px; font-weight: 600; }
+    .status { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .messages { overflow-y: auto; display: grid; align-content: start; gap: 12px; padding: 2px; }
+    .message { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 13px; }
+    .message.user { margin-left: auto; width: min(760px, 90%); background: #fdfdfb; }
+    .message.assistant { margin-right: auto; width: min(860px, 100%); }
+    .role { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; margin-bottom: 8px; }
+    .answer { line-height: 1.68; font-size: 15px; }
+    .answer p { margin: 0 0 10px; }
+    .answer ul, .answer ol { margin: 8px 0 10px 20px; padding: 0; }
+    .answer pre { overflow-x: auto; padding: 10px; border-radius: 6px; background: var(--code); }
+    .answer code { background: var(--code); padding: 1px 4px; border-radius: 4px; }
+    .composer { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px; display: grid; gap: 10px; }
+    .controls, .session-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
+    input, select, textarea { border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; font: inherit; background: #fff; color: var(--text); }
+    textarea { width: 100%; min-height: 78px; resize: vertical; }
+    button { border: 1px solid var(--accent); border-radius: 6px; padding: 9px 13px; background: var(--accent); color: #fff; font-weight: 700; cursor: pointer; }
+    button.secondary { background: #fff; color: var(--accent-dark); border-color: var(--line); }
+    button.danger { background: #fff; color: var(--danger); border-color: #f0b8b1; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .debug { border-top: 1px solid var(--line); padding-top: 8px; color: var(--muted); font-size: 12px; }
+    details.refs, details.debug-details { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+    details.refs summary, details.debug-details summary { cursor: pointer; color: var(--accent-dark); font-weight: 700; }
+    .reference-list { display: grid; gap: 10px; margin-top: 10px; }
+    .reference { border: 1px solid var(--line); border-radius: 6px; background: #fdfdfb; padding: 10px; }
+    .reference .path { color: var(--muted); font-size: 12px; word-break: break-all; margin-top: 3px; }
+    .reference pre, .debug-box { white-space: pre-wrap; overflow-x: auto; background: var(--code); border-radius: 6px; padding: 10px; }
+    .ref-id, .citation { color: var(--accent-dark); font-weight: 700; }
+    details.review { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+    details.review summary { cursor: pointer; color: var(--accent-dark); font-weight: 700; }
+    .review-section { margin-top: 10px; }
+    .review-section h4 { margin: 0 0 6px; font-size: 14px; }
+    .review-section ul { margin: 6px 0 0 18px; }
+    .review-section.reference-answer { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 12px; }
+    .plan { border: 1px solid var(--line); border-radius: 8px; background: var(--soft); padding: 10px; margin-bottom: 10px; }
+    .plan-title { font-weight: 800; margin-bottom: 6px; }
+    .starter-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+    .starter-grid button { background: #fff; color: var(--accent-dark); border-color: var(--line); }
+    .modal-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,.28); display: none; align-items: stretch; justify-content: flex-end; z-index: 20; }
+    .modal-backdrop.open { display: flex; }
+    .modal { width: min(760px, 100vw); background: var(--panel); height: 100vh; overflow-y: auto; padding: 18px; border-left: 1px solid var(--line); box-shadow: -12px 0 32px rgba(15,23,42,.16); }
+    .modal-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; }
+    .history-item { display: block; width: 100%; text-align: left; margin-bottom: 8px; border: 1px solid var(--line); background: #fff; color: var(--text); }
+    .history-meta { color: var(--muted); font-size: 12px; }
+    .error { color: var(--danger); }
+    @media (max-width: 720px) { main { width: min(100vw - 18px, 980px); padding: 10px 0; } .topbar { display: block; } .message.user, .message.assistant { width: 100%; } .controls { display: grid; grid-template-columns: 1fr 1fr; } }
   </style>
 </head>
 <body>
@@ -4203,121 +4201,116 @@ CHAT_HTML = r"""<!doctype html>
     <header>
       <div class="topbar">
         <div>
-          <h1>知识库对话</h1>
-          <div id="status" class="status">就绪</div>
+          <h1>&#23545;&#35805;</h1>
+          <div id="status" class="status">&#23601;&#32490;</div>
         </div>
         <nav class="topnav">
-          <a href="/chat">对话</a>
-          <a href="/topics">知识主题</a>
-          <a href="/organize">整理</a>
-          <a href="/search">检索调试</a>
-          <a href="/admin/wiki">维护</a>
-      <a href="/settings">设置</a>
+          <a href="/chat">&#23545;&#35805;</a>
+          <a href="/topics">&#30693;&#35782;&#20027;&#39064;</a>
+          <a href="/organize">&#25972;&#29702;</a>
+          <a href="/search">&#26816;&#32034;&#35843;&#35797;</a>
+          <a href="/admin/wiki">&#32500;&#25252;</a>
+          <a href="/settings">&#35774;&#32622;</a>
         </nav>
       </div>
     </header>
 
-    <section id="messages" class="messages"></section>
+    <section id="messages" class="messages">
+      <article class="message assistant"><div class="role">Assistant</div><div class="answer">已准备。可以选择面试模式并发送消息开始。</div></article>
+    </section>
 
     <section class="composer">
-      <div id="starters" class="starters"></div>
-      <textarea id="query" placeholder="询问、检索、整理或基于你的笔记生成内容..."></textarea>
-      <div class="composer-row">
-        <button id="sendBtn">发送</button>
-        <details class="advanced-options">
-          <summary>高级选项</summary>
-          <div class="advanced-grid">
-            <label class="field">模式
-              <select id="chatMode">
-                <option value="answer" selected>问答</option>
-                <option value="interview">模拟面试</option>
-                <option value="study">复习助教</option>
-              </select>
-            </label>
-            <label class="field">范围
-              <select id="scopeType">
-                <option value="tag" selected>Tag</option>
-                <option value="folder">文件夹</option>
-                <option value="selected_notes">指定笔记</option>
-                <option value="search">搜索结果</option>
-              </select>
-            </label>
-            <label class="field">范围值
-              <input id="scopeValue" type="text" placeholder="个人/面试/agent面试" />
-            </label>
-            <label class="field">指令
-              <select id="command">
-                <option value="auto" selected>auto</option>
-                <option value="Notes">Notes</option>
-                <option value="RegexSearchFiles">RegexSearchFiles</option>
-                <option value="Notes+Online">Notes+Online</option>
-              </select>
-            </label>
-            <label class="field">引用数
-              <input id="notesTopK" type="number" min="1" max="50" value="5" />
-            </label>
-            <label class="field">联网
-              <input id="onlineProvider" type="text" placeholder="disabled / tavily / brave" />
-            </label>
-            <label class="field">
-              <input id="speculative" type="checkbox" checked />
-              预先检索本地笔记
-            </label>
-          </div>
-        </details>
+      <div class="controls">
+        <label>模式<select id="chatMode"><option value="interview" selected>面试</option><option value="study">复习</option><option value="answer">问答</option></select></label>
+        <label>范围<select id="scopeType"><option value="tag">标签</option><option value="folder" selected>文件夹</option><option value="selected_notes">指定笔记</option><option value="search">搜索</option></select></label>
+        <label>范围值<input id="scopeValue" value="个人/面试/agent面试" /></label>
       </div>
+      <textarea id="query" placeholder="输入你的问题..."></textarea>
+      <div id="starters" class="starter-grid"></div>
+      <div class="session-toolbar">
+        <button id="sendBtn" type="button">发送</button>
+        <button id="newConversation" class="secondary" type="button">新建对话</button>
+        <button id="historyBtn" class="secondary" type="button">历史</button>
+        <button id="endInterview" class="danger" type="button" disabled>结束本次面试</button>
+        <span id="sessionLabel" class="status">暂无进行中的面试</span>
+      </div>
+      <details class="debug">
+        <summary>选项</summary>
+        <div class="controls" style="margin-top:8px">
+          <label>检索指令<select id="command"><option value="auto" selected>auto</option><option value="Notes">Notes</option><option value="RegexSearchFiles">RegexSearchFiles</option><option value="Notes+Online">Notes+Online</option></select></label>
+          <label>引用数<input id="notesTopK" type="number" min="1" max="50" value="15" /></label>
+          <label>联网<select id="onlineProvider"><option value="" selected>disabled</option><option value="tavily">tavily</option><option value="brave">brave</option></select></label>
+          <label><span>预先检索本地笔记</span><input id="speculative" type="checkbox" checked /></label>
+          <label>Dense top K<input id="denseTopK" type="number" min="1" max="500" value="50" /></label>
+          <label>BM25 top K<input id="hybridBm25TopK" type="number" min="1" max="500" value="50" /></label>
+          <label>RRF K<input id="rrfK" type="number" min="1" max="500" value="60" /></label>
+        </div>
+      </details>
     </section>
   </main>
+
+  <div id="historyModal" class="modal-backdrop" aria-hidden="true">
+    <aside class="modal" role="dialog" aria-modal="true" aria-label="面试历史">
+      <div class="modal-head">
+        <h2 style="margin:0;font-size:18px">面试历史</h2>
+        <button id="closeHistory" class="secondary" type="button">关闭</button>
+      </div>
+      <div id="historyContent" class="history-meta">加载中...</div>
+    </aside>
+  </div>
 
   <script>
     const $ = (id) => document.getElementById(id);
     const messages = $("messages");
-    let currentAssistant = null;
     let chatHistory = [];
-    let currentPayload = {
-      router: null,
-      retrieval: null,
-      context: null,
-      answer: null,
-      done: null,
-      errors: []
-    };
+    let currentAssistant = null;
+    let currentAssistantText = "";
+    let currentPayload = null;
+    let currentInterviewPlan = null;
+    let currentInterviewPlanSignature = "";
+    let currentInterviewState = null;
+    let currentInterviewSessionId = "";
+    let currentConversationSignature = conversationSignature();
+    let lastContextItems = [];
+    const activeInterviewSessionKey = "knowledge_agent.active_interview_session_id";
 
     $("sendBtn").addEventListener("click", sendMessage);
-    loadStarters();
     $("query").addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-        sendMessage();
-      }
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) sendMessage();
     });
+    $("newConversation").addEventListener("click", startNewConversation);
+    $("historyBtn").addEventListener("click", openHistory);
+    $("closeHistory").addEventListener("click", closeHistory);
+    $("historyModal").addEventListener("click", (event) => { if (event.target === $("historyModal")) closeHistory(); });
+    $("endInterview").addEventListener("click", endInterviewSession);
+    ["chatMode", "scopeType", "scopeValue"].forEach((id) => $(id).addEventListener("change", resetConversationIfNeeded));
+    restoreActiveInterviewSession();
 
-    async function loadStarters() {
-      try {
-        const response = await fetch("/api/chat/starters");
-        const data = await response.json();
-        const starters = Array.isArray(data.starters) ? data.starters : [];
-        $("starters").innerHTML = starters.map((item) =>
-          `<button class="starter-chip" data-starter="${escapeHtml(item)}">${escapeHtml(item)}</button>`
-        ).join("");
-        document.querySelectorAll("[data-starter]").forEach((button) => {
-          button.addEventListener("click", () => {
-            $("query").value = button.dataset.starter || "";
-            $("query").focus();
-          });
-        });
-      } catch {
-        $("starters").innerHTML = "";
-      }
+    function resetConversationIfNeeded() {
+      const signature = conversationSignature();
+      if (signature === currentConversationSignature) return;
+      chatHistory = [];
+      currentInterviewPlan = null;
+      currentInterviewPlanSignature = "";
+      currentInterviewState = null;
+      currentInterviewSessionId = "";
+      localStorage.removeItem(activeInterviewSessionKey);
+      lastContextItems = [];
+      currentConversationSignature = signature;
+      updateSessionLabel();
+      $("starters").innerHTML = "";
     }
 
     async function sendMessage() {
       const query = $("query").value.trim();
       if (!query) return;
-
+      resetConversationIfNeeded();
       appendUserMessage(query);
-      currentAssistant = appendAssistantMessage();
-      currentPayload = {router: null, retrieval: null, context: null, answer: null, done: null, errors: []};
-      setBusy(true, "starting");
+      $("query").value = "";
+      currentAssistant = appendAssistantMessage("");
+      currentAssistantText = "";
+      currentPayload = {router: null, retrieval: null, retrievalStatus: null, interviewPlan: null, context: null, answer: null, done: null, errors: []};
+      setBusy(true, "Starting...");
 
       const body = {
         query,
@@ -4327,259 +4320,547 @@ CHAT_HTML = r"""<!doctype html>
         scope_value: $("scopeValue").value.trim() || null,
         scope_paths: scopePaths(),
         chat_history: chatHistory.slice(-12),
+        interview_plan: $("chatMode").value === "interview" && currentInterviewPlanSignature === conversationSignature() ? currentInterviewPlan : null,
+        interview_state: $("chatMode").value === "interview" ? currentInterviewState : null,
         notes_top_k: numberValue("notesTopK"),
+        dense_top_k: numberValue("denseTopK"),
+        hybrid_bm25_top_k: numberValue("hybridBm25TopK"),
+        rrf_k: numberValue("rrfK"),
         online_provider: $("onlineProvider").value.trim() || null,
         speculative_notes_search: $("speculative").checked
       };
 
       try {
-        const response = await fetch("/api/agent/stream", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify(body)
-        });
-        if (!response.ok || !response.body) {
-          const data = await response.json().catch(() => ({}));
-          throw new Error(data.detail || "request failed");
+        const response = await fetch("/api/agent/stream", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+        if (!response.ok || !response.body) throw new Error(`request failed: ${response.status}`);
+        await readSse(response.body);
+        const answerText = currentAssistantText.trim();
+        if (answerText) {
+          const assistantNode = currentAssistant;
+          renderAssistantExtras();
+          const shouldReview = $("chatMode").value === "interview" && shouldRequestTurnSummary(query, answerText);
+          chatHistory.push({role:"user", content:query});
+          chatHistory.push({role:"assistant", content:answerText});
+          trimChatHistory();
+          if ($("chatMode").value === "interview") {
+            updateInterviewState(query, answerText);
+            const turnIds = await persistInterviewTurn(query, answerText);
+            if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
+          }
         }
-        await readSseStream(response.body);
-        if (currentPayload.answer?.answer) {
-          chatHistory.push({role: "user", content: query});
-          chatHistory.push({role: "assistant", content: currentPayload.answer.answer});
-          chatHistory = chatHistory.slice(-12);
-        }
+        setBusy(false, "就绪");
       } catch (error) {
-        currentPayload.errors.push({message: error.message});
-        renderAssistant(currentAssistant, currentPayload);
-      } finally {
-        setBusy(false, "ready");
+        currentPayload.errors.push(error.message);
+        if (currentAssistant) currentAssistant.querySelector(".answer").innerHTML += `<p class="error">${escapeHtml(error.message)}</p>`;
+        setBusy(false, "Error");
       }
     }
 
-    async function readSseStream(stream) {
+    async function readSse(stream) {
       const reader = stream.getReader();
-      const decoder = new TextDecoder("utf-8");
+      const decoder = new TextDecoder();
       let buffer = "";
       while (true) {
         const {value, done} = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, {stream: true});
-        const parts = buffer.split("\n\n");
-        buffer = parts.pop() || "";
-        for (const part of parts) {
-          handleSseBlock(part);
+        buffer += decoder.decode(value, {stream:true});
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+          const raw = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          handleSseEvent(raw);
         }
       }
-      if (buffer.trim()) handleSseBlock(buffer);
+      if (buffer.trim()) handleSseEvent(buffer);
     }
 
-    function handleSseBlock(block) {
+    function handleSseEvent(raw) {
       let eventName = "message";
       const dataLines = [];
-      for (const line of block.split("\n")) {
+      raw.split(/\r?\n/).forEach((line) => {
         if (line.startsWith("event:")) eventName = line.slice(6).trim();
-        if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
-      }
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      });
       if (!dataLines.length) return;
-      const data = JSON.parse(dataLines.join("\n"));
-
-      if (eventName === "status") {
-        setBusy(true, data.message || data.stage || "running");
-        if (data.stage === "retrieval_finished" && data.summary) {
-          currentPayload.retrievalStatus = data.summary;
-        }
-      } else if (eventName === "router") {
-        currentPayload.router = data;
-      } else if (eventName === "retrieval") {
+      let data;
+      try { data = JSON.parse(dataLines.join("\n")); } catch { return; }
+      if (eventName === "status") setBusy(true, data.message || data.stage || "处理中...");
+      if (eventName === "router") currentPayload.router = data;
+      if (eventName === "retrieval") {
         currentPayload.retrieval = data;
-      } else if (eventName === "context") {
-        currentPayload.context = data;
-      } else if (eventName === "answer_delta") {
-        if (!currentPayload.answer) currentPayload.answer = {answer: "", model: "", prompt_chars: null};
-        currentPayload.answer.answer += data.text || "";
-      } else if (eventName === "answer") {
-        currentPayload.answer = data;
-      } else if (eventName === "done") {
-        currentPayload.done = data;
-        setBusy(false, "done");
-      } else if (eventName === "error") {
-        currentPayload.errors.push(data);
+        currentPayload.retrievalStatus = data.reference_summary || data.summary || null;
       }
-      renderAssistant(currentAssistant, currentPayload);
-      scrollToBottom();
+      if (eventName === "context") { currentPayload.context = data; lastContextItems = data.items || []; }
+      if (eventName === "interview_plan") {
+        currentPayload.interviewPlan = data;
+        if (data.plan) {
+          currentInterviewPlan = data.plan;
+          currentInterviewPlanSignature = conversationSignature();
+          renderInterviewPlan(data.plan);
+        }
+      }
+      if (eventName === "answer_delta") {
+        currentAssistantText += data.text || "";
+        if (currentAssistant) currentAssistant.querySelector(".answer").innerHTML = renderMarkdown(currentAssistantText);
+        scrollToBottom();
+      }
+      if (eventName === "answer") { currentPayload.answer = data; }
+      if (eventName === "done") { currentPayload.done = data; }
+      if (eventName === "error") throw new Error(data.message || "stream error");
     }
 
-    function appendUserMessage(text) {
-      const node = document.createElement("article");
-      node.className = "message user";
-      node.innerHTML = `<div class="role">你</div><div class="answer">${escapeHtml(text)}</div>`;
-      messages.appendChild(node);
-      scrollToBottom();
+    function renderInterviewPlan(plan) {
+      const topics = Array.isArray(plan.topics) ? plan.topics : [];
+      if (!topics.length || !currentAssistant) return;
+      const html = `<div class="plan"><div class="plan-title">Interview topics</div><div class="starter-grid">${topics.map((topic) => `<button type="button" data-topic="${escapeHtml(topic.name || "")}">${escapeHtml(topic.name || "Topic")}</button>`).join("")}</div></div>`;
+      currentAssistant.querySelector(".answer").insertAdjacentHTML("beforebegin", html);
+      currentAssistant.querySelectorAll("[data-topic]").forEach((button) => {
+        button.addEventListener("click", () => {
+          $("query").value = `I want to start with ${button.dataset.topic}`;
+          $("query").focus();
+        });
+      });
     }
 
-    function appendAssistantMessage() {
-      const node = document.createElement("article");
-      node.className = "message assistant";
-      node.innerHTML = `<div class="role">助手</div><div class="answer">正在处理...</div>`;
-      messages.appendChild(node);
-      scrollToBottom();
-      return node;
-    }
-
-    function renderAssistant(node, payload) {
-      if (!node) return;
-      const answerText = payload.answer?.answer || statusText(payload);
-      const references = payload.context?.items || [];
+    function renderAssistantExtras() {
+      if (!currentAssistant) return;
+      currentAssistant.querySelectorAll(".assistant-extra").forEach((node) => node.remove());
+      const references = (currentPayload.context && currentPayload.context.items) || [];
       const debug = {
-        router: payload.router,
-        retrieval: payload.retrieval,
-        retrievalStatus: payload.retrievalStatus,
-        done: payload.done,
-        errors: payload.errors
+        router: currentPayload.router,
+        retrieval: currentPayload.retrieval,
+        context: currentPayload.context,
+        interview_plan: currentPayload.interviewPlan,
+        interview_state: currentInterviewState,
+        done: currentPayload.done,
+        errors: currentPayload.errors
       };
-      const retrievalStatus = payload.retrievalStatus
-        ? `<div class="status-line">${escapeHtml(payload.retrievalStatus.message)}</div>`
-        : "";
-      node.innerHTML = `
-        <div class="role">Assistant</div>
-        ${retrievalStatus}
-        <div class="answer markdown-body ${payload.errors.length ? "error" : ""}">${renderMarkdown(answerText)}</div>
-        ${renderReferences(references)}
-        <details>
-          <summary>Debug</summary>
-          <pre class="debug-box">${escapeHtml(JSON.stringify(debug, null, 2))}</pre>
-        </details>
-      `;
+      currentAssistant.insertAdjacentHTML(
+        "beforeend",
+        `<div class="assistant-extra">${renderReferences(references)}${renderDebug(debug)}</div>`
+      );
     }
 
     function renderReferences(items) {
-      if (!items.length) return "";
-      return `
-        <details>
-          <summary>References (${items.length})</summary>
-          <div class="reference-list">
-            ${items.map(renderReference).join("")}
-          </div>
-        </details>
-      `;
+      if (!Array.isArray(items) || !items.length) return "";
+      return `<details class="refs"><summary>References (${items.length})</summary><div class="reference-list">${items.map(renderReference).join("")}</div></details>`;
     }
 
     function renderReference(item) {
       const path = item.path || item.url || item.provider || "";
       const lines = item.lines ? ` lines ${item.lines}` : item.line ? ` line ${item.line}` : "";
       const score = item.score !== null && item.score !== undefined ? ` score ${item.score}` : "";
-      return `
-        <div class="reference">
-          <div><span class="ref-id">[${escapeHtml(item.citation_id)}]</span>${escapeHtml(lines)}${escapeHtml(score)}</div>
-          <div class="path">${escapeHtml(path)}</div>
-          ${item.heading ? `<div class="path">heading: ${escapeHtml(item.heading)}</div>` : ""}
-          ${item.message ? `<div class="path">${escapeHtml(item.message)}</div>` : ""}
-          ${item.text ? `<pre>${escapeHtml(item.text)}</pre>` : ""}
-        </div>
-      `;
+      const citation = item.citation_id || item.id || "S";
+      return `<div class="reference">
+        <div><span class="ref-id">[${escapeHtml(citation)}]</span>${escapeHtml(lines)}${escapeHtml(score)}</div>
+        <div class="path">${escapeHtml(path)}</div>
+        ${item.heading ? `<div class="path">heading: ${escapeHtml(item.heading)}</div>` : ""}
+        ${item.message ? `<div class="path">${escapeHtml(item.message)}</div>` : ""}
+        ${item.text ? `<pre>${escapeHtml(item.text)}</pre>` : ""}
+      </div>`;
     }
 
-    function statusText(payload) {
-      if (payload.errors.length) return payload.errors[payload.errors.length - 1].message || "发生错误";
-      if (payload.retrieval) return "正在生成回答...";
-      if (payload.router) return "正在检索上下文...";
-      return "正在判断检索方式...";
+    function renderDebug(debug) {
+      return `<details class="debug-details"><summary>Debug</summary><pre class="debug-box">${escapeHtml(JSON.stringify(debug, null, 2))}</pre></details>`;
     }
 
-    function renderMarkdown(markdown) {
-      const source = String(markdown ?? "");
+    function shouldRequestTurnSummary(query, answerText) {
+      const priorAssistant = [...chatHistory].reverse().find((item) => item.role === "assistant")?.content || "";
+      if (!priorAssistant.trim()) return false;
+      const topicChoicePrompt =
+        /which.*(topic|direction).*start|choose.*(topic|direction)/i.test(priorAssistant) ||
+        priorAssistant.includes("\u5e0c\u671b\u4ece\u54ea\u4e2a") ||
+        priorAssistant.includes("\u4f60\u4ece\u54ea\u4e2a\u5f00\u59cb") ||
+        priorAssistant.includes("\u4ece\u54ea\u4e2a\u65b9\u5411") ||
+        priorAssistant.includes("\u54ea\u4e2a\u4e3b\u9898");
+      if (topicChoicePrompt) return false;
+      const assistantText = answerText || "";
+      const assistantOnlyAskedFirstQuestion =
+        /first question/i.test(assistantText) ||
+        assistantText.includes("\u5148\u95ee") ||
+        assistantText.includes("\u5148\u6765") ||
+        assistantText.includes("\u7b2c\u4e00\u4e2a\u95ee\u9898");
+      const userText = query || "";
+      const userOnlyChoseTopic =
+        /^(I want to start with|start with)/i.test(userText) ||
+        userText.includes("\u6211\u60f3\u4ece") ||
+        (userText.includes("\u4ece") && userText.includes("\u5f00\u59cb"));
+      if (assistantOnlyAskedFirstQuestion && userOnlyChoseTopic) return false;
+      return true;
+    }
+
+    async function requestTurnSummary(answerText) {
+      try {
+        const response = await fetch("/api/interview/summary", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+          scope_type: $("scopeType").value,
+          scope_value: $("scopeValue").value.trim() || null,
+          scope_paths: scopePaths(),
+          chat_history: chatHistory.slice(-12),
+          answer: answerText,
+          interview_plan: currentInterviewPlan,
+          notes_top_k: numberValue("notesTopK"),
+          dense_top_k: numberValue("denseTopK"),
+          hybrid_bm25_top_k: numberValue("hybridBm25TopK"),
+          rrf_k: numberValue("rrfK")
+        })});
+        if (!response.ok) return {available:false, error:"复盘生成失败"};
+        return await response.json();
+      } catch (error) {
+        return {available:false, error:error.message};
+      }
+    }
+
+    function renderSummaryIntoAssistant(assistantNode, summary) {
+      if (!assistantNode) return;
+      assistantNode.querySelectorAll("details.review").forEach((node) => node.remove());
+      const html = renderSessionSummary(summary);
+      if (html) assistantNode.insertAdjacentHTML("beforeend", html);
+      scrollToBottom();
+    }
+
+    async function runTurnReviewInBackground(answerText, turnIds, assistantNode) {
+      renderSummaryIntoAssistant(assistantNode, {pending: true});
+      const summary = await requestTurnSummary(answerText);
+      renderSummaryIntoAssistant(assistantNode, summary);
+      if (turnIds && summary && summary.available !== false) {
+        await persistTurnReview(turnIds, summary);
+      }
+    }
+
+    function startNewConversation() {
+      localStorage.removeItem(activeInterviewSessionKey);
+      chatHistory = [];
+      currentAssistant = null;
+      currentAssistantText = "";
+      currentPayload = null;
+      currentInterviewPlan = null;
+      currentInterviewPlanSignature = "";
+      currentInterviewState = null;
+      currentInterviewSessionId = "";
+      lastContextItems = [];
+      currentConversationSignature = conversationSignature();
+      $("query").value = "";
+      $("starters").innerHTML = "";
+      messages.innerHTML = `<article class="message assistant"><div class="role">Assistant</div><div class="answer">已开始新对话。可以选择面试模式并发送消息开始。</div></article>`;
+      updateSessionLabel();
+      setBusy(false, "就绪");
+      scrollToBottom();
+    }
+
+    async function restoreActiveInterviewSession() {
+      const sessionId = localStorage.getItem(activeInterviewSessionKey);
+      if (!sessionId) return;
+      try {
+        const response = await fetch(`/api/interview/sessions/${encodeURIComponent(sessionId)}`);
+        if (!response.ok) {
+          localStorage.removeItem(activeInterviewSessionKey);
+          return;
+        }
+        const data = await response.json();
+        const session = data.session || {};
+        if (!["active", "end_failed"].includes(session.status)) {
+          localStorage.removeItem(activeInterviewSessionKey);
+          return;
+        }
+        restoreSessionIntoChat(session, data.reviews || []);
+      } catch {
+        localStorage.removeItem(activeInterviewSessionKey);
+      }
+    }
+
+    function restoreSessionIntoChat(session, reviews) {
+      const context = session.context || {};
+      $("chatMode").value = "interview";
+      if (context.source_type) $("scopeType").value = context.source_type;
+      if (context.source_type === "selected_notes") {
+        $("scopeValue").value = (context.source_paths || []).join("\n");
+      } else if (context.source_value) {
+        $("scopeValue").value = context.source_value;
+      }
+
+      currentInterviewSessionId = session.session_id || "";
+      currentInterviewPlan = session.interview_plan || null;
+      currentInterviewPlanSignature = currentInterviewPlan ? conversationSignature() : "";
+      currentInterviewState = session.interview_state || null;
+      currentConversationSignature = conversationSignature();
+      localStorage.setItem(activeInterviewSessionKey, currentInterviewSessionId);
+
+      const reviewByAssistant = new Map((reviews || []).map((review) => [review.assistant_message_id, review]));
+      const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
+      chatHistory = sessionMessages
+        .filter((message) => ["user", "assistant"].includes(message.role))
+        .map((message) => ({role: message.role, content: message.content || ""}));
+      trimChatHistory();
+      messages.innerHTML = sessionMessages.length
+        ? sessionMessages.map((message) => renderMessageWithReview(message, reviewByAssistant.get(message.id))).join("")
+        : `<article class="message assistant"><div class="role">Assistant</div><div class="answer">已恢复未结束的面试记录。</div></article>`;
+      updateSessionLabel();
+      setBusy(false, "已恢复未结束的面试");
+      scrollToBottom();
+    }
+
+    function renderMessageWithReview(message, review) {
+      const cls = message.role === "user" ? "user" : "assistant";
+      return `<article class="message ${cls}"><div class="role">${escapeHtml(message.role || "")}</div><div class="answer">${renderMarkdown(message.content || "")}</div>${review ? renderSessionSummary({available:true, feedback:review.feedback || {}, expression_example:review.expression_example || review.reference_answer || "", reference_answer:review.reference_answer || "", profile_signals:review.profile_signals || []}) : ""}</article>`;
+    }
+
+    async function ensureInterviewSession() {
+      if (currentInterviewSessionId) return currentInterviewSessionId;
+      const response = await fetch("/api/interview/sessions", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+        source_type: $("scopeType").value,
+        source_value: $("scopeValue").value.trim() || null,
+        source_paths: scopePaths(),
+        source_note_paths: sourceNotePaths(),
+        interview_plan: currentInterviewPlan,
+        interview_state: currentInterviewState,
+        extra: {created_from:"chat"}
+      })});
+      if (!response.ok) throw new Error("创建面试记录失败");
+      const data = await response.json();
+      currentInterviewSessionId = data.session.session_id;
+      localStorage.setItem(activeInterviewSessionKey, currentInterviewSessionId);
+      updateSessionLabel();
+      return currentInterviewSessionId;
+    }
+
+    async function persistInterviewTurn(userContent, assistantContent) {
+      const sessionId = await ensureInterviewSession();
+      const response = await fetch(`/api/interview/sessions/${encodeURIComponent(sessionId)}/turns`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+        user_content: userContent,
+        assistant_content: assistantContent,
+        interview_plan: currentInterviewPlan,
+        interview_state: currentInterviewState,
+        source_note_paths: sourceNotePaths()
+      })});
+      if (!response.ok) return null;
+      const data = await response.json();
+      return {user: data.user_message, assistant: data.assistant_message};
+    }
+
+    async function persistTurnReview(turnIds, summary) {
+      if (!turnIds || !currentInterviewSessionId) return;
+      await fetch(`/api/interview/sessions/${encodeURIComponent(currentInterviewSessionId)}/reviews`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+        user_message_id: turnIds.user.id,
+        assistant_message_id: turnIds.assistant.id,
+        feedback: summary.feedback || {},
+        expression_example: summary.expression_example || summary.reference_answer || "",
+        reference_answer: summary.reference_answer || summary.expression_example || "",
+        profile_signals: summary.profile_signals || []
+      })});
+    }
+
+    async function endInterviewSession() {
+      if (!currentInterviewSessionId) return;
+      setBusy(true, "正在结束面试...");
+      try {
+        const response = await fetch(`/api/interview/sessions/${encodeURIComponent(currentInterviewSessionId)}/end`, {method:"POST"});
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.detail || "end interview failed");
+        appendSystemMessage(data.session && data.session.status === "completed" ? "本次面试已保存，长期画像已更新。" : "本次面试已保存，但最终总结或画像更新失败。可以稍后从历史记录重试。");
+        currentInterviewSessionId = "";
+        localStorage.removeItem(activeInterviewSessionKey);
+        updateSessionLabel();
+      } catch (error) {
+        appendSystemMessage(`结束失败：${error.message}`);
+      } finally {
+        setBusy(false, "就绪");
+      }
+    }
+
+    async function openHistory() {
+      $("historyModal").classList.add("open");
+      $("historyModal").setAttribute("aria-hidden", "false");
+      await loadInterviewHistoryListOnly();
+    }
+
+    function closeHistory() {
+      $("historyModal").classList.remove("open");
+      $("historyModal").setAttribute("aria-hidden", "true");
+    }
+
+    async function loadInterviewHistoryListOnly() {
+      $("historyContent").innerHTML = "加载中...";
+      try {
+        const response = await fetch("/api/interview/sessions?limit=30");
+        if (!response.ok) throw new Error("历史记录加载失败");
+        const data = await response.json();
+        renderInterviewHistory(data.sessions || []);
+      } catch (error) {
+        $("historyContent").innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    function renderInterviewHistory(sessions) {
+      if (!sessions.length) { $("historyContent").innerHTML = "暂无历史面试。"; return; }
+      $("historyContent").innerHTML = sessions.map((session) => `<button class="history-item" type="button" data-session="${escapeHtml(session.session_id || "")}"><strong>${escapeHtml(session.title || session.session_id || "面试记录")}</strong><div class="history-meta">${escapeHtml(session.status || "")} | ${escapeHtml(session.updated_at || session.created_at || "")}</div></button>`).join("");
+      document.querySelectorAll("[data-session]").forEach((button) => button.addEventListener("click", () => loadInterviewSession(button.dataset.session)));
+    }
+
+    async function loadInterviewSession(sessionId) {
+      $("historyContent").innerHTML = "正在加载面试记录...";
+      try {
+        const response = await fetch(`/api/interview/sessions/${encodeURIComponent(sessionId)}`);
+        if (!response.ok) throw new Error("面试记录加载失败");
+        const data = await response.json();
+        renderInterviewSessionDetail(data.session, data.reviews || []);
+      } catch (error) {
+        $("historyContent").innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    function renderInterviewSessionDetail(session, reviews) {
+      const reviewByAssistant = new Map((reviews || []).map((review) => [review.assistant_message_id, review]));
+      $("historyContent").innerHTML = `<button class="secondary" type="button" id="backHistoryBtn">返回</button><div class="history-meta" style="margin:8px 0 12px">${escapeHtml(session.session_id || "")} | ${escapeHtml(session.status || "")}</div>${(session.messages || []).map((message) => {
+        const cls = message.role === "user" ? "user" : "assistant";
+        const review = reviewByAssistant.get(message.id);
+        return `<article class="message ${cls}"><div class="role">${escapeHtml(message.role || "")}</div><div class="answer">${renderMarkdown(message.content || "")}</div>${review ? renderSessionSummary({available:true, feedback:review.feedback || {}, expression_example:review.expression_example || review.reference_answer || "", reference_answer:review.reference_answer || "", profile_signals:review.profile_signals || []}) : ""}</article>`;
+      }).join("") || `<article class="message assistant">暂无消息。</article>`}`;
+      $("backHistoryBtn").addEventListener("click", loadInterviewHistoryListOnly);
+    }
+
+    function renderSessionSummary(summary) {
+      if (!summary) return "";
+      if (summary.pending) return `<details class="review"><summary>本轮复盘</summary><div class="history-meta">生成中...</div></details>`;
+      if (summary.available === false) return `<details class="review"><summary>本轮复盘</summary><div class="error">${escapeHtml(summary.error || "不可用")}</div></details>`;
+      const feedback = summary.feedback || {};
+      const gaps = feedback.gaps || feedback.missing || feedback.could_cover || [];
+      const coachNote = feedback.coach_note || feedback.overall || feedback.summary || "";
+      const followupNote = feedback.interviewer_followup_note || feedback.interviewer_direction || "";
+      const feedbackText = [coachNote, followupNote].filter(Boolean).join("\n\n");
+      const thinkingFramework = feedback.thinking_framework || feedback.next_focus || feedback.next_tip || feedback.next_step || "";
+      const expressionExample = summary.expression_example || summary.reference_answer || "";
+      const list = (items) => Array.isArray(items) && items.length ? `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : "";
+      const paragraph = (text) => text ? `<p>${escapeHtml(text)}</p>` : "";
+      const hasFeedback = feedbackText || (Array.isArray(gaps) && gaps.length) || thinkingFramework || expressionExample;
+      if (!hasFeedback) return "";
+      return `<details class="review" open><summary>本轮复盘</summary>
+        <div class="review-section"><h4>反馈</h4>${paragraph(feedbackText)}</div>
+        <div class="review-section"><h4>你可改进的点</h4>${list(gaps)}</div>
+        <div class="review-section"><h4>思路构建</h4>${paragraph(thinkingFramework)}</div>
+        ${expressionExample ? `<div class="review-section reference-answer"><h4>表达示例</h4>${renderMarkdown(expressionExample)}</div>` : ""}
+      </details>`;
+    }
+
+    function updateInterviewState(userText, assistantText) {
+      if (!currentInterviewState) currentInterviewState = {current_topic:null, current_layer_index:0, follow_up_count:0, sub_points_touched:[], last_user_answer:""};
+      currentInterviewState.last_user_answer = userText.slice(0, 300);
+      const topic = inferTopic(userText + "\n" + assistantText);
+      if (topic && topic !== currentInterviewState.current_topic) {
+        currentInterviewState.current_topic = topic;
+        currentInterviewState.current_layer_index = 0;
+        currentInterviewState.follow_up_count = 0;
+        currentInterviewState.sub_points_touched = [];
+      }
+      currentInterviewState.follow_up_count = (currentInterviewState.follow_up_count || 0) + 1;
+      const question = extractLastQuestion(assistantText);
+      if (question) {
+        currentInterviewState.sub_points_touched = [...(currentInterviewState.sub_points_touched || []), question].slice(-8);
+      }
+      if (detectLayerTransition(assistantText)) {
+        currentInterviewState.current_layer_index = (currentInterviewState.current_layer_index || 0) + 1;
+        currentInterviewState.follow_up_count = 0;
+        currentInterviewState.sub_points_touched = [];
+      }
+    }
+
+    function inferTopic(text) {
+      const topics = currentInterviewPlan && Array.isArray(currentInterviewPlan.topics) ? currentInterviewPlan.topics : [];
+      for (const topic of topics) {
+        const name = topic.name || "";
+        if (name && text.includes(name)) return name;
+      }
+      return null;
+    }
+
+    function detectLayerTransition(text) {
+      return /(next layer|next dimension|switch to|move to|move on|next topic|next section)/i.test(text || "");
+    }
+
+    function extractLastQuestion(text) {
+      const parts = String(text || "").split(/(?<=[??])/).map((item) => item.trim()).filter(Boolean);
+      return parts.length ? parts[parts.length - 1].slice(0, 120) : "";
+    }
+
+    function appendUserMessage(text) {
+      const node = document.createElement("article");
+      node.className = "message user";
+      node.innerHTML = `<div class="role">You</div><div class="answer">${renderMarkdown(text)}</div>`;
+      messages.appendChild(node);
+      scrollToBottom();
+      return node;
+    }
+
+    function appendAssistantMessage(text = "") {
+      const node = document.createElement("article");
+      node.className = "message assistant";
+      node.innerHTML = `<div class="role">Assistant</div><div class="answer">${text ? renderMarkdown(text) : ""}</div>`;
+      messages.appendChild(node);
+      scrollToBottom();
+      return node;
+    }
+
+    function appendSystemMessage(text) {
+      const node = document.createElement("article");
+      node.className = "message assistant";
+      node.innerHTML = `<div class="role">System</div><div class="answer">${escapeHtml(text)}</div>`;
+      messages.appendChild(node);
+      scrollToBottom();
+    }
+
+    function renderMarkdown(text) {
       const codeBlocks = [];
-      let text = source.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
-        const token = `@@CODE_BLOCK_${codeBlocks.length}@@`;
-        codeBlocks.push(`<pre><code>${escapeHtml(code.trim())}</code></pre>`);
-        return token;
+      let safe = escapeHtml(text || "").replace(/```([\s\S]*?)```/g, (_, code) => {
+        const key = `@@CODE_${codeBlocks.length}@@`;
+        codeBlocks.push(`<pre><code>${code}</code></pre>`);
+        return key;
       });
-
-      const lines = text.split(/\r?\n/);
+      const lines = safe.split(/\r?\n/);
       const html = [];
-      let listItems = [];
-
-      function flushList() {
-        if (!listItems.length) return;
-        html.push(`<ul>${listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ul>`);
-        listItems = [];
+      let list = [];
+      const flush = () => { if (list.length) { html.push(`<ul>${list.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</ul>`); list = []; } };
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) { flush(); continue; }
+        const heading = /^(#{1,4})\s+(.+)$/.exec(trimmed);
+        if (heading) { flush(); html.push(`<h${Math.min(heading[1].length + 1, 5)}>${inlineMarkdown(heading[2])}</h${Math.min(heading[1].length + 1, 5)}>`); continue; }
+        const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
+        if (bullet) { list.push(bullet[1]); continue; }
+        flush();
+        html.push(`<p>${inlineMarkdown(trimmed)}</p>`);
       }
-
-      for (const rawLine of lines) {
-        const line = rawLine.trimEnd();
-        if (!line.trim()) {
-          flushList();
-          continue;
-        }
-
-        const heading = /^(#{1,4})\s+(.+)$/.exec(line);
-        if (heading) {
-          flushList();
-          const level = Math.min(heading[1].length + 1, 5);
-          html.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
-          continue;
-        }
-
-        const bullet = /^[-*]\s+(.+)$/.exec(line);
-        if (bullet) {
-          listItems.push(bullet[1]);
-          continue;
-        }
-
-        const ordered = /^\d+\.\s+(.+)$/.exec(line);
-        if (ordered) {
-          listItems.push(ordered[1]);
-          continue;
-        }
-
-        flushList();
-        html.push(`<p>${renderInlineMarkdown(line)}</p>`);
-      }
-      flushList();
-
+      flush();
       let rendered = html.join("");
-      codeBlocks.forEach((block, index) => {
-        rendered = rendered.replace(`@@CODE_BLOCK_${index}@@`, block);
-      });
+      codeBlocks.forEach((block, index) => { rendered = rendered.replace(`@@CODE_${index}@@`, block); });
       return rendered;
     }
 
-    function renderInlineMarkdown(text) {
-      return escapeHtml(text)
-        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-        .replace(/`([^`]+)`/g, "<code>$1</code>")
-        .replace(/\[(N|R|B|W|E)(\d+)\]/g, '<span class="citation">[$1$2]</span>');
+    function inlineMarkdown(text) {
+      return String(text || "").replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\[(S|N|R|B|W|E)(\d+)\]/g, '<span class="citation">[$1$2]</span>');
     }
 
-    function numberValue(id) {
-      return Number($(id).value);
+    function sourceNotePaths() {
+      return Array.from(new Set((lastContextItems || []).map((item) => item.path || item.relative_path || "").filter(Boolean)));
     }
 
-    function scopePaths() {
-      if ($("scopeType").value !== "selected_notes") return [];
-      return $("scopeValue").value
-        .split(/\r?\n/)
-        .map((item) => item.trim())
-        .filter(Boolean);
+    function trimChatHistory() {
+      if (chatHistory.length > 24) chatHistory = chatHistory.slice(-24);
+    }
+
+    function updateSessionLabel() {
+      $("endInterview").disabled = !currentInterviewSessionId;
+      $("sessionLabel").textContent = currentInterviewSessionId ? `面试记录：${currentInterviewSessionId}` : "暂无进行中的面试";
     }
 
     function setBusy(isBusy, text) {
       $("sendBtn").disabled = isBusy;
-      $("status").textContent = text;
+      $("status").textContent = text || (isBusy ? "处理中..." : "就绪");
     }
 
-    function scrollToBottom() {
-      messages.scrollTop = messages.scrollHeight;
-    }
-
-    function escapeHtml(value) {
-      return String(value ?? "")
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
-    }
+    function numberValue(id) { return Number($(id).value); }
+    function scopePaths() { return $("scopeType").value === "selected_notes" ? $("scopeValue").value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) : []; }
+    function conversationSignature() { return JSON.stringify({mode:$("chatMode").value, scopeType:$("scopeType").value, scopeValue:$("scopeValue").value.trim(), scopePaths:scopePaths()}); }
+    function scrollToBottom() { messages.scrollTop = messages.scrollHeight; }
+    function escapeHtml(value) { return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;"); }
   </script>
 </body>
 </html>
