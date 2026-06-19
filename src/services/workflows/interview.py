@@ -258,7 +258,13 @@ When you generate expression_example, write it in the candidate's speaking voice
 You may leave profile_signals for later session-level profile extraction. These are evidence hints, not profile updates.
 Use them sparingly:
 - possible_weak_point: the user exposed a recurring or important gap.
+- possible_partial: the user showed partial progress on an existing weak point, but the answer is still incomplete.
 - possible_improvement: the user gave evidence that a known weak point may be improving.
+- For each profile signal, include category and scope_suggestion:
+  - category: knowledge_gap, answer_structure, communication, or thinking_pattern.
+  - scope_suggestion: domain or universal.
+  - Specific technical knowledge, mechanism, component, or implementation gaps should be domain.
+  - Listening, communication, answer-structure, or repeated thinking-pattern habits may be universal.
 
 # Special Cases
 
@@ -287,15 +293,131 @@ Return only JSON:
   "expression_example": "表达示例：按思路构建组织出的候选人口吻 60-90 秒回答；没有必要时为空字符串",
   "profile_signals": [
     {
-      "type": "possible_weak_point or possible_improvement",
+      "type": "possible_weak_point or possible_partial or possible_improvement",
       "topic": "topic name if clear",
       "planned_layer": "planned layer if clear from the interview plan, otherwise empty string",
+      "category": "knowledge_gap|answer_structure|communication|thinking_pattern",
+      "scope_suggestion": "domain|universal",
       "summary": "short evidence summary",
       "weak_point_ref": "existing weak point text if this is a possible improvement, otherwise empty string",
       "evidence": "what the user said or omitted",
       "confidence": "low|medium|high"
     }
   ]
+}
+"""
+
+
+ANSWER_REVIEW_SYSTEM_PROMPT = """# Role
+
+You are a senior interview coach for a Chinese user preparing technical interviews.
+You review only the user's just-completed answer.
+
+# Critical Input Boundary
+
+You will receive:
+- selected source notes and the interview plan;
+- the previous interviewer question;
+- the user's latest answer.
+
+You will not receive the interviewer's next follow-up. Do not predict it.
+
+Your task is to evaluate what the user reasonably should have covered for the previous question, based only on that question, the user's answer, the selected notes, and the interview plan.
+
+# Gap Boundary
+
+The `gaps` field must contain only points that were actually weak, vague, missing, or imprecise in the user's answer to the previous question.
+
+Do not list every adjacent topic from the notes.
+Do not list a future interview direction as a gap.
+Do not require the user to pre-answer dimensions that were not asked unless they are an essential part of the original question.
+
+# Coaching Style
+
+Write in Simplified Chinese.
+Think like a coach, not like a grader.
+Keep the review compact and concrete.
+Do not score the user.
+Do not continue the interview or ask another interview question.
+
+If the latest user message only starts the interview or only chooses a topic, return an empty minimal review.
+
+# Profile Signals
+
+You may leave profile_signals for later session-level profile extraction. These are evidence hints, not profile updates.
+Use them sparingly:
+- possible_weak_point: the user exposed a recurring or important gap.
+- possible_partial: the user showed partial progress on an existing weak point, but the answer is still incomplete. Prefer including weak_point_ref. Do not use this for brand-new weak points.
+- possible_improvement: the user gave evidence that a known weak point may be improving.
+- category: knowledge_gap, answer_structure, communication, or thinking_pattern.
+- scope_suggestion: domain or universal.
+
+# Output
+
+Return only JSON:
+{
+  "feedback": {
+    "coach_note": "one direct coaching paragraph about the user's past answer",
+    "covered": ["concrete points the user already covered"],
+    "gaps": ["concrete improvement points in the user's past answer"]
+  },
+  "profile_signals": [
+    {
+      "type": "possible_weak_point or possible_partial or possible_improvement",
+      "topic": "topic name if clear",
+      "planned_layer": "planned layer if clear from the interview plan, otherwise empty string",
+      "category": "knowledge_gap|answer_structure|communication|thinking_pattern",
+      "scope_suggestion": "domain|universal",
+      "summary": "short evidence summary",
+      "weak_point_ref": "existing weak point text if this is a possible improvement, otherwise empty string",
+      "evidence": "what the user said or omitted",
+      "confidence": "low|medium|high"
+    }
+  ]
+}
+"""
+
+
+FOLLOWUP_REVIEW_SYSTEM_PROMPT = """# Role
+
+You are a senior interview coach for a Chinese user preparing technical interviews.
+You interpret why the interviewer followed up in a certain direction and provide a useful answer-organization frame.
+
+# Critical Boundary
+
+You will receive an existing answer_review that already contains coach_note, covered, and gaps.
+Do not change, expand, or reinterpret those gaps.
+
+The interviewer follow-up may introduce a new dimension. If so, describe it as the interviewer's new probe or depth direction, not as something the user necessarily should have covered in the previous answer.
+
+# Tasks
+
+Produce:
+- interviewer_followup_note: one sentence explaining why the interviewer moved in this direction.
+- thinking_framework: a type-level answer framework for similar future questions.
+- expression_example: a candidate-style 60-90 second answer when useful.
+
+thinking_framework must be type-level, not a direct "next turn script".
+Do not write "下一轮你可以...".
+Do not label the follow-up as proof of a gap.
+
+expression_example may address the follow-up dimension, but it should be framed as an expression example, not as a correction of the previous answer unless answer_review.gaps already support that.
+
+# Style
+
+Write in Simplified Chinese.
+Keep it compact.
+Do not continue the interview or ask another interview question.
+
+# Output
+
+Return only JSON:
+{
+  "feedback": {
+    "thinking_framework": "type-level framework for similar questions",
+    "interviewer_followup_note": "one sentence about the interviewer's follow-up direction"
+  },
+  "expression_example": "candidate-style answer example, or empty string"
 }
 """
 def prepare_interview_plan(
@@ -388,7 +510,7 @@ def generate_session_summary(
 ) -> dict[str, Any]:
     latest_user = latest_message_content(chat_history, role="user")
     previous_interviewer_question = previous_assistant_before_latest_user(chat_history)
-    user_content = "\n\n".join(
+    answer_review_content = "\n\n".join(
         [
             "# Selected Source Notes",
             context.context_text or "(no source notes)",
@@ -402,26 +524,55 @@ def generate_session_summary(
             "",
             "User latest answer:",
             latest_user or "(not available)",
-            "",
-            "# Interviewer Follow-up",
-            answer_text or "(not available)",
-            "",
-            "# Recent Transcript For Continuity",
-            render_chat_history(chat_history[-6:]),
         ]
     )
-    response = llm_client.complete(
+    answer_response = llm_client.complete(
         LLMRequest(
             model=model,
             messages=[
-                LLMMessage(role="system", content=SESSION_SUMMARY_SYSTEM_PROMPT),
-                LLMMessage(role="user", content=user_content),
+                LLMMessage(role="system", content=ANSWER_REVIEW_SYSTEM_PROMPT),
+                LLMMessage(role="user", content=answer_review_content),
             ],
             temperature=temperature,
             response_format={"type": "json_object"},
         )
     )
-    return normalize_session_summary(parse_json_object(response.content))
+    answer_review = normalize_answer_review(parse_json_object(answer_response.content))
+
+    followup_content = "\n\n".join(
+        [
+            "# Selected Source Notes",
+            context.context_text or "(no source notes)",
+            "",
+            "# Interview Plan",
+            render_interview_plan(plan) if plan else "(no precomputed plan)",
+            "",
+            "# Previous Interviewer Question",
+            previous_interviewer_question or "(not available)",
+            "",
+            "# User Latest Answer",
+            latest_user or "(not available)",
+            "",
+            "# Existing Answer Review",
+            json.dumps(answer_review, ensure_ascii=False, indent=2),
+            "",
+            "# Interviewer Follow-up",
+            answer_text or "(not available)",
+        ]
+    )
+    followup_response = llm_client.complete(
+        LLMRequest(
+            model=model,
+            messages=[
+                LLMMessage(role="system", content=FOLLOWUP_REVIEW_SYSTEM_PROMPT),
+                LLMMessage(role="user", content=followup_content),
+            ],
+            temperature=temperature,
+            response_format={"type": "json_object"},
+        )
+    )
+    followup_review = normalize_followup_review(parse_json_object(followup_response.content))
+    return merge_session_reviews(answer_review, followup_review)
 
 
 def normalize_session_summary(payload: dict[str, Any]) -> dict[str, Any]:
@@ -456,6 +607,65 @@ def normalize_session_summary(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def normalize_answer_review(payload: dict[str, Any]) -> dict[str, Any]:
+    feedback = payload.get("feedback")
+    if not isinstance(feedback, dict):
+        feedback = {}
+    return {
+        "feedback": {
+            "coach_note": str(
+                feedback.get("coach_note") or feedback.get("overall") or feedback.get("summary") or ""
+            ).strip(),
+            "covered": dedupe_strings(feedback.get("covered") or [], max_items=6),
+            "gaps": dedupe_strings(
+                feedback.get("gaps") or feedback.get("missing") or feedback.get("could_cover") or [],
+                max_items=6,
+            ),
+            "thinking_framework": "",
+            "interviewer_followup_note": "",
+        },
+        "expression_example": "",
+        "profile_signals": normalize_profile_signals(payload.get("profile_signals") or []),
+    }
+
+
+def normalize_followup_review(payload: dict[str, Any]) -> dict[str, Any]:
+    feedback = payload.get("feedback")
+    if not isinstance(feedback, dict):
+        feedback = {}
+    return {
+        "feedback": {
+            "thinking_framework": str(
+                feedback.get("thinking_framework")
+                or feedback.get("next_focus")
+                or feedback.get("next_tip")
+                or feedback.get("next_step")
+                or ""
+            ).strip(),
+            "interviewer_followup_note": str(
+                feedback.get("interviewer_followup_note") or feedback.get("interviewer_direction") or ""
+            ).strip(),
+        },
+        "expression_example": str(payload.get("expression_example") or payload.get("reference_answer") or "").strip(),
+    }
+
+
+def merge_session_reviews(answer_review: dict[str, Any], followup_review: dict[str, Any]) -> dict[str, Any]:
+    answer_feedback = answer_review.get("feedback") if isinstance(answer_review.get("feedback"), dict) else {}
+    followup_feedback = followup_review.get("feedback") if isinstance(followup_review.get("feedback"), dict) else {}
+    return {
+        "feedback": {
+            "coach_note": str(answer_feedback.get("coach_note") or "").strip(),
+            "covered": dedupe_strings(answer_feedback.get("covered") or [], max_items=6),
+            "gaps": dedupe_strings(answer_feedback.get("gaps") or [], max_items=6),
+            "thinking_framework": str(followup_feedback.get("thinking_framework") or "").strip(),
+            "interviewer_followup_note": str(followup_feedback.get("interviewer_followup_note") or "").strip(),
+        },
+        "expression_example": str(followup_review.get("expression_example") or "").strip(),
+        "profile_signals": normalize_profile_signals(answer_review.get("profile_signals") or []),
+    }
+
+
 def normalize_profile_signals(value: Any) -> list[dict[str, str]]:
     if not isinstance(value, (list, tuple)):
         return []
@@ -464,17 +674,20 @@ def normalize_profile_signals(value: Any) -> list[dict[str, str]]:
         if not isinstance(item, dict):
             continue
         signal_type = str(item.get("type") or "").strip()
-        if signal_type not in {"possible_weak_point", "possible_improvement"}:
+        if signal_type not in {"possible_weak_point", "possible_partial", "possible_improvement"}:
             continue
         signals.append(
             {
                 "type": signal_type,
                 "topic": str(item.get("topic") or "").strip(),
                 "planned_layer": str(item.get("planned_layer") or "").strip(),
+                "category": str(item.get("category") or "").strip(),
+                "scope_suggestion": str(item.get("scope_suggestion") or item.get("scope") or "").strip(),
                 "summary": str(item.get("summary") or "").strip(),
                 "weak_point_ref": str(item.get("weak_point_ref") or "").strip(),
                 "evidence": str(item.get("evidence") or "").strip(),
                 "confidence": str(item.get("confidence") or "medium").strip() or "medium",
+                "context_note_paths": [str(path) for path in item.get("context_note_paths", []) if str(path).strip()] if isinstance(item.get("context_note_paths"), list) else [],
             }
         )
         if len(signals) >= 3:

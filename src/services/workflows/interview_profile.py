@@ -10,7 +10,7 @@ from knowledge_base_agent.llm.schema import LLMMessage, LLMRequest
 from services.workflows.interview import InterviewPlan
 
 
-PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 3
 
 
 PROFILE_EXTRACTION_SYSTEM_PROMPT = """# Role
@@ -23,6 +23,7 @@ You are not the interviewer and you are not editing the profile directly. Your j
 
 Extract only observations that are useful across future interview sessions:
 - weak_point: a recurring, important, or interview-relevant gap.
+- partial: evidence that the user partially addressed an existing weak point, but not completely.
 - strong_point: a durable strength shown by the user.
 - improvement: evidence that an existing weak point may have improved.
 
@@ -36,6 +37,13 @@ Prefer concrete engineering phrasing over generic labels. Keep each point short 
 - If a turn_review already contains profile_signals, treat them as evidence hints, not final truth.
 - Use planned_layer only when it is clear from the session plan or turn review. Otherwise leave it empty.
 - For improvement, include weak_point_ref when an existing weak point or signal reference is clear.
+- For partial, include weak_point_ref when possible. Do not use partial for a brand-new weak point.
+- For weak_point, include category and scope_suggestion:
+  - category must be one of: knowledge_gap, answer_structure, communication, thinking_pattern.
+  - scope_suggestion must be domain or universal.
+  - Concrete knowledge/mechanism/component gaps should be domain.
+  - Listening, communication, or answer-structure habits may be universal, but the system will make the final scope decision.
+- Do not output domain_anchor; it is written by code.
 
 # Output
 
@@ -49,9 +57,11 @@ Return only JSON:
   },
   "observations": [
     {
-      "type": "weak_point|strong_point|improvement",
+      "type": "weak_point|partial|strong_point|improvement",
       "topic": "topic name if clear",
       "planned_layer": "planned layer if clear, otherwise empty string",
+      "category": "knowledge_gap|answer_structure|communication|thinking_pattern",
+      "scope_suggestion": "domain|universal",
       "point": "short durable point",
       "weak_point_ref": "existing weak point text if improvement, otherwise empty string",
       "evidence": "brief evidence from the session",
@@ -157,8 +167,9 @@ class InterviewProfileStore:
 def normalize_interview_profile(profile: dict[str, Any]) -> dict[str, Any]:
     result = default_interview_profile()
     result.update(profile or {})
-    result["weak_points"] = list(result.get("weak_points") or [])
-    result["strong_points"] = list(result.get("strong_points") or [])
+    result["schema_version"] = PROFILE_SCHEMA_VERSION
+    result["weak_points"] = [normalize_weak_point(item) for item in list(result.get("weak_points") or []) if isinstance(item, dict)]
+    result["strong_points"] = [normalize_strong_point(item) for item in list(result.get("strong_points") or []) if isinstance(item, dict)]
     result["topic_mastery"] = dict(result.get("topic_mastery") or {})
     communication = result.get("communication")
     if not isinstance(communication, dict):
@@ -168,6 +179,88 @@ def normalize_interview_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "suggestions": [str(item).strip() for item in communication.get("suggestions", []) if str(item).strip()],
     }
     return recompute_topic_mastery(result)
+
+
+def normalize_weak_point(item: dict[str, Any]) -> dict[str, Any]:
+    weak = dict(item or {})
+    category = normalize_category(weak.get("category"))
+    weak["category"] = category
+    weak["scope"] = normalize_scope(
+        weak.get("scope") or weak.get("scope_suggestion"),
+        category=category,
+        existing_scope=weak.get("scope"),
+    )
+    weak["domain_anchor"] = normalize_domain_anchor(
+        weak.get("domain_anchor"),
+        legacy_anchor_note_paths=weak.get("anchor_note_paths"),
+        topic=weak.get("topic"),
+    )
+    weak["source_note_paths"] = [str(path) for path in weak.get("source_note_paths", []) if str(path).strip()]
+    weak["source_session_ids"] = [str(item) for item in weak.get("source_session_ids", []) if str(item).strip()]
+    weak["times_seen"] = int(weak.get("times_seen", 0) or 0)
+    weak["improved"] = bool(weak.get("improved"))
+    sr = dict(weak.get("sr") or {})
+    sr.setdefault("interval_days", 1)
+    sr.setdefault("ease_factor", 2.5)
+    sr.setdefault("repetitions", 0)
+    sr.setdefault("next_review", date.today().isoformat())
+    sr.setdefault("last_outcome", "")
+    weak["sr"] = sr
+    return weak
+
+
+def normalize_strong_point(item: dict[str, Any]) -> dict[str, Any]:
+    strong = dict(item or {})
+    strong["topic"] = str(strong.get("topic") or "").strip()
+    strong["source_session_ids"] = [str(value) for value in strong.get("source_session_ids", []) if str(value).strip()]
+    strong["times_seen"] = int(strong.get("times_seen", 0) or 0)
+    return strong
+
+
+def normalize_category(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "knowledge": "knowledge_gap",
+        "knowledge_gap": "knowledge_gap",
+        "domain": "knowledge_gap",
+        "answer": "answer_structure",
+        "answer_structure": "answer_structure",
+        "structure": "answer_structure",
+        "communication": "communication",
+        "thinking": "thinking_pattern",
+        "thinking_pattern": "thinking_pattern",
+    }
+    return aliases.get(text, "knowledge_gap")
+
+
+def normalize_scope(value: Any, *, category: str, existing_scope: Any = None) -> str:
+    current = str(existing_scope or value or "").strip().lower()
+    if current == "universal":
+        return "universal"
+    if category == "communication":
+        return "universal"
+    return "domain"
+
+
+def normalize_scope_suggestion(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return "universal" if text == "universal" else "domain"
+
+
+def normalize_domain_anchor(
+    value: Any,
+    *,
+    legacy_anchor_note_paths: Any = None,
+    topic: Any = None,
+) -> dict[str, Any]:
+    anchor = dict(value or {}) if isinstance(value, dict) else {}
+    paths = anchor.get("context_note_paths")
+    if paths is None and legacy_anchor_note_paths:
+        paths = legacy_anchor_note_paths
+    anchor["context_note_paths"] = [str(path) for path in (paths or []) if str(path).strip()]
+    anchor["plan_topic"] = str(anchor.get("plan_topic") or topic or "").strip()
+    anchor["scope_path"] = str(anchor.get("scope_path") or "").strip()
+    return anchor
 
 
 def extract_profile_observations(
@@ -219,6 +312,8 @@ def compact_profile_for_extraction(profile: dict[str, Any]) -> dict[str, Any]:
                 "point": weak.get("point"),
                 "topic": weak.get("topic"),
                 "planned_layer": weak.get("planned_layer", ""),
+                "scope": weak.get("scope", "domain"),
+                "category": weak.get("category", "knowledge_gap"),
                 "improved": bool(weak.get("improved")),
             }
             for weak in profile.get("weak_points", [])[:60]
@@ -272,6 +367,7 @@ def compact_reviews_for_extraction(reviews: list[dict[str, Any]]) -> list[dict[s
                     or "",
                 },
                 "expression_example": review.get("expression_example") or review.get("reference_answer") or "",
+                "context_note_paths": review.get("context_note_paths") or [],
                 "profile_signals": review.get("profile_signals") or [],
             }
         )
@@ -346,10 +442,13 @@ def normalize_observations(value: Any) -> list[dict[str, str]]:
                 "type": obs_type,
                 "topic": str(item.get("topic") or "").strip(),
                 "planned_layer": str(item.get("planned_layer") or "").strip(),
+                "category": normalize_category(item.get("category")),
+                "scope_suggestion": normalize_scope_suggestion(item.get("scope_suggestion") or item.get("scope")),
                 "point": point,
                 "weak_point_ref": str(item.get("weak_point_ref") or "").strip(),
                 "evidence": evidence,
                 "confidence": normalize_confidence(item.get("confidence")),
+                "context_note_paths": [str(path) for path in item.get("context_note_paths", []) if str(path).strip()] if isinstance(item.get("context_note_paths"), list) else [],
             }
         )
         if len(observations) >= 30:
@@ -363,6 +462,8 @@ def normalize_observation_type(value: Any) -> str:
         "possible_weak_point": "weak_point",
         "weak": "weak_point",
         "weak_point": "weak_point",
+        "possible_partial": "partial",
+        "partial": "partial",
         "possible_improvement": "improvement",
         "improved": "improvement",
         "improvement": "improvement",
@@ -388,10 +489,13 @@ def observations_from_turn_reviews(reviews: list[dict[str, Any]]) -> list[dict[s
                     "type": signal.get("type"),
                     "topic": signal.get("topic"),
                     "planned_layer": signal.get("planned_layer"),
+                    "category": signal.get("category"),
+                    "scope_suggestion": signal.get("scope_suggestion") or signal.get("scope"),
                     "point": signal.get("summary") or signal.get("weak_point_ref"),
                     "weak_point_ref": signal.get("weak_point_ref"),
                     "evidence": signal.get("evidence"),
                     "confidence": signal.get("confidence"),
+                    "context_note_paths": signal.get("context_note_paths") or review.get("context_note_paths") or [],
                 }
             )
     return normalize_observations(raw)
@@ -417,11 +521,9 @@ def apply_profile_observations(
     communication: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     updated = normalize_interview_profile(profile)
-    operations = {"added": [], "updated": [], "improved": [], "strong_added": [], "strong_updated": []}
+    operations = {"added": [], "updated": [], "partial": [], "improved": [], "strong_added": [], "strong_updated": []}
     today = date.today().isoformat()
     session_id = str(session.get("session_id") or "")
-    context = session.get("context") or {}
-    source_note_paths = list(context.get("source_note_paths") or [])
 
     for observation in observations:
         obs_type = observation["type"]
@@ -429,17 +531,13 @@ def apply_profile_observations(
         if confidence == "low":
             continue
         if obs_type == "weak_point":
-            index = find_similar_profile_item(
-                updated.get("weak_points", []),
-                topic=observation.get("topic", ""),
-                text=observation.get("point", ""),
-                include_improved=False,
-            )
+            observation = prepare_observation_for_write(observation, session)
+            index = find_similar_weak_point(updated.get("weak_points", []), observation=observation)
             if index is None:
                 weak = new_weak_point(
                     observation=observation,
+                    session=session,
                     session_id=session_id,
-                    source_note_paths=source_note_paths,
                     today=today,
                 )
                 updated.setdefault("weak_points", []).append(weak)
@@ -456,25 +554,48 @@ def apply_profile_observations(
                 operations["improved"].append(weak.get("point"))
             else:
                 upsert_strong_point(updated, observation, session_id=session_id, today=today, operations=operations)
+        elif obs_type == "partial":
+            index = find_improvement_target(updated.get("weak_points", []), observation)
+            if index is not None:
+                weak = updated["weak_points"][index]
+                mark_weak_point_partial(weak, observation, session_id=session_id, today=today)
+                operations["partial"].append(weak.get("point"))
         elif obs_type == "strong_point":
             upsert_strong_point(updated, observation, session_id=session_id, today=today, operations=operations)
 
     merge_communication(updated, communication or {})
+    upgraded = promote_repeated_domain_habits(updated)
+    if upgraded:
+        operations["scope_upgraded"] = upgraded
     updated = recompute_topic_mastery(updated)
     return updated, operations
 
 
+def prepare_observation_for_write(observation: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+    prepared = dict(observation or {})
+    category = normalize_category(prepared.get("category"))
+    prepared["category"] = category
+    prepared["scope"] = normalize_scope(prepared.get("scope_suggestion") or prepared.get("scope"), category=category)
+    prepared["domain_anchor"] = resolve_domain_anchor(observation=prepared, session=session)
+    return prepared
+
+
 def new_weak_point(
     *,
-    observation: dict[str, str],
+    observation: dict[str, Any],
+    session: dict[str, Any],
     session_id: str,
-    source_note_paths: list[str],
     today: str,
 ) -> dict[str, Any]:
+    context = session.get("context") or {}
+    source_note_paths = list(context.get("source_note_paths") or [])
     return {
         "point": observation.get("point") or observation.get("evidence"),
         "topic": observation.get("topic", ""),
         "planned_layer": observation.get("planned_layer", ""),
+        "scope": observation.get("scope", "domain"),
+        "category": observation.get("category", "knowledge_gap"),
+        "domain_anchor": observation.get("domain_anchor") or {},
         "evidence": compact_evidence(observation.get("evidence", "")),
         "source_session_ids": [session_id] if session_id else [],
         "source_note_paths": source_note_paths[:12],
@@ -488,11 +609,12 @@ def new_weak_point(
             "ease_factor": 2.5,
             "repetitions": 0,
             "next_review": (date.today() + timedelta(days=1)).isoformat(),
+            "last_outcome": "fail",
         },
     }
 
 
-def update_weak_point(weak: dict[str, Any], observation: dict[str, str], *, session_id: str, today: str) -> None:
+def update_weak_point(weak: dict[str, Any], observation: dict[str, Any], *, session_id: str, today: str) -> None:
     weak["times_seen"] = int(weak.get("times_seen", 0) or 0) + 1
     weak["last_seen"] = today
     if observation.get("planned_layer") and not weak.get("planned_layer"):
@@ -500,12 +622,41 @@ def update_weak_point(weak: dict[str, Any], observation: dict[str, str], *, sess
     append_unique(weak.setdefault("source_session_ids", []), session_id, max_items=8)
     append_evidence(weak, observation.get("evidence", ""))
     sr = weak.setdefault("sr", {})
-    sr["ease_factor"] = max(1.3, float(sr.get("ease_factor", 2.5)) - 0.15)
+    if sr.get("last_outcome") == "fail":
+        sr["ease_factor"] = round(max(1.3, float(sr.get("ease_factor", 2.5)) - 0.15), 2)
+    else:
+        sr["ease_factor"] = round(float(sr.get("ease_factor", 2.5)), 2)
+    sr["repetitions"] = max(0, int(sr.get("repetitions", 0) or 0) - 1)
     sr["interval_days"] = 1
     sr["next_review"] = (date.today() + timedelta(days=1)).isoformat()
+    sr["last_outcome"] = "fail"
 
 
-def mark_weak_point_improved(weak: dict[str, Any], observation: dict[str, str], *, session_id: str, today: str) -> None:
+def mark_weak_point_partial(weak: dict[str, Any], observation: dict[str, Any], *, session_id: str, today: str) -> None:
+    weak["last_seen"] = today
+    weak["improved"] = False
+    append_unique(weak.setdefault("source_session_ids", []), session_id, max_items=8)
+    append_evidence(weak, observation.get("evidence", ""))
+    sr = weak.setdefault("sr", {})
+    previous_interval = int(sr.get("interval_days", 1) or 1)
+    if previous_interval <= 1:
+        interval = 2
+    elif previous_interval < 3:
+        interval = 3
+    else:
+        interval = previous_interval
+    sr.update(
+        {
+            "ease_factor": round(float(sr.get("ease_factor", 2.5)), 2),
+            "repetitions": int(sr.get("repetitions", 0) or 0),
+            "interval_days": interval,
+            "next_review": (date.today() + timedelta(days=interval)).isoformat(),
+            "last_outcome": "partial",
+        }
+    )
+
+
+def mark_weak_point_improved(weak: dict[str, Any], observation: dict[str, Any], *, session_id: str, today: str) -> None:
     weak["last_seen"] = today
     append_unique(weak.setdefault("source_session_ids", []), session_id, max_items=8)
     append_evidence(weak, observation.get("evidence", ""))
@@ -519,6 +670,7 @@ def mark_weak_point_improved(weak: dict[str, Any], observation: dict[str, str], 
             "ease_factor": round(ease, 2),
             "interval_days": interval,
             "next_review": (date.today() + timedelta(days=interval)).isoformat(),
+            "last_outcome": "pass",
         }
     )
     if repetitions >= 3:
@@ -583,6 +735,48 @@ def find_improvement_target(items: list[dict[str, Any]], observation: dict[str, 
     )
 
 
+def find_similar_weak_point(items: list[dict[str, Any]], *, observation: dict[str, Any]) -> int | None:
+    text_norm = normalize_match_text(observation.get("point") or "")
+    if not text_norm:
+        return None
+    obs_scope = observation.get("scope") or "domain"
+    obs_category = normalize_category(observation.get("category"))
+    obs_anchor = normalize_domain_anchor(observation.get("domain_anchor"), topic=observation.get("topic"))
+    best_index: int | None = None
+    best_score = 0.0
+
+    for index, item in enumerate(items):
+        if item.get("improved"):
+            continue
+        item_scope = item.get("scope") or "domain"
+        if item_scope != obs_scope:
+            continue
+        item_category = normalize_category(item.get("category"))
+        if item_category != obs_category:
+            continue
+        candidate = normalize_match_text(str(item.get("point") or ""))
+        if not candidate:
+            continue
+        score = max(
+            SequenceMatcher(None, text_norm, candidate).ratio(),
+            containment_score(text_norm, candidate),
+        )
+        if obs_scope == "universal":
+            threshold = 0.72
+        else:
+            relevance = domain_relevance_between_anchors(item.get("domain_anchor") or {}, obs_anchor)
+            if relevance in {"strong", "medium"}:
+                threshold = 0.68
+            elif is_legacy_topic_match(item, observation):
+                threshold = 0.78
+            else:
+                threshold = 0.85
+        if score >= threshold and score > best_score:
+            best_score = score
+            best_index = index
+    return best_index
+
+
 def find_similar_profile_item(
     items: list[dict[str, Any]],
     *,
@@ -599,7 +793,7 @@ def find_similar_profile_item(
         if not include_improved and item.get("improved"):
             continue
         item_topic = str(item.get("topic") or "")
-        if topic and item_topic and item_topic != topic:
+        if topic and item_topic and not topic_matches(item_topic, topic):
             continue
         candidate = normalize_match_text(str(item.get("point") or ""))
         if not candidate:
@@ -622,6 +816,132 @@ def containment_score(left: str, right: str) -> float:
 
 def normalize_match_text(text: str) -> str:
     return "".join(str(text or "").lower().split())
+
+
+def resolve_domain_anchor(*, observation: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+    if observation.get("scope") == "universal":
+        return {}
+    topic_card = resolve_topic_card_from_session(
+        session=session,
+        current_topic=(session.get("interview_state") or {}).get("current_topic") or observation.get("topic"),
+    )
+    context = session.get("context") or {}
+    plan_topic = str((session.get("interview_state") or {}).get("current_topic") or observation.get("topic") or "").strip()
+    scope_path = resolve_scope_path(context)
+    turn_context_paths = [str(path) for path in observation.get("context_note_paths", []) if str(path).strip()]
+    if turn_context_paths and len(turn_context_paths) <= 3:
+        context_note_paths = turn_context_paths
+    else:
+        card_paths = list((topic_card or {}).get("source_note_paths") or [])
+        context_note_paths = [str(path) for path in (card_paths if len(card_paths) <= 3 else card_paths[:3]) if str(path).strip()]
+    if not context_note_paths and not plan_topic and not scope_path:
+        return {}
+    return {
+        "plan_topic": plan_topic,
+        "context_note_paths": context_note_paths,
+        "scope_path": scope_path,
+    }
+
+
+def resolve_scope_path(context: dict[str, Any]) -> str:
+    source_type = str(context.get("source_type") or "").strip()
+    source_value = str(context.get("source_value") or "").strip()
+    if source_type in {"folder", "tag", "search"} and source_value:
+        return source_value
+    paths = [str(path) for path in (context.get("source_paths") or []) if str(path).strip()]
+    if paths:
+        return str(Path(paths[0]).parent).replace("\\", "/")
+    note_paths = [str(path) for path in (context.get("source_note_paths") or []) if str(path).strip()]
+    if note_paths:
+        return str(Path(note_paths[0]).parent).replace("\\", "/")
+    return ""
+
+
+def resolve_topic_card_from_session(*, session: dict[str, Any], current_topic: Any) -> dict[str, Any] | None:
+    plan = session.get("interview_plan") or {}
+    topics = [topic for topic in plan.get("topics", []) if isinstance(topic, dict)]
+    if not topics:
+        return None
+    target = str(current_topic or "").strip()
+    if target:
+        target_key = normalize_topic_key(target)
+        for topic in topics:
+            if normalize_topic_key(topic.get("name")) == target_key:
+                return topic
+        scored = [
+            (SequenceMatcher(None, normalize_topic_key(topic.get("name")), target_key).ratio(), topic)
+            for topic in topics
+        ]
+        best_score, best_topic = max(scored, key=lambda item: item[0])
+        if best_score >= 0.6:
+            return best_topic
+    if len(topics) == 1:
+        return topics[0]
+    return None
+
+
+def topic_card_from_plan(plan: InterviewPlan | None, current_topic: str | None) -> dict[str, Any] | None:
+    if not plan or not plan.topics:
+        return None
+    if current_topic:
+        target = normalize_topic_key(current_topic)
+        for topic in plan.topics:
+            if normalize_topic_key(topic.name) == target:
+                return {"name": topic.name, "source_note_paths": list(topic.source_note_paths), "coverage": list(topic.coverage)}
+        scored = [
+            (SequenceMatcher(None, normalize_topic_key(topic.name), target).ratio(), topic)
+            for topic in plan.topics
+        ]
+        best_score, best_topic = max(scored, key=lambda item: item[0])
+        if best_score >= 0.6:
+            return {"name": best_topic.name, "source_note_paths": list(best_topic.source_note_paths), "coverage": list(best_topic.coverage)}
+    if len(plan.topics) == 1:
+        topic = plan.topics[0]
+        return {"name": topic.name, "source_note_paths": list(topic.source_note_paths), "coverage": list(topic.coverage)}
+    return None
+
+
+def domain_relevance_between_anchors(left: dict[str, Any], right: dict[str, Any]) -> str:
+    left_paths = set(str(path) for path in (left or {}).get("context_note_paths", []) if str(path).strip())
+    right_paths = set(str(path) for path in (right or {}).get("context_note_paths", []) if str(path).strip())
+    if left_paths and right_paths and left_paths.intersection(right_paths):
+        return "strong"
+    left_scope = str((left or {}).get("scope_path") or "").strip()
+    right_scope = str((right or {}).get("scope_path") or "").strip()
+    left_topic = str((left or {}).get("plan_topic") or "").strip()
+    right_topic = str((right or {}).get("plan_topic") or "").strip()
+    if left_scope and right_scope and path_prefix_related(left_scope, right_scope):
+        if not left_topic or not right_topic:
+            return "medium"
+        if SequenceMatcher(None, normalize_topic_key(left_topic), normalize_topic_key(right_topic)).ratio() >= 0.8:
+            return "medium"
+    return "none"
+
+
+def domain_relevance_for_current(weak: dict[str, Any], *, current_topic_card: dict[str, Any] | None, current_topic: str | None) -> str:
+    anchor = normalize_domain_anchor(weak.get("domain_anchor"), topic=weak.get("topic"))
+    card_paths = set(str(path) for path in ((current_topic_card or {}).get("source_note_paths") or []) if str(path).strip())
+    anchor_paths = set(str(path) for path in anchor.get("context_note_paths", []) if str(path).strip())
+    if card_paths and anchor_paths and card_paths.intersection(anchor_paths):
+        return "strong"
+    if anchor_paths:
+        return "none"
+    if is_legacy_topic_match(weak, {"topic": current_topic}):
+        return "medium"
+    return "none"
+
+
+def path_prefix_related(left: str, right: str) -> bool:
+    a = left.replace("\\", "/").strip("/")
+    b = right.replace("\\", "/").strip("/")
+    return bool(a and b and (a == b or a.startswith(b + "/") or b.startswith(a + "/")))
+
+
+def is_legacy_topic_match(item: dict[str, Any], observation: dict[str, Any]) -> bool:
+    anchor = item.get("domain_anchor") or {}
+    if anchor.get("context_note_paths"):
+        return False
+    return topic_matches(item.get("topic"), observation.get("topic"))
 
 
 def compact_evidence(text: str, max_chars: int = 300) -> str:
@@ -658,6 +978,71 @@ def merge_communication(profile: dict[str, Any], communication: dict[str, Any]) 
     suggestions = target.setdefault("suggestions", [])
     for suggestion in communication.get("suggestions") or []:
         append_unique(suggestions, str(suggestion).strip(), max_items=8)
+
+
+def promote_repeated_domain_habits(profile: dict[str, Any]) -> list[str]:
+    upgraded: list[str] = []
+    weak_points = profile.get("weak_points", [])
+    whitelist = {"answer_structure", "thinking_pattern", "communication"}
+    for left_index, left in enumerate(list(weak_points)):
+        if left.get("improved") or left.get("scope") != "domain":
+            continue
+        category = normalize_category(left.get("category"))
+        if category not in whitelist:
+            continue
+        left_text = normalize_match_text(left.get("point") or "")
+        if not left_text:
+            continue
+        for right in weak_points[left_index + 1 :]:
+            if right.get("improved") or right.get("scope") != "domain":
+                continue
+            if normalize_category(right.get("category")) != category:
+                continue
+            right_text = normalize_match_text(right.get("point") or "")
+            score = max(
+                SequenceMatcher(None, left_text, right_text).ratio(),
+                containment_score(left_text, right_text),
+            )
+            if score < 0.85:
+                continue
+            if domain_relevance_between_anchors(left.get("domain_anchor") or {}, right.get("domain_anchor") or {}) != "none":
+                continue
+            if not domains_are_distinct(left, right):
+                continue
+            left["scope"] = "universal"
+            left["times_seen"] = int(left.get("times_seen", 0) or 0) + int(right.get("times_seen", 0) or 0)
+            for session_id in right.get("source_session_ids", []) or []:
+                append_unique(left.setdefault("source_session_ids", []), session_id, max_items=8)
+            append_evidence(left, right.get("evidence", ""))
+            also_seen = left.setdefault("also_seen_in", [])
+            also_seen.append(
+                {
+                    "topic": right.get("topic", ""),
+                    "domain_anchor": right.get("domain_anchor") or {},
+                    "point": right.get("point", ""),
+                }
+            )
+            right["improved"] = True
+            right["improved_at"] = date.today().isoformat()
+            upgraded.append(left.get("point", ""))
+            break
+    return upgraded
+
+
+def domains_are_distinct(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_anchor = left.get("domain_anchor") or {}
+    right_anchor = right.get("domain_anchor") or {}
+    if domain_relevance_between_anchors(left_anchor, right_anchor) != "none":
+        return False
+    left_scope = str(left_anchor.get("scope_path") or "").strip()
+    right_scope = str(right_anchor.get("scope_path") or "").strip()
+    if left_scope and right_scope and left_scope != right_scope:
+        return True
+    left_topic = normalize_topic_key(left_anchor.get("plan_topic") or left.get("topic"))
+    right_topic = normalize_topic_key(right_anchor.get("plan_topic") or right.get("topic"))
+    if left_topic and right_topic and SequenceMatcher(None, left_topic, right_topic).ratio() < 0.6:
+        return True
+    return False
 
 
 def dedupe_strings(value: Any, max_items: int) -> list[str]:
@@ -715,57 +1100,34 @@ def render_candidate_profile_context(
         return "(no candidate profile available)"
 
     topic = resolve_current_topic(current_topic=current_topic, plan=plan)
-    lines: list[str] = []
-    lines.append(f"Current topic: {topic or '(unknown)'}")
-
-    mastery = (profile.get("topic_mastery") or {}).get(topic or "", {})
-    if mastery:
-        estimate = mastery.get("mastery_estimate")
-        weak_count = mastery.get("active_weak_count", 0)
-        if estimate is not None:
-            level = mastery_level_label(float(estimate))
-            lines.extend(
-                [
-                    "",
-                    "Topic overview:",
-                    f"- {topic}: estimated {level} level (~{estimate}/100), {weak_count} active weak point(s).",
-                    "  Interview behavior: calibrate baseline difficulty from this estimate; do not mention the score to the user.",
-                ]
-            )
-
-    topic_weak = [
-        weak for weak in profile.get("weak_points", [])
-        if not weak.get("improved") and topic and str(weak.get("topic") or "") == topic
-    ]
-    due_matching, due_other = split_due_reviews(profile, topic)
+    current_topic_card = topic_card_from_plan(plan, topic)
+    universal_weak, domain_weak, _other_domain_weak = split_weak_points_for_current(
+        profile,
+        current_topic=topic,
+        current_topic_card=current_topic_card,
+    )
     strong = [
         item for item in profile.get("strong_points", [])
-        if topic and str(item.get("topic") or "") == topic
+        if topic_matches(item.get("topic"), topic)
     ][:4]
 
-    if topic_weak:
-        lines.extend(["", "Priority weak points for this topic:"])
-        for weak in topic_weak[:8]:
-            layer = str(weak.get("planned_layer") or "").strip()
+    lines: list[str] = [
+        "## Candidate Profile Background",
+        "Private background from prior interview sessions. These notes are not interview tasks.",
+        "",
+        f"Current topic: {topic or '(unknown)'}",
+    ]
+    if domain_weak:
+        lines.extend(["", "Observed unstable areas in this topic:"])
+        for weak in domain_weak[:4]:
             lines.append(f"- {weak.get('point')}")
-            if layer:
-                lines.append(f"  planned layer: {layer}")
-            else:
-                lines.append("  planned layer: topic-level")
-            lines.append("  behavior: use as a private probe; ask one extra follow-up if the answer is vague.")
     else:
-        lines.extend(["", "Priority weak points for this topic: none recorded."])
+        lines.extend(["", "Observed unstable areas in this topic: none recorded."])
 
-    if due_matching:
-        lines.extend(["", "Due reviews for current topic:"])
-        for weak in due_matching[:5]:
-            lines.extend(render_due_review_lines(weak))
-
-    if due_other:
-        lines.extend(["", "Due reviews not matching current topic:"])
-        for weak in due_other[:5]:
-            lines.append(f"- {weak.get('topic')}: {weak.get('point')}")
-            lines.append("  behavior: do not introduce unless the user switches to that topic.")
+    if universal_weak:
+        lines.extend(["", "Cross-topic habits:"])
+        for weak in universal_weak[:3]:
+            lines.append(f"- {weak.get('point')}")
 
     if strong:
         lines.extend(["", "Recent strengths for this topic:"])
@@ -773,23 +1135,87 @@ def render_candidate_profile_context(
             lines.append(f"- {item.get('point')}")
 
     communication = profile.get("communication") or {}
-    if communication.get("style") or communication.get("suggestions"):
+    if communication.get("style"):
         lines.extend(["", "Communication notes:"])
-        if communication.get("style"):
-            lines.append(f"- style: {communication['style']}")
-        for suggestion in communication.get("suggestions", [])[:3]:
-            lines.append(f"- suggestion: {suggestion}")
+        lines.append(f"- style: {communication['style']}")
 
     lines.extend(
         [
             "",
-            "Interview policy:",
-            "- Do not say the user was previously weak on these points.",
-            "- Use this profile only as private guidance for what to verify.",
-            "- If the user shows clear improvement, leave that as a profile signal in the turn review; do not announce it as a profile update.",
+            "## Profile Use Boundary",
+            "Use this profile only as quiet background while you conduct the interview.",
+            "Let the user's current answer and the interview plan drive the next question.",
+            "Do not force these notes into the conversation, and do not chase them as checklist items.",
+            "Do not mention prior sessions, profile notes, weak points, scores, review history, or spaced-review status.",
+            "If the conversation naturally reaches one of these areas, use the note only to judge whether the current answer is clearer than before.",
         ]
     )
     return "\n".join(lines)
+
+
+def build_candidate_profile_debug(
+    *,
+    profile: dict[str, Any] | None,
+    current_topic: str | None,
+    plan: InterviewPlan | None,
+) -> dict[str, Any]:
+    topic = resolve_current_topic(current_topic=current_topic, plan=plan)
+    current_topic_card = topic_card_from_plan(plan, topic)
+    if not profile:
+        return {
+            "available": False,
+            "current_topic": topic,
+            "weak_points_count": 0,
+            "due_reviews_count": 0,
+            "strong_points_count": 0,
+            "topic_mastery": None,
+        }
+
+    universal_weak, domain_weak, other_domain_weak = split_weak_points_for_current(
+        profile,
+        current_topic=topic,
+        current_topic_card=current_topic_card,
+    )
+    due_matching, due_other = split_due_reviews(profile, topic, current_topic_card=current_topic_card)
+    topic_weak = [*universal_weak, *domain_weak]
+    strong = [
+        item for item in profile.get("strong_points", [])
+        if topic_matches(item.get("topic"), topic)
+    ]
+    mastery = find_topic_mastery(profile, topic)
+
+    return {
+        "available": True,
+        "current_topic": topic,
+        "weak_points_count": len(topic_weak),
+        "due_reviews_count": len(due_matching),
+        "other_due_reviews_count": len(due_other),
+        "other_domain_weak_points_count": len(other_domain_weak),
+        "strong_points_count": len(strong),
+        "topic_mastery": {
+            "active_weak_count": mastery.get("active_weak_count"),
+            "mastery_estimate": mastery.get("mastery_estimate"),
+            "last_assessed": mastery.get("last_assessed"),
+        } if mastery else None,
+        "weak_points": [
+            {
+                "point": weak.get("point"),
+                "scope": weak.get("scope", "domain"),
+                "category": weak.get("category", "knowledge_gap"),
+                "planned_layer": weak.get("planned_layer") or "topic-level",
+                "domain_anchor": weak.get("domain_anchor") or {},
+            }
+            for weak in topic_weak[:5]
+        ],
+        "due_reviews": [
+            {
+                "point": weak.get("point"),
+                "planned_layer": weak.get("planned_layer") or "topic-level",
+                "sr": weak.get("sr") or {},
+            }
+            for weak in due_matching[:5]
+        ],
+    }
 
 
 def resolve_current_topic(*, current_topic: str | None, plan: InterviewPlan | None) -> str | None:
@@ -800,7 +1226,71 @@ def resolve_current_topic(*, current_topic: str | None, plan: InterviewPlan | No
     return None
 
 
-def split_due_reviews(profile: dict[str, Any], current_topic: str | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def normalize_topic_key(value: Any) -> str:
+    return "".join(str(value or "").lower().split())
+
+
+def topic_matches(left: Any, right: Any) -> bool:
+    left_key = normalize_topic_key(left)
+    right_key = normalize_topic_key(right)
+    return bool(left_key and right_key and left_key == right_key)
+
+
+def find_topic_mastery(profile: dict[str, Any], current_topic: str | None) -> dict[str, Any]:
+    if not current_topic:
+        return {}
+    target = normalize_topic_key(current_topic)
+    for topic, mastery in (profile.get("topic_mastery") or {}).items():
+        if normalize_topic_key(topic) == target:
+            return mastery or {}
+    return {}
+
+
+def split_weak_points_for_current(
+    profile: dict[str, Any],
+    *,
+    current_topic: str | None,
+    current_topic_card: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    universal: list[dict[str, Any]] = []
+    domain: list[dict[str, Any]] = []
+    other: list[dict[str, Any]] = []
+    for weak in profile.get("weak_points", []):
+        if weak.get("improved"):
+            continue
+        if weak.get("scope") == "universal":
+            universal.append(weak)
+            continue
+        relevance = domain_relevance_for_current(
+            weak,
+            current_topic_card=current_topic_card,
+            current_topic=current_topic,
+        )
+        if relevance in {"strong", "medium"}:
+            domain.append(weak)
+        else:
+            other.append(weak)
+    return sort_weak_points_for_prompt(universal), sort_weak_points_for_prompt(domain), other
+
+
+def sort_weak_points_for_prompt(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    today = date.today().isoformat()
+
+    def key(item: dict[str, Any]) -> tuple[int, float, str]:
+        sr = item.get("sr") or {}
+        due = str(sr.get("next_review") or "2000-01-01") <= today
+        ease = float(sr.get("ease_factor", 2.5))
+        return (0 if due else 1, ease, str(item.get("last_seen") or ""))
+
+    return sorted(items, key=key)
+
+
+def split_due_reviews(
+    profile: dict[str, Any],
+    current_topic: str | None,
+    *,
+    current_topic_card: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     today = date.today().isoformat()
     matching: list[dict[str, Any]] = []
     other: list[dict[str, Any]] = []
@@ -811,30 +1301,15 @@ def split_due_reviews(profile: dict[str, Any], current_topic: str | None) -> tup
         next_review = str(sr.get("next_review") or "2000-01-01")
         if next_review > today:
             continue
-        if current_topic and weak.get("topic") == current_topic:
+        if weak.get("scope") == "universal":
+            matching.append(weak)
+        elif domain_relevance_for_current(
+            weak,
+            current_topic_card=current_topic_card,
+            current_topic=current_topic,
+        ) in {"strong", "medium"}:
             matching.append(weak)
         else:
             other.append(weak)
     key = lambda item: float((item.get("sr") or {}).get("ease_factor", 2.5))
     return sorted(matching, key=key), sorted(other, key=key)
-
-
-def render_due_review_lines(weak: dict[str, Any]) -> list[str]:
-    sr = weak.get("sr") or {}
-    ease = float(sr.get("ease_factor", 2.5))
-    repetitions = int(sr.get("repetitions", 0) or 0)
-    priority = "high" if ease < 2.0 or repetitions >= 3 else "normal"
-    return [
-        f"- {weak.get('point')}",
-        f"  priority: {priority}",
-        f"  history: reviewed {repetitions} time(s), ease {ease}, interval {sr.get('interval_days', 1)} day(s)",
-        "  interview behavior: spend extra follow-up depth only if the answer is vague.",
-    ]
-
-
-def mastery_level_label(estimate: float) -> str:
-    if estimate >= 80:
-        return "strong"
-    if estimate >= 55:
-        return "intermediate"
-    return "foundational"

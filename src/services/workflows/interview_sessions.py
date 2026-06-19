@@ -201,6 +201,107 @@ class InterviewSessionStore:
         self.save_session(session)
         return {"user_message": user_message, "assistant_message": assistant_message, "session": session}
 
+    def append_pending_turn(
+        self,
+        *,
+        session_id: str,
+        user_content: str,
+        interview_plan: dict[str, Any] | None = None,
+        interview_state: dict[str, Any] | None = None,
+        source_note_paths: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        session = self.load_session(session_id)
+        if session.get("status") not in {"active", "end_failed"}:
+            raise ValueError(f"cannot append to session with status {session.get('status')}")
+
+        now = utc_now()
+        messages = session.setdefault("messages", [])
+        user_message = {
+            "id": self._next_message_id(messages),
+            "role": "user",
+            "content": user_content,
+            "status": "completed",
+            "created_at": now,
+        }
+        assistant_message = {
+            "id": self._next_message_id([*messages, user_message]),
+            "role": "assistant",
+            "content": "",
+            "status": "pending",
+            "error_type": "",
+            "error_message": "",
+            "retryable": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+        messages.extend([user_message, assistant_message])
+
+        self._update_session_context(
+            session,
+            interview_plan=interview_plan,
+            interview_state=interview_state,
+            source_note_paths=source_note_paths,
+        )
+        session["status"] = "active"
+        session["updated_at"] = now
+        session["end_error"] = None
+        self.save_session(session)
+        return {"user_message": user_message, "assistant_message": assistant_message, "session": session}
+
+    def complete_assistant_message(
+        self,
+        *,
+        session_id: str,
+        assistant_message_id: str,
+        assistant_content: str,
+        interview_plan: dict[str, Any] | None = None,
+        interview_state: dict[str, Any] | None = None,
+        source_note_paths: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        session = self.load_session(session_id)
+        message = self._find_message(session, assistant_message_id, role="assistant")
+        now = utc_now()
+        message["content"] = assistant_content
+        message["status"] = "completed"
+        message["error_type"] = ""
+        message["error_message"] = ""
+        message["retryable"] = False
+        message["updated_at"] = now
+        self._update_session_context(
+            session,
+            interview_plan=interview_plan,
+            interview_state=interview_state,
+            source_note_paths=source_note_paths,
+        )
+        session["status"] = "active"
+        session["updated_at"] = now
+        session["end_error"] = None
+        self.save_session(session)
+        return {"assistant_message": message, "session": session}
+
+    def fail_assistant_message(
+        self,
+        *,
+        session_id: str,
+        assistant_message_id: str,
+        assistant_content: str = "",
+        error_type: str = "Error",
+        error_message: str = "",
+        retryable: bool = True,
+    ) -> dict[str, Any]:
+        session = self.load_session(session_id)
+        message = self._find_message(session, assistant_message_id, role="assistant")
+        now = utc_now()
+        message["content"] = assistant_content or message.get("content", "")
+        message["status"] = "failed"
+        message["error_type"] = error_type
+        message["error_message"] = error_message
+        message["retryable"] = bool(retryable)
+        message["updated_at"] = now
+        session["updated_at"] = now
+        self.save_session(session)
+        return {"assistant_message": message, "session": session}
+
     def save_turn_review(
         self,
         *,
@@ -209,10 +310,23 @@ class InterviewSessionStore:
         assistant_message_id: str,
         feedback: dict[str, Any] | None,
         reference_answer: str,
+        context_note_paths: list[str] | tuple[str, ...] | None = None,
         profile_signals: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         reviews_doc = self.load_reviews(session_id)
         reviews = reviews_doc.setdefault("reviews", [])
+        existing = self._find_review(reviews, user_message_id=user_message_id, assistant_message_id=assistant_message_id)
+        if existing is not None:
+            existing["feedback"] = feedback or {}
+            existing["expression_example"] = reference_answer or ""
+            existing["reference_answer"] = reference_answer or ""
+            existing["context_note_paths"] = [str(path) for path in (context_note_paths or []) if str(path).strip()]
+            existing["profile_signals"] = profile_signals or []
+            existing["status"] = "completed"
+            existing["error"] = ""
+            existing["updated_at"] = utc_now()
+            self.save_reviews(reviews_doc)
+            return existing
         review = {
             "turn_id": f"turn-{len(reviews) + 1:04d}",
             "user_message_id": user_message_id,
@@ -220,10 +334,84 @@ class InterviewSessionStore:
             "feedback": feedback or {},
             "expression_example": reference_answer or "",
             "reference_answer": reference_answer or "",
+            "context_note_paths": [str(path) for path in (context_note_paths or []) if str(path).strip()],
             "profile_signals": profile_signals or [],
+            "status": "completed",
+            "error": "",
+            "retry_count": 0,
             "created_at": utc_now(),
         }
         reviews.append(review)
+        self.save_reviews(reviews_doc)
+        return review
+
+    def create_pending_review(
+        self,
+        *,
+        session_id: str,
+        user_message_id: str,
+        assistant_message_id: str,
+        context_note_paths: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        reviews_doc = self.load_reviews(session_id)
+        reviews = reviews_doc.setdefault("reviews", [])
+        existing = self._find_review(reviews, user_message_id=user_message_id, assistant_message_id=assistant_message_id)
+        now = utc_now()
+        if existing is not None:
+            existing["status"] = "pending"
+            existing["error"] = ""
+            existing["retry_count"] = int(existing.get("retry_count", 0) or 0) + 1
+            existing["updated_at"] = now
+            self.save_reviews(reviews_doc)
+            return existing
+        review = {
+            "turn_id": f"turn-{len(reviews) + 1:04d}",
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+            "feedback": {},
+            "expression_example": "",
+            "reference_answer": "",
+            "context_note_paths": [str(path) for path in (context_note_paths or []) if str(path).strip()],
+            "profile_signals": [],
+            "status": "pending",
+            "error": "",
+            "retry_count": 0,
+            "created_at": now,
+        }
+        reviews.append(review)
+        self.save_reviews(reviews_doc)
+        return review
+
+    def mark_review_failed(
+        self,
+        *,
+        session_id: str,
+        user_message_id: str,
+        assistant_message_id: str,
+        error: str,
+        context_note_paths: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        reviews_doc = self.load_reviews(session_id)
+        reviews = reviews_doc.setdefault("reviews", [])
+        review = self._find_review(reviews, user_message_id=user_message_id, assistant_message_id=assistant_message_id)
+        now = utc_now()
+        if review is None:
+            review = {
+                "turn_id": f"turn-{len(reviews) + 1:04d}",
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+                "feedback": {},
+                "expression_example": "",
+                "reference_answer": "",
+                "context_note_paths": [str(path) for path in (context_note_paths or []) if str(path).strip()],
+                "profile_signals": [],
+                "created_at": now,
+            }
+            reviews.append(review)
+        review["status"] = "failed"
+        review["error"] = error
+        review["retry_count"] = int(review.get("retry_count", 0) or 0)
+        review["updated_at"] = now
         self.save_reviews(reviews_doc)
         return review
 
@@ -266,6 +454,46 @@ class InterviewSessionStore:
 
     def _next_message_id(self, messages: list[dict[str, Any]]) -> str:
         return f"msg-{len(messages) + 1:04d}"
+
+    def _find_message(self, session: dict[str, Any], message_id: str, *, role: str | None = None) -> dict[str, Any]:
+        for message in session.get("messages", []):
+            if message.get("id") == message_id and (role is None or message.get("role") == role):
+                return message
+        raise ValueError(f"message not found: {message_id}")
+
+    def _find_review(
+        self,
+        reviews: list[dict[str, Any]],
+        *,
+        user_message_id: str,
+        assistant_message_id: str,
+    ) -> dict[str, Any] | None:
+        for review in reviews:
+            if review.get("user_message_id") == user_message_id and review.get("assistant_message_id") == assistant_message_id:
+                return review
+        return None
+
+    def _update_session_context(
+        self,
+        session: dict[str, Any],
+        *,
+        interview_plan: dict[str, Any] | None = None,
+        interview_state: dict[str, Any] | None = None,
+        source_note_paths: list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        if interview_plan is not None:
+            session["interview_plan"] = interview_plan
+        if interview_state is not None:
+            session["interview_state"] = interview_state
+        if source_note_paths:
+            context = session.setdefault("context", {})
+            existing = list(context.get("source_note_paths") or [])
+            for path in source_note_paths:
+                text = str(path).strip()
+                if text and text not in existing:
+                    existing.append(text)
+            context["source_note_paths"] = existing
+            context["source_note_count"] = len(existing)
 
     def _infer_topic_label(self, session: dict[str, Any]) -> str:
         state = session.get("interview_state") or {}

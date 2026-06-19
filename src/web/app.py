@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
@@ -52,11 +53,78 @@ from services.workflows.interview import (
     interview_plan_to_dict,
     prepare_interview_plan,
 )
-from services.workflows.interview_profile import InterviewProfileStore, render_candidate_profile_context
+from services.workflows.interview_profile import (
+    InterviewProfileStore,
+    build_candidate_profile_debug,
+    render_candidate_profile_context,
+)
 from services.workflows.interview_sessions import InterviewSessionStore
 from services.workflows.runner import WorkflowRunner, task_result_to_dict
 from services.workflows.schema import ScopeSpec, WorkflowSpec, WritebackSpec
 from services.workflows.scope_resolver import ScopeResolver
+
+
+def resolve_profile_topic_for_request(
+    *,
+    query: str,
+    current_topic: str | None,
+    plan: Any,
+) -> tuple[str | None, str]:
+    query_text = str(query or "")
+    if plan and getattr(plan, "topics", None):
+        for topic in plan.topics:
+            name = str(getattr(topic, "name", "") or "").strip()
+            if name and name in query_text:
+                return name, "query_topic_match"
+    if current_topic:
+        return current_topic, "session_state"
+    if plan and getattr(plan, "topics", None):
+        return plan.topics[0].name, "plan_default"
+    return None, "unknown"
+
+
+def add_profile_injection_audit(
+    *,
+    debug: dict[str, Any] | None,
+    topic_source: str,
+    candidate_profile_context: str | None,
+) -> dict[str, Any]:
+    result = dict(debug or {})
+    context = str(candidate_profile_context or "")
+    result["topic_source"] = topic_source
+    result["prompt_section"] = "## Candidate Profile"
+    result["injected_to_prompt"] = bool(context)
+    result["prompt_context_sha256"] = hashlib.sha256(context.encode("utf-8")).hexdigest()[:16] if context else ""
+    result["prompt_context_line_count"] = len(context.splitlines()) if context else 0
+    result["prompt_context_preview"] = context[:1200] if context else ""
+    return result
+
+
+def classify_runtime_error(exc: BaseException | str) -> dict[str, Any]:
+    raw = str(exc or "")
+    lower = raw.lower()
+    error_type = type(exc).__name__ if isinstance(exc, BaseException) else "Error"
+    retryable = True
+    category = "unknown"
+    if "ssl" in lower or "certificate" in lower:
+        category = "ssl"
+    elif "timeout" in lower or "timed out" in lower:
+        category = "timeout"
+    elif "connection" in lower or "network" in lower or "dns" in lower or "temporary failure" in lower:
+        category = "network"
+    elif "429" in lower or "rate limit" in lower or "too many requests" in lower:
+        category = "rate_limit"
+    elif "500" in lower or "502" in lower or "503" in lower or "504" in lower:
+        category = "server_error"
+    elif "400" in lower or "401" in lower or "403" in lower or "unauthorized" in lower or "forbidden" in lower:
+        category = "request_error"
+        retryable = False
+    return {
+        "message": raw,
+        "error_type": error_type,
+        "category": category,
+        "retryable": retryable,
+    }
 
 
 class SearchRequest(BaseModel):
@@ -135,13 +203,48 @@ class InterviewSessionAppendTurnRequest(BaseModel):
     source_note_paths: list[str] = Field(default_factory=list)
 
 
+class InterviewSessionPendingTurnRequest(BaseModel):
+    user_content: str = Field(default="")
+    interview_plan: dict[str, Any] | None = Field(default=None)
+    interview_state: dict[str, Any] | None = Field(default=None)
+    source_note_paths: list[str] = Field(default_factory=list)
+
+
+class InterviewSessionCompleteAssistantRequest(BaseModel):
+    assistant_content: str = Field(default="")
+    interview_plan: dict[str, Any] | None = Field(default=None)
+    interview_state: dict[str, Any] | None = Field(default=None)
+    source_note_paths: list[str] = Field(default_factory=list)
+
+
+class InterviewSessionFailAssistantRequest(BaseModel):
+    assistant_content: str = Field(default="")
+    error_type: str = Field(default="Error")
+    error_message: str = Field(default="")
+    retryable: bool = Field(default=True)
+
+
 class InterviewSessionReviewRequest(BaseModel):
     user_message_id: str = Field(default="")
     assistant_message_id: str = Field(default="")
     feedback: dict[str, Any] = Field(default_factory=dict)
     reference_answer: str = Field(default="")
     expression_example: str = Field(default="")
+    context_note_paths: list[str] = Field(default_factory=list)
     profile_signals: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class InterviewSessionReviewPendingRequest(BaseModel):
+    user_message_id: str = Field(default="")
+    assistant_message_id: str = Field(default="")
+    context_note_paths: list[str] = Field(default_factory=list)
+
+
+class InterviewSessionReviewFailRequest(BaseModel):
+    user_message_id: str = Field(default="")
+    assistant_message_id: str = Field(default="")
+    error: str = Field(default="")
+    context_note_paths: list[str] = Field(default_factory=list)
 
 
 class WikiSynthesizeTagRequest(BaseModel):
@@ -1208,15 +1311,34 @@ def create_app(
         answer_parts: list[str] = []
         session_state = interview_session_state_from_dict(request.interview_state)
         candidate_profile_context = None
+        profile_debug: dict[str, Any] | None = None
         if request.chat_mode == "interview":
+            resolved_profile_topic, profile_topic_source = resolve_profile_topic_for_request(
+                query=request.query,
+                current_topic=session_state.current_topic if session_state else None,
+                plan=plan,
+            )
             try:
+                profile = interview_profile_store.load()
                 candidate_profile_context = render_candidate_profile_context(
-                    profile=interview_profile_store.load(),
-                    current_topic=session_state.current_topic if session_state else None,
+                    profile=profile,
+                    current_topic=resolved_profile_topic,
+                    plan=plan,
+                )
+                profile_debug = build_candidate_profile_debug(
+                    profile=profile,
+                    current_topic=resolved_profile_topic,
                     plan=plan,
                 )
             except Exception as exc:
                 candidate_profile_context = f"(candidate profile unavailable: {exc})"
+                profile_debug = {"available": False, "error": str(exc)}
+            profile_debug = add_profile_injection_audit(
+                debug=profile_debug,
+                topic_source=profile_topic_source,
+                candidate_profile_context=candidate_profile_context,
+            )
+            yield sse_event("profile_debug", profile_debug)
         llm_request = LLMRequest(
             model=llm_config.model,
             messages=build_interview_messages(
@@ -1252,6 +1374,7 @@ def create_app(
                 "latency_ms": plan_ms,
             },
             "interview_state": request.interview_state,
+            "profile_debug": profile_debug,
             "session_summary": {
                 "available": session_summary is not None,
                 "latency_ms": summary_ms,
@@ -1339,6 +1462,72 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/interview/sessions/{session_id}/turns/pending")
+    def append_pending_interview_turn(session_id: str, request: InterviewSessionPendingTurnRequest) -> dict[str, Any]:
+        if not request.user_content.strip():
+            raise HTTPException(status_code=400, detail="user_content is required")
+        try:
+            result = interview_session_store.append_pending_turn(
+                session_id=session_id,
+                user_content=request.user_content,
+                interview_plan=request.interview_plan,
+                interview_state=request.interview_state,
+                source_note_paths=request.source_note_paths,
+            )
+            return {
+                "user_message": result["user_message"],
+                "assistant_message": result["assistant_message"],
+                "session": result["session"],
+            }
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/interview/sessions/{session_id}/messages/{assistant_message_id}/complete")
+    def complete_interview_assistant_message(
+        session_id: str,
+        assistant_message_id: str,
+        request: InterviewSessionCompleteAssistantRequest,
+    ) -> dict[str, Any]:
+        if not request.assistant_content.strip():
+            raise HTTPException(status_code=400, detail="assistant_content is required")
+        try:
+            result = interview_session_store.complete_assistant_message(
+                session_id=session_id,
+                assistant_message_id=assistant_message_id,
+                assistant_content=request.assistant_content,
+                interview_plan=request.interview_plan,
+                interview_state=request.interview_state,
+                source_note_paths=request.source_note_paths,
+            )
+            return {"assistant_message": result["assistant_message"], "session": result["session"]}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/interview/sessions/{session_id}/messages/{assistant_message_id}/fail")
+    def fail_interview_assistant_message(
+        session_id: str,
+        assistant_message_id: str,
+        request: InterviewSessionFailAssistantRequest,
+    ) -> dict[str, Any]:
+        try:
+            result = interview_session_store.fail_assistant_message(
+                session_id=session_id,
+                assistant_message_id=assistant_message_id,
+                assistant_content=request.assistant_content,
+                error_type=request.error_type,
+                error_message=request.error_message,
+                retryable=request.retryable,
+            )
+            return {"assistant_message": result["assistant_message"], "session": result["session"]}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/interview/sessions/{session_id}/reviews")
     def save_interview_turn_review(session_id: str, request: InterviewSessionReviewRequest) -> dict[str, Any]:
         if not request.user_message_id or not request.assistant_message_id:
@@ -1350,7 +1539,43 @@ def create_app(
                 assistant_message_id=request.assistant_message_id,
                 feedback=request.feedback,
                 reference_answer=request.expression_example or request.reference_answer,
+                context_note_paths=request.context_note_paths,
                 profile_signals=request.profile_signals,
+            )
+            return {"review": review}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/interview/sessions/{session_id}/reviews/pending")
+    def create_pending_interview_turn_review(session_id: str, request: InterviewSessionReviewPendingRequest) -> dict[str, Any]:
+        if not request.user_message_id or not request.assistant_message_id:
+            raise HTTPException(status_code=400, detail="message ids are required")
+        try:
+            review = interview_session_store.create_pending_review(
+                session_id=session_id,
+                user_message_id=request.user_message_id,
+                assistant_message_id=request.assistant_message_id,
+                context_note_paths=request.context_note_paths,
+            )
+            return {"review": review}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/interview/sessions/{session_id}/reviews/failed")
+    def fail_interview_turn_review(session_id: str, request: InterviewSessionReviewFailRequest) -> dict[str, Any]:
+        if not request.user_message_id or not request.assistant_message_id:
+            raise HTTPException(status_code=400, detail="message ids are required")
+        try:
+            review = interview_session_store.mark_review_failed(
+                session_id=session_id,
+                user_message_id=request.user_message_id,
+                assistant_message_id=request.assistant_message_id,
+                error=request.error,
+                context_note_paths=request.context_note_paths,
             )
             return {"review": review}
         except FileNotFoundError as exc:
@@ -1450,12 +1675,23 @@ def create_app(
                 plan=plan,
                 temperature=min(llm_config.temperature, 0.2),
             )
+            context_note_paths = [
+                str(item.get("path") or item.get("relative_path") or "")
+                for item in context.items
+                if str(item.get("path") or item.get("relative_path") or "").strip()
+            ]
+            profile_signals = summary.get("profile_signals", [])
+            if isinstance(profile_signals, list):
+                for signal in profile_signals:
+                    if isinstance(signal, dict) and not signal.get("context_note_paths"):
+                        signal["context_note_paths"] = context_note_paths
             return {
                 "available": True,
                 "feedback": summary.get("feedback", {}),
                 "expression_example": summary.get("expression_example", ""),
                 "reference_answer": summary.get("expression_example", ""),
-                "profile_signals": summary.get("profile_signals", []),
+                "context_note_paths": context_note_paths,
+                "profile_signals": profile_signals,
                 "latency_ms": elapsed_since(started_at),
             }
         except HTTPException:
@@ -1588,7 +1824,7 @@ def create_app(
                 )
                 yield sse_event("done", {"timing": timing, "telemetry": telemetry, "command": payload["command"]})
             except Exception as exc:
-                yield sse_event("error", {"message": str(exc), "error_type": type(exc).__name__})
+                yield sse_event("error", classify_runtime_error(exc))
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -4167,8 +4403,18 @@ CHAT_HTML = r"""<!doctype html>
     button { border: 1px solid var(--accent); border-radius: 6px; padding: 9px 13px; background: var(--accent); color: #fff; font-weight: 700; cursor: pointer; }
     button.secondary { background: #fff; color: var(--accent-dark); border-color: var(--line); }
     button.danger { background: #fff; color: var(--danger); border-color: #f0b8b1; }
+    button.retry-answer { margin-top: 8px; width: 32px; height: 32px; padding: 0; border-radius: 50%; background: #fff; color: var(--accent-dark); border-color: var(--line); }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
     .debug { border-top: 1px solid var(--line); padding-top: 8px; color: var(--muted); font-size: 12px; }
+    .session-context { display: none; }
+    .session-context.has-content { display: block; }
+    .session-panel { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 10px 12px; }
+    .session-panel summary { cursor: pointer; color: var(--accent-dark); font-weight: 800; }
+    .context-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+    .context-section { border: 1px solid var(--line); border-radius: 6px; background: #fdfdfb; padding: 10px; min-width: 0; }
+    .context-section h3 { margin: 0 0 7px; font-size: 13px; }
+    .context-section ul { margin: 6px 0 0 18px; padding: 0; }
+    .context-section .meta-line { color: var(--muted); font-size: 12px; word-break: break-word; }
     details.refs, details.debug-details { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
     details.refs summary, details.debug-details summary { cursor: pointer; color: var(--accent-dark); font-weight: 700; }
     .reference-list { display: grid; gap: 10px; margin-top: 10px; }
@@ -4193,7 +4439,7 @@ CHAT_HTML = r"""<!doctype html>
     .history-item { display: block; width: 100%; text-align: left; margin-bottom: 8px; border: 1px solid var(--line); background: #fff; color: var(--text); }
     .history-meta { color: var(--muted); font-size: 12px; }
     .error { color: var(--danger); }
-    @media (max-width: 720px) { main { width: min(100vw - 18px, 980px); padding: 10px 0; } .topbar { display: block; } .message.user, .message.assistant { width: 100%; } .controls { display: grid; grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 720px) { main { width: min(100vw - 18px, 980px); padding: 10px 0; } .topbar { display: block; } .message.user, .message.assistant { width: 100%; } .controls, .context-grid { display: grid; grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -4214,6 +4460,8 @@ CHAT_HTML = r"""<!doctype html>
         </nav>
       </div>
     </header>
+
+    <section id="sessionContext" class="session-context"></section>
 
     <section id="messages" class="messages">
       <article class="message assistant"><div class="role">Assistant</div><div class="answer">已准备。可以选择面试模式并发送消息开始。</div></article>
@@ -4272,6 +4520,7 @@ CHAT_HTML = r"""<!doctype html>
     let currentInterviewSessionId = "";
     let currentConversationSignature = conversationSignature();
     let lastContextItems = [];
+    let sessionContextState = {scope: null, stats: null, references: [], interviewPlan: null, profileDebug: null};
     const activeInterviewSessionKey = "knowledge_agent.active_interview_session_id";
 
     $("sendBtn").addEventListener("click", sendMessage);
@@ -4296,6 +4545,7 @@ CHAT_HTML = r"""<!doctype html>
       currentInterviewSessionId = "";
       localStorage.removeItem(activeInterviewSessionKey);
       lastContextItems = [];
+      resetSessionContext();
       currentConversationSignature = signature;
       updateSessionLabel();
       $("starters").innerHTML = "";
@@ -4309,10 +4559,51 @@ CHAT_HTML = r"""<!doctype html>
       $("query").value = "";
       currentAssistant = appendAssistantMessage("");
       currentAssistantText = "";
-      currentPayload = {router: null, retrieval: null, retrievalStatus: null, interviewPlan: null, context: null, answer: null, done: null, errors: []};
+      currentPayload = {router: null, retrieval: null, retrievalStatus: null, interviewPlan: null, profileDebug: null, context: null, answer: null, done: null, errors: []};
       setBusy(true, "Starting...");
 
-      const body = {
+      const body = buildAgentRequestBody(query);
+      let turnIds = null;
+
+      try {
+        if ($("chatMode").value === "interview") {
+          turnIds = await persistPendingInterviewTurn(query);
+        }
+        await streamAgentAnswerWithRetry(body);
+        const answerText = currentAssistantText.trim();
+        if (answerText) {
+          const assistantNode = currentAssistant;
+          renderAssistantExtras();
+          const shouldReview = $("chatMode").value === "interview" && shouldRequestTurnSummary(query, answerText);
+          chatHistory.push({role:"user", content:query});
+          chatHistory.push({role:"assistant", content:answerText});
+          trimChatHistory();
+          if ($("chatMode").value === "interview") {
+            updateInterviewState(query, answerText);
+            if (turnIds) {
+              await completeInterviewTurn(turnIds, answerText);
+            } else {
+              turnIds = await persistInterviewTurn(query, answerText);
+            }
+            if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
+          }
+        }
+        setBusy(false, "就绪");
+      } catch (error) {
+        currentPayload.errors.push(error.message);
+        if ($("chatMode").value === "interview" && turnIds) {
+          await failInterviewTurn(turnIds, currentAssistantText.trim(), error);
+        }
+        if (currentAssistant) {
+          currentAssistant.querySelector(".answer").innerHTML += `<p class="error">${escapeHtml(error.message)}</p>`;
+          if (error.retryable !== false) attachRegenerateButton(currentAssistant, query, turnIds);
+        }
+        setBusy(false, "Error");
+      }
+    }
+
+    function buildAgentRequestBody(query) {
+      return {
         query,
         chat_mode: $("chatMode").value,
         command: $("command").value,
@@ -4329,29 +4620,72 @@ CHAT_HTML = r"""<!doctype html>
         online_provider: $("onlineProvider").value.trim() || null,
         speculative_notes_search: $("speculative").checked
       };
+    }
 
-      try {
-        const response = await fetch("/api/agent/stream", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
-        if (!response.ok || !response.body) throw new Error(`request failed: ${response.status}`);
-        await readSse(response.body);
-        const answerText = currentAssistantText.trim();
-        if (answerText) {
-          const assistantNode = currentAssistant;
-          renderAssistantExtras();
-          const shouldReview = $("chatMode").value === "interview" && shouldRequestTurnSummary(query, answerText);
-          chatHistory.push({role:"user", content:query});
-          chatHistory.push({role:"assistant", content:answerText});
-          trimChatHistory();
-          if ($("chatMode").value === "interview") {
-            updateInterviewState(query, answerText);
-            const turnIds = await persistInterviewTurn(query, answerText);
-            if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
+    async function streamAgentAnswerWithRetry(body) {
+      let lastError = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          if (attempt > 0) {
+            setBusy(true, "Retrying...");
+            await delay(1200);
           }
+          const response = await fetch("/api/agent/stream", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+          if (!response.ok || !response.body) throw new Error(`request failed: ${response.status}`);
+          await readSse(response.body);
+          return;
+        } catch (error) {
+          lastError = error;
+          const retryable = error.retryable !== false;
+          const noOutputYet = !currentAssistantText.trim();
+          if (attempt === 0 && retryable && noOutputYet) continue;
+          throw error;
         }
-        setBusy(false, "就绪");
+      }
+      if (lastError) throw lastError;
+    }
+
+    function delay(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function attachRegenerateButton(assistantNode, query, turnIds) {
+      if (!assistantNode || !turnIds) return;
+      assistantNode.querySelectorAll(".retry-answer").forEach((node) => node.remove());
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "retry-answer";
+      button.title = "Retry";
+      button.innerHTML = "&#8635;";
+      button.addEventListener("click", () => retryAssistantAnswer(query, turnIds, assistantNode));
+      assistantNode.appendChild(button);
+    }
+
+    async function retryAssistantAnswer(query, turnIds, assistantNode) {
+      if (!turnIds || !assistantNode) return;
+      currentAssistant = assistantNode;
+      currentAssistantText = "";
+      currentPayload = {router: null, retrieval: null, retrievalStatus: null, interviewPlan: currentInterviewPlan, profileDebug: null, context: null, answer: null, done: null, errors: []};
+      assistantNode.querySelectorAll(".retry-answer, .assistant-extra, details.review").forEach((node) => node.remove());
+      assistantNode.querySelector(".answer").innerHTML = "";
+      setBusy(true, "Retrying...");
+      try {
+        await streamAgentAnswerWithRetry(buildAgentRequestBody(query));
+        const answerText = currentAssistantText.trim();
+        if (!answerText) throw new Error("empty answer");
+        renderAssistantExtras();
+        const shouldReview = $("chatMode").value === "interview" && shouldRequestTurnSummary(query, answerText);
+        chatHistory.push({role:"user", content:query});
+        chatHistory.push({role:"assistant", content:answerText});
+        trimChatHistory();
+        updateInterviewState(query, answerText);
+        await completeInterviewTurn(turnIds, answerText);
+        if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
+        setBusy(false, "灏辩华");
       } catch (error) {
-        currentPayload.errors.push(error.message);
-        if (currentAssistant) currentAssistant.querySelector(".answer").innerHTML += `<p class="error">${escapeHtml(error.message)}</p>`;
+        await failInterviewTurn(turnIds, currentAssistantText.trim(), error);
+        assistantNode.querySelector(".answer").innerHTML += `<p class="error">${escapeHtml(error.message)}</p>`;
+        if (error.retryable !== false) attachRegenerateButton(assistantNode, query, turnIds);
         setBusy(false, "Error");
       }
     }
@@ -4390,14 +4724,28 @@ CHAT_HTML = r"""<!doctype html>
         currentPayload.retrieval = data;
         currentPayload.retrievalStatus = data.reference_summary || data.summary || null;
       }
-      if (eventName === "context") { currentPayload.context = data; lastContextItems = data.items || []; }
+      if (eventName === "context") {
+        currentPayload.context = data;
+        lastContextItems = data.items || [];
+        sessionContextState.scope = data.scope || null;
+        sessionContextState.stats = data.stats || null;
+        sessionContextState.references = data.items || [];
+        renderSessionContext();
+      }
       if (eventName === "interview_plan") {
         currentPayload.interviewPlan = data;
+        sessionContextState.interviewPlan = data;
+        renderSessionContext();
         if (data.plan) {
           currentInterviewPlan = data.plan;
           currentInterviewPlanSignature = conversationSignature();
           renderInterviewPlan(data.plan);
         }
+      }
+      if (eventName === "profile_debug") {
+        currentPayload.profileDebug = data;
+        sessionContextState.profileDebug = data;
+        renderSessionContext();
       }
       if (eventName === "answer_delta") {
         currentAssistantText += data.text || "";
@@ -4406,12 +4754,19 @@ CHAT_HTML = r"""<!doctype html>
       }
       if (eventName === "answer") { currentPayload.answer = data; }
       if (eventName === "done") { currentPayload.done = data; }
-      if (eventName === "error") throw new Error(data.message || "stream error");
+      if (eventName === "error") {
+        const error = new Error(data.message || "stream error");
+        error.errorType = data.error_type || "Error";
+        error.category = data.category || "unknown";
+        error.retryable = data.retryable !== false;
+        throw error;
+      }
     }
 
     function renderInterviewPlan(plan) {
       const topics = Array.isArray(plan.topics) ? plan.topics : [];
       if (!topics.length || !currentAssistant) return;
+      currentAssistant.querySelectorAll(".plan").forEach((node) => node.remove());
       const html = `<div class="plan"><div class="plan-title">Interview topics</div><div class="starter-grid">${topics.map((topic) => `<button type="button" data-topic="${escapeHtml(topic.name || "")}">${escapeHtml(topic.name || "Topic")}</button>`).join("")}</div></div>`;
       currentAssistant.querySelector(".answer").insertAdjacentHTML("beforebegin", html);
       currentAssistant.querySelectorAll("[data-topic]").forEach((button) => {
@@ -4425,20 +4780,76 @@ CHAT_HTML = r"""<!doctype html>
     function renderAssistantExtras() {
       if (!currentAssistant) return;
       currentAssistant.querySelectorAll(".assistant-extra").forEach((node) => node.remove());
-      const references = (currentPayload.context && currentPayload.context.items) || [];
-      const debug = {
-        router: currentPayload.router,
-        retrieval: currentPayload.retrieval,
-        context: currentPayload.context,
-        interview_plan: currentPayload.interviewPlan,
-        interview_state: currentInterviewState,
-        done: currentPayload.done,
-        errors: currentPayload.errors
-      };
       currentAssistant.insertAdjacentHTML(
         "beforeend",
-        `<div class="assistant-extra">${renderReferences(references)}${renderDebug(debug)}</div>`
+        `<div class="assistant-extra">${renderDebug(buildTurnDebug())}</div>`
       );
+    }
+
+    function resetSessionContext() {
+      sessionContextState = {scope: null, stats: null, references: [], interviewPlan: null, profileDebug: null};
+      renderSessionContext();
+    }
+
+    function renderSessionContext() {
+      const node = $("sessionContext");
+      if (!node) return;
+      const hasContent = sessionContextState.scope || sessionContextState.interviewPlan || sessionContextState.profileDebug || (sessionContextState.references || []).length;
+      if (!hasContent) {
+        node.className = "session-context";
+        node.innerHTML = "";
+        return;
+      }
+      node.className = "session-context has-content";
+      const scope = sessionContextState.scope || {};
+      const stats = sessionContextState.stats || {};
+      const planPayload = sessionContextState.interviewPlan || {};
+      const plan = planPayload.plan || planPayload || {};
+      const topics = Array.isArray(plan.topics) ? plan.topics : [];
+      const profile = sessionContextState.profileDebug || {};
+      node.innerHTML = `<details class="session-panel" open><summary>Session Context</summary>
+        <div class="context-grid">
+          <section class="context-section">
+            <h3>Scope</h3>
+            <div class="meta-line">type: ${escapeHtml(scope.type || "")}</div>
+            <div class="meta-line">value: ${escapeHtml(scope.value || "")}</div>
+            ${Array.isArray(scope.paths) && scope.paths.length ? `<ul>${scope.paths.map((path) => `<li>${escapeHtml(path)}</li>`).join("")}</ul>` : ""}
+            ${stats ? `<div class="meta-line">items: ${escapeHtml(stats.context_items ?? stats.items ?? "")} · chars: ${escapeHtml(stats.context_chars ?? "")}</div>` : ""}
+          </section>
+          <section class="context-section">
+            <h3>Interview Plan</h3>
+            ${planPayload.source ? `<div class="meta-line">source: ${escapeHtml(planPayload.source)}${planPayload.fallback_used ? " · fallback" : ""}</div>` : ""}
+            ${topics.length ? `<ul>${topics.map((topic) => `<li><strong>${escapeHtml(topic.name || "")}</strong>${Array.isArray(topic.coverage) && topic.coverage.length ? `：${escapeHtml(topic.coverage.join(" / "))}` : ""}</li>`).join("")}</ul>` : `<div class="meta-line">not available</div>`}
+          </section>
+          <section class="context-section">
+            <h3>Candidate Profile</h3>
+            ${renderProfileDebug(profile)}
+          </section>
+          <section class="context-section">
+            <h3>References</h3>
+            ${renderReferences(sessionContextState.references || []) || `<div class="meta-line">not loaded</div>`}
+          </section>
+        </div>
+      </details>`;
+    }
+
+    function renderProfileDebug(profile) {
+      if (!profile || profile.available === false) {
+        return `<div class="meta-line">${escapeHtml(profile?.error || "not available")}</div>`;
+      }
+      const mastery = profile.topic_mastery || {};
+      const weak = Array.isArray(profile.weak_points) ? profile.weak_points : [];
+      const due = Array.isArray(profile.due_reviews) ? profile.due_reviews : [];
+      return `
+        <div class="meta-line">topic: ${escapeHtml(profile.current_topic || "")}</div>
+        <div class="meta-line">topic source: ${escapeHtml(profile.topic_source || "")}</div>
+        <div class="meta-line">injected: ${profile.injected_to_prompt ? "yes" : "no"} · hash: ${escapeHtml(profile.prompt_context_sha256 || "")}</div>
+        <div class="meta-line">weak: ${escapeHtml(profile.weak_points_count ?? 0)} · due: ${escapeHtml(profile.due_reviews_count ?? 0)} · strong: ${escapeHtml(profile.strong_points_count ?? 0)}</div>
+        ${mastery.mastery_estimate !== undefined ? `<div class="meta-line">mastery estimate: ${escapeHtml(mastery.mastery_estimate)}/100 · active weak: ${escapeHtml(mastery.active_weak_count ?? "")}</div>` : ""}
+        ${weak.length ? `<ul>${weak.map((item) => `<li>${escapeHtml(item.point || "")}<div class="meta-line">${escapeHtml(item.planned_layer || "")}</div></li>`).join("")}</ul>` : ""}
+        ${due.length ? `<div class="meta-line">due reviews: ${escapeHtml(due.length)}</div>` : ""}
+        ${profile.prompt_context_preview ? `<details><summary>Prompt profile context</summary><pre class="debug-box">${escapeHtml(profile.prompt_context_preview)}</pre></details>` : ""}
+      `;
     }
 
     function renderReferences(items) {
@@ -4451,17 +4862,85 @@ CHAT_HTML = r"""<!doctype html>
       const lines = item.lines ? ` lines ${item.lines}` : item.line ? ` line ${item.line}` : "";
       const score = item.score !== null && item.score !== undefined ? ` score ${item.score}` : "";
       const citation = item.citation_id || item.id || "S";
+      const originalText = item.text ? String(item.text) : "";
+      const text = originalText.slice(0, 900);
       return `<div class="reference">
         <div><span class="ref-id">[${escapeHtml(citation)}]</span>${escapeHtml(lines)}${escapeHtml(score)}</div>
         <div class="path">${escapeHtml(path)}</div>
         ${item.heading ? `<div class="path">heading: ${escapeHtml(item.heading)}</div>` : ""}
         ${item.message ? `<div class="path">${escapeHtml(item.message)}</div>` : ""}
-        ${item.text ? `<pre>${escapeHtml(item.text)}</pre>` : ""}
+        ${text ? `<details><summary>excerpt</summary><pre>${escapeHtml(text)}${originalText.length > text.length ? "\n..." : ""}</pre></details>` : ""}
       </div>`;
     }
 
+    function buildTurnDebug() {
+      const slimItems = ((currentPayload.context && currentPayload.context.items) || []).map(slimReference);
+      return {
+        slim: {
+          command: currentPayload.done?.command || null,
+          retrieval: summarizeRetrieval(currentPayload.retrieval),
+          context: {
+            stats: currentPayload.context?.stats || null,
+            item_count: slimItems.length,
+            items: slimItems
+          },
+          interview_plan: summarizeInterviewPlan(currentPayload.interviewPlan),
+          interview_state: currentInterviewState,
+          profile_debug: currentPayload.profileDebug || currentPayload.done?.telemetry?.profile_debug || null,
+          generation: currentPayload.done?.telemetry?.generation || currentPayload.done?.timing || null,
+          errors: currentPayload.errors || []
+        },
+        raw: {
+          router: currentPayload.router,
+          retrieval: summarizeRetrieval(currentPayload.retrieval),
+          context: currentPayload.context ? {...currentPayload.context, items: slimItems} : null,
+          interview_plan: summarizeInterviewPlan(currentPayload.interviewPlan),
+          profile_debug: currentPayload.profileDebug,
+          answer: currentPayload.answer,
+          done: currentPayload.done
+        }
+      };
+    }
+
+    function slimReference(item) {
+      return {
+        citation_id: item.citation_id || item.id || null,
+        path: item.path || item.url || item.provider || null,
+        heading: item.heading || null,
+        lines: item.lines || item.line || null,
+        score: item.score ?? null,
+        message: item.message || null
+      };
+    }
+
+    function summarizeRetrieval(retrieval) {
+      if (!retrieval) return null;
+      return {
+        command: retrieval.command || null,
+        summary: retrieval.reference_summary || retrieval.summary || null,
+        total: retrieval.total ?? retrieval.count ?? null,
+        elapsed_ms: retrieval.elapsed_ms ?? null
+      };
+    }
+
+    function summarizeInterviewPlan(payload) {
+      if (!payload) return null;
+      const plan = payload.plan || {};
+      return {
+        available: payload.available ?? Boolean(payload.plan),
+        source: payload.source || null,
+        fallback_used: Boolean(payload.fallback_used),
+        latency_ms: payload.latency_ms ?? null,
+        topic_count: Array.isArray(plan.topics) ? plan.topics.length : 0,
+        topics: Array.isArray(plan.topics) ? plan.topics.map((topic) => topic.name || "").filter(Boolean) : []
+      };
+    }
+
     function renderDebug(debug) {
-      return `<details class="debug-details"><summary>Debug</summary><pre class="debug-box">${escapeHtml(JSON.stringify(debug, null, 2))}</pre></details>`;
+      return `<details class="debug-details"><summary>Turn Debug</summary>
+        <pre class="debug-box">${escapeHtml(JSON.stringify(debug.slim, null, 2))}</pre>
+        <details><summary>Raw payload</summary><pre class="debug-box">${escapeHtml(JSON.stringify(debug.raw, null, 2))}</pre></details>
+      </details>`;
     }
 
     function shouldRequestTurnSummary(query, answerText) {
@@ -4520,10 +4999,18 @@ CHAT_HTML = r"""<!doctype html>
 
     async function runTurnReviewInBackground(answerText, turnIds, assistantNode) {
       renderSummaryIntoAssistant(assistantNode, {pending: true});
-      const summary = await requestTurnSummary(answerText);
-      renderSummaryIntoAssistant(assistantNode, summary);
-      if (turnIds && summary && summary.available !== false) {
-        await persistTurnReview(turnIds, summary);
+      if (turnIds) await persistPendingTurnReview(turnIds);
+      try {
+        const summary = await requestTurnSummary(answerText);
+        renderSummaryIntoAssistant(assistantNode, summary);
+        if (turnIds && summary && summary.available !== false) {
+          await persistTurnReview(turnIds, summary);
+        } else if (turnIds) {
+          await persistFailedTurnReview(turnIds, new Error((summary && summary.error) || "review unavailable"));
+        }
+      } catch (error) {
+        renderSummaryIntoAssistant(assistantNode, {available:false, error:error.message});
+        if (turnIds) await persistFailedTurnReview(turnIds, error);
       }
     }
 
@@ -4538,6 +5025,7 @@ CHAT_HTML = r"""<!doctype html>
       currentInterviewState = null;
       currentInterviewSessionId = "";
       lastContextItems = [];
+      resetSessionContext();
       currentConversationSignature = conversationSignature();
       $("query").value = "";
       $("starters").innerHTML = "";
@@ -4584,24 +5072,54 @@ CHAT_HTML = r"""<!doctype html>
       currentInterviewState = session.interview_state || null;
       currentConversationSignature = conversationSignature();
       localStorage.setItem(activeInterviewSessionKey, currentInterviewSessionId);
+      sessionContextState = sessionContextFromSession(session);
+      renderSessionContext();
 
       const reviewByAssistant = new Map((reviews || []).map((review) => [review.assistant_message_id, review]));
       const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
       chatHistory = sessionMessages
         .filter((message) => ["user", "assistant"].includes(message.role))
+        .filter((message) => message.role !== "assistant" || !["pending", "failed"].includes(message.status))
         .map((message) => ({role: message.role, content: message.content || ""}));
       trimChatHistory();
       messages.innerHTML = sessionMessages.length
-        ? sessionMessages.map((message) => renderMessageWithReview(message, reviewByAssistant.get(message.id))).join("")
+        ? sessionMessages.map((message, index) => renderMessageWithReview(message, reviewByAssistant.get(message.id), sessionMessages[index - 1])).join("")
         : `<article class="message assistant"><div class="role">Assistant</div><div class="answer">已恢复未结束的面试记录。</div></article>`;
       updateSessionLabel();
+      attachRestoredRetryButtons();
       setBusy(false, "已恢复未结束的面试");
       scrollToBottom();
     }
 
-    function renderMessageWithReview(message, review) {
+    function renderMessageWithReview(message, review, previousMessage) {
       const cls = message.role === "user" ? "user" : "assistant";
-      return `<article class="message ${cls}"><div class="role">${escapeHtml(message.role || "")}</div><div class="answer">${renderMarkdown(message.content || "")}</div>${review ? renderSessionSummary({available:true, feedback:review.feedback || {}, expression_example:review.expression_example || review.reference_answer || "", reference_answer:review.reference_answer || "", profile_signals:review.profile_signals || []}) : ""}</article>`;
+      const status = message.status || "completed";
+      const errorHtml = status === "failed" ? `<p class="error">${escapeHtml(message.error_message || "assistant generation failed")}</p>` : "";
+      const pendingHtml = status === "pending" ? `<p class="history-meta">pending generation</p>` : "";
+      const retryHtml = status === "failed" && message.retryable !== false && previousMessage && previousMessage.role === "user"
+        ? `<button type="button" class="retry-answer restored-retry" data-user-id="${escapeHtml(previousMessage.id || "")}" data-assistant-id="${escapeHtml(message.id || "")}" data-query="${escapeHtml(previousMessage.content || "")}">&#8635;</button>`
+        : "";
+      const reviewSummary = review ? {
+        status: review.status,
+        pending: review.status === "pending",
+        error: review.error,
+        available: review.status !== "failed",
+        feedback: review.feedback || {},
+        expression_example: review.expression_example || review.reference_answer || "",
+        reference_answer: review.reference_answer || "",
+        profile_signals: review.profile_signals || []
+      } : null;
+      return `<article class="message ${cls}"><div class="role">${escapeHtml(message.role || "")}</div><div class="answer">${renderMarkdown(message.content || "")}${errorHtml}${pendingHtml}</div>${retryHtml}${reviewSummary ? renderSessionSummary(reviewSummary) : ""}</article>`;
+    }
+
+    function attachRestoredRetryButtons() {
+      messages.querySelectorAll(".restored-retry").forEach((button) => {
+        button.addEventListener("click", () => {
+          const article = button.closest(".message.assistant");
+          const turnIds = {user:{id:button.dataset.userId || ""}, assistant:{id:button.dataset.assistantId || ""}};
+          retryAssistantAnswer(button.dataset.query || "", turnIds, article);
+        });
+      });
     }
 
     async function ensureInterviewSession() {
@@ -4623,6 +5141,45 @@ CHAT_HTML = r"""<!doctype html>
       return currentInterviewSessionId;
     }
 
+    async function persistPendingInterviewTurn(userContent) {
+      const sessionId = await ensureInterviewSession();
+      const response = await fetch(`/api/interview/sessions/${encodeURIComponent(sessionId)}/turns/pending`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+        user_content: userContent,
+        interview_plan: currentInterviewPlan,
+        interview_state: currentInterviewState,
+        source_note_paths: sourceNotePaths()
+      })});
+      if (!response.ok) throw new Error("failed to save pending interview turn");
+      const data = await response.json();
+      return {user: data.user_message, assistant: data.assistant_message};
+    }
+
+    async function completeInterviewTurn(turnIds, assistantContent) {
+      if (!turnIds || !currentInterviewSessionId) return null;
+      const response = await fetch(`/api/interview/sessions/${encodeURIComponent(currentInterviewSessionId)}/messages/${encodeURIComponent(turnIds.assistant.id)}/complete`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+        assistant_content: assistantContent,
+        interview_plan: currentInterviewPlan,
+        interview_state: currentInterviewState,
+        source_note_paths: sourceNotePaths()
+      })});
+      if (!response.ok) return null;
+      const data = await response.json();
+      return data.assistant_message || null;
+    }
+
+    async function failInterviewTurn(turnIds, assistantContent, error) {
+      if (!turnIds || !currentInterviewSessionId) return null;
+      const response = await fetch(`/api/interview/sessions/${encodeURIComponent(currentInterviewSessionId)}/messages/${encodeURIComponent(turnIds.assistant.id)}/fail`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+        assistant_content: assistantContent || "",
+        error_type: error.errorType || error.name || "Error",
+        error_message: error.message || String(error),
+        retryable: error.retryable !== false
+      })});
+      if (!response.ok) return null;
+      const data = await response.json();
+      return data.assistant_message || null;
+    }
+
     async function persistInterviewTurn(userContent, assistantContent) {
       const sessionId = await ensureInterviewSession();
       const response = await fetch(`/api/interview/sessions/${encodeURIComponent(sessionId)}/turns`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
@@ -4637,6 +5194,17 @@ CHAT_HTML = r"""<!doctype html>
       return {user: data.user_message, assistant: data.assistant_message};
     }
 
+    async function persistPendingTurnReview(turnIds) {
+      if (!turnIds || !currentInterviewSessionId) return null;
+      const response = await fetch(`/api/interview/sessions/${encodeURIComponent(currentInterviewSessionId)}/reviews/pending`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+        user_message_id: turnIds.user.id,
+        assistant_message_id: turnIds.assistant.id,
+        context_note_paths: sourceNotePaths()
+      })});
+      if (!response.ok) return null;
+      return await response.json();
+    }
+
     async function persistTurnReview(turnIds, summary) {
       if (!turnIds || !currentInterviewSessionId) return;
       await fetch(`/api/interview/sessions/${encodeURIComponent(currentInterviewSessionId)}/reviews`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
@@ -4645,7 +5213,18 @@ CHAT_HTML = r"""<!doctype html>
         feedback: summary.feedback || {},
         expression_example: summary.expression_example || summary.reference_answer || "",
         reference_answer: summary.reference_answer || summary.expression_example || "",
+        context_note_paths: summary.context_note_paths || sourceNotePaths(),
         profile_signals: summary.profile_signals || []
+      })});
+    }
+
+    async function persistFailedTurnReview(turnIds, error) {
+      if (!turnIds || !currentInterviewSessionId) return;
+      await fetch(`/api/interview/sessions/${encodeURIComponent(currentInterviewSessionId)}/reviews/failed`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+        user_message_id: turnIds.user.id,
+        assistant_message_id: turnIds.assistant.id,
+        error: error.message || String(error),
+        context_note_paths: sourceNotePaths()
       })});
     }
 
@@ -4710,12 +5289,62 @@ CHAT_HTML = r"""<!doctype html>
 
     function renderInterviewSessionDetail(session, reviews) {
       const reviewByAssistant = new Map((reviews || []).map((review) => [review.assistant_message_id, review]));
-      $("historyContent").innerHTML = `<button class="secondary" type="button" id="backHistoryBtn">返回</button><div class="history-meta" style="margin:8px 0 12px">${escapeHtml(session.session_id || "")} | ${escapeHtml(session.status || "")}</div>${(session.messages || []).map((message) => {
+      const contextHtml = renderHistorySessionContext(session);
+      $("historyContent").innerHTML = `<button class="secondary" type="button" id="backHistoryBtn">返回</button><div class="history-meta" style="margin:8px 0 12px">${escapeHtml(session.session_id || "")} | ${escapeHtml(session.status || "")}</div>${contextHtml}${(session.messages || []).map((message) => {
         const cls = message.role === "user" ? "user" : "assistant";
         const review = reviewByAssistant.get(message.id);
         return `<article class="message ${cls}"><div class="role">${escapeHtml(message.role || "")}</div><div class="answer">${renderMarkdown(message.content || "")}</div>${review ? renderSessionSummary({available:true, feedback:review.feedback || {}, expression_example:review.expression_example || review.reference_answer || "", reference_answer:review.reference_answer || "", profile_signals:review.profile_signals || []}) : ""}</article>`;
       }).join("") || `<article class="message assistant">暂无消息。</article>`}`;
       $("backHistoryBtn").addEventListener("click", loadInterviewHistoryListOnly);
+    }
+
+    function sessionContextFromSession(session) {
+      const context = session.context || {};
+      const references = (context.source_note_paths || []).map((path, index) => ({
+        citation_id: `S${index + 1}`,
+        path
+      }));
+      return {
+        scope: {
+          type: context.source_type || "",
+          value: context.source_value || "",
+          paths: context.source_paths || []
+        },
+        stats: {
+          source_notes: references.length
+        },
+        references,
+        interviewPlan: session.interview_plan ? {available: true, source: "session", plan: session.interview_plan} : null,
+        profileDebug: null
+      };
+    }
+
+    function renderHistorySessionContext(session) {
+      const previous = sessionContextState;
+      sessionContextState = sessionContextFromSession(session);
+      const scope = sessionContextState.scope || {};
+      const plan = (sessionContextState.interviewPlan && sessionContextState.interviewPlan.plan) || {};
+      const topics = Array.isArray(plan.topics) ? plan.topics : [];
+      const html = `<details class="session-panel" open><summary>Session Context</summary>
+        <div class="context-grid">
+          <section class="context-section">
+            <h3>Scope</h3>
+            <div class="meta-line">type: ${escapeHtml(scope.type || "")}</div>
+            <div class="meta-line">value: ${escapeHtml(scope.value || "")}</div>
+            ${Array.isArray(scope.paths) && scope.paths.length ? `<ul>${scope.paths.map((path) => `<li>${escapeHtml(path)}</li>`).join("")}</ul>` : ""}
+          </section>
+          <section class="context-section">
+            <h3>Interview Plan</h3>
+            ${topics.length ? `<ul>${topics.map((topic) => `<li><strong>${escapeHtml(topic.name || "")}</strong>${Array.isArray(topic.coverage) && topic.coverage.length ? `：${escapeHtml(topic.coverage.join(" / "))}` : ""}</li>`).join("")}</ul>` : `<div class="meta-line">not available</div>`}
+          </section>
+          <section class="context-section">
+            <h3>References</h3>
+            ${renderReferences(sessionContextState.references || []) || `<div class="meta-line">not loaded</div>`}
+          </section>
+        </div>
+      </details>`;
+      sessionContextState = previous;
+      return html;
     }
 
     function renderSessionSummary(summary) {
