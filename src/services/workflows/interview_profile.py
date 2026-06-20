@@ -354,6 +354,7 @@ def compact_reviews_for_extraction(reviews: list[dict[str, Any]]) -> list[dict[s
                 "user_message_id": review.get("user_message_id"),
                 "assistant_message_id": review.get("assistant_message_id"),
                 "feedback": {
+                    "question_requires": feedback.get("question_requires") or [],
                     "coach_note": feedback.get("coach_note") or feedback.get("overall") or feedback.get("summary") or "",
                     "covered": feedback.get("covered", []),
                     "gaps": feedback.get("gaps") or feedback.get("missing") or feedback.get("could_cover") or [],
@@ -481,21 +482,42 @@ def normalize_confidence(value: Any) -> str:
 def observations_from_turn_reviews(reviews: list[dict[str, Any]]) -> list[dict[str, str]]:
     raw: list[dict[str, Any]] = []
     for review in reviews:
-        for signal in review.get("profile_signals") or []:
-            if not isinstance(signal, dict):
+        signals = [signal for signal in (review.get("profile_signals") or []) if isinstance(signal, dict)]
+        if signals:
+            for signal in signals:
+                raw.append(
+                    {
+                        "type": signal.get("type"),
+                        "topic": signal.get("topic"),
+                        "planned_layer": signal.get("planned_layer"),
+                        "category": signal.get("category"),
+                        "scope_suggestion": signal.get("scope_suggestion") or signal.get("scope"),
+                        "point": signal.get("summary") or signal.get("weak_point_ref"),
+                        "weak_point_ref": signal.get("weak_point_ref"),
+                        "evidence": signal.get("evidence"),
+                        "confidence": signal.get("confidence"),
+                        "context_note_paths": signal.get("context_note_paths") or review.get("context_note_paths") or [],
+                    }
+                )
+            continue
+        feedback = review.get("feedback") or {}
+        coach_note = str(feedback.get("coach_note") or "").strip()
+        for gap in feedback.get("gaps") or []:
+            point = str(gap or "").strip()
+            if not point:
                 continue
             raw.append(
                 {
-                    "type": signal.get("type"),
-                    "topic": signal.get("topic"),
-                    "planned_layer": signal.get("planned_layer"),
-                    "category": signal.get("category"),
-                    "scope_suggestion": signal.get("scope_suggestion") or signal.get("scope"),
-                    "point": signal.get("summary") or signal.get("weak_point_ref"),
-                    "weak_point_ref": signal.get("weak_point_ref"),
-                    "evidence": signal.get("evidence"),
-                    "confidence": signal.get("confidence"),
-                    "context_note_paths": signal.get("context_note_paths") or review.get("context_note_paths") or [],
+                    "type": "weak_point",
+                    "topic": "",
+                    "planned_layer": "",
+                    "category": "knowledge_gap",
+                    "scope_suggestion": "domain",
+                    "point": point,
+                    "weak_point_ref": "",
+                    "evidence": coach_note or point,
+                    "confidence": "medium",
+                    "context_note_paths": review.get("context_note_paths") or [],
                 }
             )
     return normalize_observations(raw)
@@ -505,7 +527,7 @@ def fallback_final_review(session: dict[str, Any], observations: list[dict[str, 
     weak = [item["point"] for item in observations if item["type"] == "weak_point" and item.get("point")]
     improved = [item["point"] for item in observations if item["type"] == "improvement" and item.get("point")]
     return {
-        "summary": "本次面试已归档。长期画像抽取使用每轮复盘信号降级完成。",
+        "summary": "本次面试已归档。长期画像抽取使用每轮复盘反馈降级完成。",
         "clear_strengths": improved[:5],
         "active_gaps": weak[:5],
         "next_review_focus": weak[:5],
@@ -1198,24 +1220,123 @@ def build_candidate_profile_debug(
             "last_assessed": mastery.get("last_assessed"),
         } if mastery else None,
         "weak_points": [
-            {
-                "point": weak.get("point"),
-                "scope": weak.get("scope", "domain"),
-                "category": weak.get("category", "knowledge_gap"),
-                "planned_layer": weak.get("planned_layer") or "topic-level",
-                "domain_anchor": weak.get("domain_anchor") or {},
-            }
+            profile_weak_point_for_agent(weak)
             for weak in topic_weak[:5]
         ],
         "due_reviews": [
-            {
-                "point": weak.get("point"),
-                "planned_layer": weak.get("planned_layer") or "topic-level",
-                "sr": weak.get("sr") or {},
-            }
+            profile_weak_point_for_agent(weak)
             for weak in due_matching[:5]
         ],
+        "universal_weak_points": [profile_weak_point_for_agent(weak) for weak in universal_weak[:5]],
+        "domain_weak_points": [profile_weak_point_for_agent(weak) for weak in domain_weak[:8]],
+        "domain_weak_by_layer": count_weak_points_by_layer(domain_weak),
     }
+
+
+def build_profile_runtime_summary(
+    *,
+    profile: dict[str, Any] | None,
+    current_topic: str | None,
+    current_layer: str | None,
+    plan: InterviewPlan | None,
+    universal_limit: int = 3,
+) -> dict[str, Any]:
+    topic = resolve_current_topic(current_topic=current_topic, plan=plan)
+    current_layer_key = normalize_planned_layer(current_layer)
+    if not profile:
+        return empty_profile_runtime_summary(topic=topic, current_layer=current_layer)
+
+    current_topic_card = topic_card_from_plan(plan, topic)
+    universal_weak, domain_weak, other_domain_weak = split_weak_points_for_current(
+        profile,
+        current_topic=topic,
+        current_topic_card=current_topic_card,
+    )
+    due_matching, due_other = split_due_reviews(profile, topic, current_topic_card=current_topic_card)
+    strong = [
+        item for item in profile.get("strong_points", [])
+        if topic_matches(item.get("topic"), topic)
+    ]
+    domain_by_layer = count_weak_points_by_layer(domain_weak)
+    return {
+        "profile_available": True,
+        "current_topic": topic,
+        "universal_weak_points": [
+            profile_weak_point_for_agent(weak)
+            for weak in sort_weak_points_for_agent(universal_weak)[:max(0, universal_limit)]
+        ],
+        "domain_weak_by_layer": domain_by_layer,
+        "current_layer_domain_weak_count": int(domain_by_layer.get(current_layer_key, 0)) if current_layer_key else 0,
+        "matching_weak_count": len(universal_weak) + len(domain_weak),
+        "domain_weak_count": len(domain_weak),
+        "other_domain_weak_points_count": len(other_domain_weak),
+        "due_review_count": len(due_matching),
+        "other_due_reviews_count": len(due_other),
+        "strong_point_count": len(strong),
+    }
+
+
+def empty_profile_runtime_summary(*, topic: str | None, current_layer: str | None) -> dict[str, Any]:
+    return {
+        "profile_available": False,
+        "current_topic": topic,
+        "universal_weak_points": [],
+        "domain_weak_by_layer": {},
+        "current_layer_domain_weak_count": 0,
+        "matching_weak_count": 0,
+        "domain_weak_count": 0,
+        "other_domain_weak_points_count": 0,
+        "due_review_count": 0,
+        "other_due_reviews_count": 0,
+        "strong_point_count": 0,
+    }
+
+
+def profile_weak_point_for_agent(weak: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "point": weak.get("point"),
+        "topic": weak.get("topic", ""),
+        "scope": weak.get("scope", "domain"),
+        "category": weak.get("category", "knowledge_gap"),
+        "planned_layer": weak.get("planned_layer") or "topic-level",
+        "confidence": weak.get("confidence", "medium"),
+        "evidence": weak.get("evidence", ""),
+        "domain_anchor": weak.get("domain_anchor") or {},
+        "sr": weak.get("sr") or {},
+    }
+
+
+def filter_weak_points_by_planned_layer(items: list[dict[str, Any]], planned_layer: str | None) -> list[dict[str, Any]]:
+    layer_key = normalize_planned_layer(planned_layer)
+    if not layer_key:
+        return items
+    return [item for item in items if normalize_planned_layer(item.get("planned_layer") or "topic-level") == layer_key]
+
+
+def count_weak_points_by_layer(items: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        layer = normalize_planned_layer(item.get("planned_layer") or "topic-level") or "topic-level"
+        counts[layer] = counts.get(layer, 0) + 1
+    return counts
+
+
+def normalize_planned_layer(value: Any) -> str:
+    return str(value or "").strip() or "topic-level"
+
+
+def sort_weak_points_for_agent(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    today = date.today().isoformat()
+    confidence_score = {"high": 3, "medium": 2, "low": 1}
+
+    def key(item: dict[str, Any]) -> tuple[int, int, float, str]:
+        sr = item.get("sr") or {}
+        due = str(sr.get("next_review") or "2000-01-01") <= today
+        confidence = confidence_score.get(str(item.get("confidence") or "medium"), 2)
+        ease = float(sr.get("ease_factor", 2.5))
+        return (0 if due else 1, -confidence, ease, str(item.get("last_seen") or ""))
+
+    return sorted(items, key=key)
 
 
 def resolve_current_topic(*, current_topic: str | None, plan: InterviewPlan | None) -> str | None:

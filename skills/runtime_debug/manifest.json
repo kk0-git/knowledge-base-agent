@@ -1,0 +1,15 @@
+{
+  "name": "runtime_debug",
+  "version": 1,
+  "description": "Debug skill for validating the generic agent runtime.",
+  "allowed_tools": ["echo", "get_time", "inspect_state", "record_debug_signal"],
+  "denied_tools": [],
+  "max_steps": 6,
+  "temperature": 0.2,
+  "output_contract": {
+    "type": "debug_text"
+  },
+  "trace_policy": {
+    "save": true
+  }
+}

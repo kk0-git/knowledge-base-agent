@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 import traceback
@@ -16,6 +17,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from agent.apps import CoachTurnRequest, InterviewCoachApp, InterviewInterviewerApp, InterviewTurnRequest
+from agent.llm.tool_calling import OpenAICompatibleToolCallingClient
+from agent.interview.state import build_interview_state_machine
+from agent.runtime import AgentRuntime
+from agent.skill_loader import SkillLoader
+from agent.tool_registry import ToolRegistry
+from agent.tools import register_debug_tools, register_interview_tools, register_profile_tools
+from agent.tools.vault import register_vault_tools
+from agent.trace import TraceRecorder
 from knowledge_base_agent.config import load_llm_config
 from knowledge_base_agent.llm import create_llm_client
 from knowledge_base_agent.llm.schema import LLMRequest
@@ -47,6 +57,7 @@ from services.workflows.context_builder import ContextBuilder
 from services.workflows.interview import (
     build_interview_messages,
     deterministic_interview_plan,
+    format_interview_opening_message,
     generate_session_summary,
     interview_plan_from_dict,
     interview_session_state_from_dict,
@@ -58,6 +69,7 @@ from services.workflows.interview_profile import (
     build_candidate_profile_debug,
     render_candidate_profile_context,
 )
+from services.workflows.interview_memory_commit import commit_interview_memory
 from services.workflows.interview_sessions import InterviewSessionStore
 from services.workflows.runner import WorkflowRunner, task_result_to_dict
 from services.workflows.schema import ScopeSpec, WorkflowSpec, WritebackSpec
@@ -98,6 +110,27 @@ def add_profile_injection_audit(
     result["prompt_context_line_count"] = len(context.splitlines()) if context else 0
     result["prompt_context_preview"] = context[:1200] if context else ""
     return result
+
+
+def latest_user_content(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if str(message.get("role") or "") == "user":
+            return str(message.get("content") or "").strip()
+    return ""
+
+
+def previous_assistant_before_latest_user_content(messages: list[dict[str, Any]]) -> str:
+    latest_user_index: int | None = None
+    for index in range(len(messages) - 1, -1, -1):
+        if str(messages[index].get("role") or "") == "user":
+            latest_user_index = index
+            break
+    if latest_user_index is None:
+        return ""
+    for index in range(latest_user_index - 1, -1, -1):
+        if str(messages[index].get("role") or "") == "assistant":
+            return str(messages[index].get("content") or "").strip()
+    return ""
 
 
 def classify_runtime_error(exc: BaseException | str) -> dict[str, Any]:
@@ -168,6 +201,7 @@ class AgentRequest(BaseModel):
     interview_max_context_chars: int = Field(default=24000, ge=2000, le=60000)
     interview_plan: dict[str, Any] | None = Field(default=None)
     interview_state: dict[str, Any] | None = Field(default=None)
+    session_id: str | None = Field(default=None)
 
 
 class InterviewSummaryRequest(BaseModel):
@@ -183,6 +217,10 @@ class InterviewSummaryRequest(BaseModel):
     rrf_k: int = Field(default=60, ge=1, le=500)
     interview_max_chars_per_note: int = Field(default=4000, ge=500, le=12000)
     interview_max_context_chars: int = Field(default=24000, ge=2000, le=60000)
+    session_id: str | None = Field(default=None)
+    user_message_id: str | None = Field(default=None)
+    assistant_message_id: str | None = Field(default=None)
+    interview_state: dict[str, Any] | None = Field(default=None)
 
 
 class InterviewSessionCreateRequest(BaseModel):
@@ -245,6 +283,19 @@ class InterviewSessionReviewFailRequest(BaseModel):
     assistant_message_id: str = Field(default="")
     error: str = Field(default="")
     context_note_paths: list[str] = Field(default_factory=list)
+
+
+class InterviewSessionTraceRequest(BaseModel):
+    event: str = Field(default="")
+    summary: str = Field(default="")
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class InterviewSessionSelectTopicRequest(BaseModel):
+    topic: str = Field(default="")
+    reason: str = Field(default="")
+    source: str = Field(default="ui")
+    interview_plan: dict[str, Any] | None = Field(default=None)
 
 
 class WikiSynthesizeTagRequest(BaseModel):
@@ -598,6 +649,8 @@ def create_app(
         hnsw_ef_construction=hnsw_ef_construction,
         hnsw_ef_search=hnsw_ef_search,
     )
+    rag_prewarm_lock = threading.Lock()
+    rag_prewarm_started = False
 
     @app.get("/", response_class=HTMLResponse)
     def home() -> str:
@@ -821,6 +874,188 @@ def create_app(
             llm_model=llm_model,
             llm_temperature=llm_temperature,
         )
+
+    def build_interview_agent_runtime(llm_client) -> AgentRuntime:
+        registry = ToolRegistry()
+        register_debug_tools(registry)
+        register_vault_tools(registry)
+        register_interview_tools(registry)
+        register_profile_tools(registry)
+        return AgentRuntime(
+            llm_client=OpenAICompatibleToolCallingClient(llm_client),
+            skill_loader=SkillLoader(project_root / "skills", registry=registry),
+            tool_registry=registry,
+            trace_recorder=TraceRecorder(project_root / "eval-results" / "agent-debug" / "traces"),
+        )
+
+    def agent_v2_interview_enabled() -> bool:
+        value = os.getenv("AGENT_V2_INTERVIEW", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def agent_v2_coach_enabled() -> bool:
+        value = os.getenv("AGENT_V2_COACH", "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def build_interview_rag_manager(request: AgentRequest):
+        return service.build_manager(
+            SearchOptions(
+                query=request.query,
+                mode="hybrid",
+                dense_top_k=request.dense_top_k,
+                bm25_top_k=request.hybrid_bm25_top_k,
+                rrf_k=request.rrf_k,
+            )
+        )
+
+    def prewarm_interview_rag(request: AgentRequest) -> None:
+        nonlocal rag_prewarm_started
+        with rag_prewarm_lock:
+            if rag_prewarm_started:
+                return
+            rag_prewarm_started = True
+
+        def run() -> None:
+            try:
+                build_interview_rag_manager(request)
+            except Exception:
+                pass
+
+        threading.Thread(target=run, name="interview-rag-prewarm", daemon=True).start()
+
+    def stream_interview_agent_v2(request: AgentRequest, llm_client, llm_config):
+        if runtime_config.vault_path is None:
+            raise HTTPException(status_code=400, detail="vault path is required for interview agent")
+        if runtime_config.wiki_state_path is None:
+            raise HTTPException(status_code=400, detail="wiki state path is required for interview scope")
+
+        yield sse_event("status", {"stage": "agent_v2_started", "message": "starting interview agent runtime"})
+        rag_manager = build_interview_rag_manager(request) if request.scope_type == "search" else None
+        rag_manager_factory = lambda: build_interview_rag_manager(request)
+        scope = ScopeResolver(
+            vault_root=runtime_config.vault_path,
+            wiki_state_store=WikiStateStore(runtime_config.wiki_state_path),
+            wiki_dir=runtime_config.wiki_dir,
+            rag_manager=rag_manager,
+            overview_note_threshold=runtime_config.overview_note_threshold,
+        ).resolve(
+            ScopeSpec(
+                type=request.scope_type,
+                value=request.scope_value,
+                paths=tuple(request.scope_paths),
+                top_k=request.notes_top_k,
+            )
+        )
+        context = ContextBuilder(
+            vault_root=runtime_config.vault_path,
+            max_chars_per_note=request.interview_max_chars_per_note,
+            max_context_chars=request.interview_max_context_chars,
+        ).build(scope, mode="interview_context")
+        source_note_paths = tuple(
+            str(item.get("path") or item.get("relative_path") or "")
+            for item in context.items
+            if str(item.get("path") or item.get("relative_path") or "").strip()
+        )
+        yield sse_event("context", {"items": context.items, "stats": context.stats, "scope": scope.metadata})
+
+        plan = None
+        plan_error: str | None = None
+        plan_source: str | None = None
+        plan_started_at = current_time()
+        plan_ms: int | None = None
+        if request.interview_plan:
+            try:
+                plan = interview_plan_from_dict(request.interview_plan, context=context)
+                plan_source = "client_reused"
+                plan_ms = elapsed_since(plan_started_at)
+            except Exception as exc:
+                plan_error = f"client plan rejected: {exc}"
+        if plan is None:
+            try:
+                plan = prepare_interview_plan(
+                    context=context,
+                    llm_client=llm_client,
+                    model=llm_config.model,
+                    temperature=min(llm_config.temperature, 0.2),
+                )
+                plan_source = "generated"
+                plan_ms = elapsed_since(plan_started_at)
+            except Exception as exc:
+                plan_error = str(exc) if not plan_error else f"{plan_error}; generated plan failed: {exc}"
+                plan = deterministic_interview_plan(context)
+                plan_source = "deterministic_fallback"
+                plan_ms = elapsed_since(plan_started_at)
+        yield sse_event(
+            "interview_plan",
+            {
+                "available": True,
+                "fallback_used": plan_source == "deterministic_fallback",
+                "source": plan_source,
+                "plan": interview_plan_to_dict(plan),
+                "error": plan_error,
+                "latency_ms": plan_ms,
+            },
+        )
+
+        server_interview_state = request.interview_state
+        if request.session_id:
+            try:
+                session = interview_session_store.load_session(str(request.session_id))
+                server_interview_state = session.get("interview_state") or request.interview_state
+            except Exception:
+                server_interview_state = request.interview_state
+        state_machine = build_interview_state_machine(
+            plan=plan,
+            state_payload=server_interview_state,
+            session_id=str(request.session_id or ""),
+        )
+        if state_machine.snapshot().get("topic_phase") == "awaiting_selection":
+            state_snapshot = state_machine.snapshot()
+            selection_prompt = format_interview_opening_message(plan)
+            yield sse_event("state_updated", state_snapshot)
+            yield sse_event("answer_delta", {"text": selection_prompt})
+            yield sse_event(
+                "answer",
+                {"answer": selection_prompt, "model": llm_config.model},
+            )
+            yield sse_event(
+                "done",
+                {
+                    "telemetry": {
+                        "command": "InterviewAgentV2",
+                        "agent_v2": True,
+                        "awaiting_topic_selection": True,
+                        "interview_state": state_snapshot,
+                    }
+                },
+            )
+            if request.scope_type in {"folder", "selected_notes"}:
+                prewarm_interview_rag(request)
+            return
+
+        app_runner = InterviewInterviewerApp(build_interview_agent_runtime(llm_client))
+        turn_request = InterviewTurnRequest(
+            query=request.query,
+            session_id=str(request.session_id or ""),
+            chat_history=list(request.chat_history or []),
+            interview_plan=plan,
+            interview_state=server_interview_state,
+            vault_root=runtime_config.vault_path,
+            rag_manager=rag_manager,
+            rag_manager_factory=rag_manager_factory,
+            scope_note_paths=source_note_paths,
+            scope_type=request.scope_type,
+            scope_value=request.scope_value or "",
+            session_store=interview_session_store,
+            profile_store=interview_profile_store,
+            model=llm_config.model,
+            tool_mode="auto",
+            trace_path=str(project_root / "eval-results" / "agent-debug" / "traces"),
+            max_steps=6,
+            max_tool_calls_per_step=4,
+            temperature=llm_config.temperature,
+        )
+        for event in app_runner.run_turn_stream(turn_request):
+            yield sse_event(event["type"], event.get("payload") or {})
 
     def run_workspace_sync(
         *,
@@ -1439,6 +1674,44 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/interview/sessions/{session_id}/select-topic")
+    def select_interview_session_topic(session_id: str, request: InterviewSessionSelectTopicRequest) -> dict[str, Any]:
+        topic = request.topic.strip()
+        if not topic:
+            raise HTTPException(status_code=400, detail="topic is required")
+        try:
+            session = interview_session_store.load_session(session_id)
+            plan = request.interview_plan or session.get("interview_plan") or {}
+            machine = build_interview_state_machine(
+                plan=plan,
+                state_payload=session.get("interview_state") or None,
+                session_id=session_id,
+            )
+            result = machine.select_topic(
+                name=topic,
+                reason=request.reason or "topic selected",
+                source=request.source or "ui",
+            )
+            if not result.get("ok"):
+                raise HTTPException(status_code=400, detail=result.get("message") or "topic selection failed")
+            state = machine.snapshot()
+            session["interview_state"] = state
+            session["updated_at"] = utc_now_iso()
+            interview_session_store.save_session(session)
+            interview_session_store.append_trace_event(
+                session_id=session_id,
+                event="topic_selected",
+                summary=f"topic selected: {state.get('current_topic') or ''}",
+                details={"result": result, "interview_state": state},
+            )
+            return {"session": session, "interview_state": state, "result": result}
+        except HTTPException:
+            raise
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/interview/sessions/{session_id}/turns")
     def append_interview_turn(session_id: str, request: InterviewSessionAppendTurnRequest) -> dict[str, Any]:
         if not request.user_content.strip() or not request.assistant_content.strip():
@@ -1583,6 +1856,23 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/interview/sessions/{session_id}/trace")
+    def append_interview_session_trace(session_id: str, request: InterviewSessionTraceRequest) -> dict[str, Any]:
+        if not request.event.strip():
+            raise HTTPException(status_code=400, detail="event is required")
+        try:
+            entry = interview_session_store.append_trace_event(
+                session_id=session_id,
+                event=request.event,
+                summary=request.summary or request.event,
+                details=request.details,
+            )
+            return {"trace": entry}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/interview/sessions/{session_id}/end")
     def end_interview_session(session_id: str) -> dict[str, Any]:
         try:
@@ -1593,7 +1883,9 @@ def create_app(
             reviews = reviews_doc.get("reviews", [])
             llm_config = load_llm_config(project_root)
             llm_client = create_llm_client(llm_config)
-            final_review, profile_update = interview_profile_store.update_from_session(
+            final_review, profile_update = commit_interview_memory(
+                session_store=interview_session_store,
+                profile_store=interview_profile_store,
                 session=session,
                 reviews=reviews,
                 llm_client=llm_client,
@@ -1666,6 +1958,39 @@ def create_app(
                 max_context_chars=request.interview_max_context_chars,
             ).build(scope, mode="interview_context")
             plan = interview_plan_from_dict(request.interview_plan, context=context)
+            context_note_paths = [
+                str(item.get("path") or item.get("relative_path") or "")
+                for item in context.items
+                if str(item.get("path") or item.get("relative_path") or "").strip()
+            ]
+            if agent_v2_coach_enabled():
+                coach_app = InterviewCoachApp(build_interview_agent_runtime(llm_client))
+                latest_user_answer = latest_user_content(list(request.chat_history or []))
+                previous_question = previous_assistant_before_latest_user_content(list(request.chat_history or []))
+                summary, _result = coach_app.run_review(
+                    CoachTurnRequest(
+                        session_id=request.session_id or "",
+                        user_message_id=request.user_message_id or "",
+                        assistant_message_id=request.assistant_message_id or "",
+                        previous_interviewer_question=previous_question,
+                        latest_user_answer=latest_user_answer,
+                        interviewer_followup=request.answer,
+                        chat_history=list(request.chat_history or []),
+                        interview_plan=plan,
+                        interview_state=request.interview_state,
+                        context_note_paths=tuple(context_note_paths),
+                        vault_root=runtime_config.vault_path,
+                        session_store=interview_session_store,
+                        profile_store=interview_profile_store,
+                        model=llm_config.model,
+                        tool_mode="auto",
+                        trace_path=str(project_root / "eval-results" / "agent-debug" / "traces"),
+                        temperature=min(llm_config.temperature, 0.2),
+                        save_review=bool(request.session_id and request.user_message_id and request.assistant_message_id),
+                    )
+                )
+                summary["latency_ms"] = elapsed_since(started_at)
+                return summary
             summary = generate_session_summary(
                 context=context,
                 chat_history=list(request.chat_history or []),
@@ -1675,11 +2000,6 @@ def create_app(
                 plan=plan,
                 temperature=min(llm_config.temperature, 0.2),
             )
-            context_note_paths = [
-                str(item.get("path") or item.get("relative_path") or "")
-                for item in context.items
-                if str(item.get("path") or item.get("relative_path") or "").strip()
-            ]
             profile_signals = summary.get("profile_signals", [])
             if isinstance(profile_signals, list):
                 for signal in profile_signals:
@@ -1713,6 +2033,9 @@ def create_app(
                 llm_config = load_llm_config(project_root)
                 llm_client = create_llm_client(llm_config)
                 if request.chat_mode in {"interview", "study"}:
+                    if request.chat_mode == "interview" and agent_v2_interview_enabled():
+                        yield from stream_interview_agent_v2(request, llm_client, llm_config)
+                        return
                     yield from stream_study_or_interview(request, llm_client, llm_config)
                     return
 
@@ -4520,7 +4843,8 @@ CHAT_HTML = r"""<!doctype html>
     let currentInterviewSessionId = "";
     let currentConversationSignature = conversationSignature();
     let lastContextItems = [];
-    let sessionContextState = {scope: null, stats: null, references: [], interviewPlan: null, profileDebug: null};
+    let sessionContextState = {scope: null, stats: null, references: [], interviewPlan: null, profileDebug: null, trace: []};
+    let currentTurnTrace = {directorNoteInjected: false};
     const activeInterviewSessionKey = "knowledge_agent.active_interview_session_id";
 
     $("sendBtn").addEventListener("click", sendMessage);
@@ -4563,11 +4887,18 @@ CHAT_HTML = r"""<!doctype html>
       setBusy(true, "Starting...");
 
       const body = buildAgentRequestBody(query);
+      currentTurnTrace = {directorNoteInjected: shouldInjectDirectorNote(body.interview_state)};
       let turnIds = null;
 
       try {
         if ($("chatMode").value === "interview") {
           turnIds = await persistPendingInterviewTurn(query);
+          body.session_id = currentInterviewSessionId;
+          if (currentTurnTrace.directorNoteInjected) {
+            recordSessionTrace("director_note_injected", `Director Note injected (follow_up=${body.interview_state?.follow_up_count || 0})`, {
+              interview_state: body.interview_state || {}
+            });
+          }
         }
         await streamAgentAnswerWithRetry(body);
         const answerText = currentAssistantText.trim();
@@ -4579,12 +4910,13 @@ CHAT_HTML = r"""<!doctype html>
           chatHistory.push({role:"assistant", content:answerText});
           trimChatHistory();
           if ($("chatMode").value === "interview") {
-            updateInterviewState(query, answerText);
+            const stateChange = isServerInterviewState() ? null : updateInterviewState(query, answerText);
             if (turnIds) {
               await completeInterviewTurn(turnIds, answerText);
             } else {
               turnIds = await persistInterviewTurn(query, answerText);
             }
+            recordInterviewStateTrace(stateChange);
             if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
           }
         }
@@ -4613,6 +4945,7 @@ CHAT_HTML = r"""<!doctype html>
         chat_history: chatHistory.slice(-12),
         interview_plan: $("chatMode").value === "interview" && currentInterviewPlanSignature === conversationSignature() ? currentInterviewPlan : null,
         interview_state: $("chatMode").value === "interview" ? currentInterviewState : null,
+        session_id: $("chatMode").value === "interview" ? currentInterviewSessionId : null,
         notes_top_k: numberValue("notesTopK"),
         dense_top_k: numberValue("denseTopK"),
         hybrid_bm25_top_k: numberValue("hybridBm25TopK"),
@@ -4620,6 +4953,42 @@ CHAT_HTML = r"""<!doctype html>
         online_provider: $("onlineProvider").value.trim() || null,
         speculative_notes_search: $("speculative").checked
       };
+    }
+
+    function shouldInjectDirectorNote(interviewState) {
+      if ($("chatMode").value !== "interview") return false;
+      if (!interviewState) return false;
+      return Number(interviewState.follow_up_count || 0) >= 4;
+    }
+
+    async function recordSessionTrace(event, summary, details) {
+      if (!currentInterviewSessionId) return null;
+      const entry = {
+        event,
+        summary,
+        details: details || {}
+      };
+      addLocalSessionTrace(entry);
+      try {
+        const response = await fetch(`/api/interview/sessions/${encodeURIComponent(currentInterviewSessionId)}/trace`, {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify(entry)
+        });
+        if (!response.ok) return null;
+        return await response.json();
+      } catch {
+        return null;
+      }
+    }
+
+    function addLocalSessionTrace(entry) {
+      sessionContextState.trace = [...(sessionContextState.trace || []), {
+        id: "local",
+        created_at: new Date().toISOString(),
+        ...entry
+      }].slice(-50);
+      renderSessionContext();
     }
 
     async function streamAgentAnswerWithRetry(body) {
@@ -4670,7 +5039,16 @@ CHAT_HTML = r"""<!doctype html>
       assistantNode.querySelector(".answer").innerHTML = "";
       setBusy(true, "Retrying...");
       try {
-        await streamAgentAnswerWithRetry(buildAgentRequestBody(query));
+        const body = buildAgentRequestBody(query);
+        body.session_id = currentInterviewSessionId;
+        currentTurnTrace = {directorNoteInjected: shouldInjectDirectorNote(body.interview_state)};
+        if (currentTurnTrace.directorNoteInjected) {
+          recordSessionTrace("director_note_injected", `Director Note injected (follow_up=${body.interview_state?.follow_up_count || 0})`, {
+            interview_state: body.interview_state || {},
+            retry: true
+          });
+        }
+        await streamAgentAnswerWithRetry(body);
         const answerText = currentAssistantText.trim();
         if (!answerText) throw new Error("empty answer");
         renderAssistantExtras();
@@ -4678,8 +5056,9 @@ CHAT_HTML = r"""<!doctype html>
         chatHistory.push({role:"user", content:query});
         chatHistory.push({role:"assistant", content:answerText});
         trimChatHistory();
-        updateInterviewState(query, answerText);
+        const stateChange = isServerInterviewState() ? null : updateInterviewState(query, answerText);
         await completeInterviewTurn(turnIds, answerText);
+        recordInterviewStateTrace(stateChange);
         if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
         setBusy(false, "灏辩华");
       } catch (error) {
@@ -4736,6 +5115,17 @@ CHAT_HTML = r"""<!doctype html>
         currentPayload.interviewPlan = data;
         sessionContextState.interviewPlan = data;
         renderSessionContext();
+        recordSessionTrace(
+          "interview_plan",
+          `plan ${data.fallback_used ? "fallback" : "ready"} (${data.source || "unknown"})`,
+          {
+            source: data.source || "",
+            fallback_used: Boolean(data.fallback_used),
+            latency_ms: data.latency_ms ?? null,
+            topic_count: Array.isArray(data.plan?.topics) ? data.plan.topics.length : 0,
+            error: data.error || ""
+          }
+        );
         if (data.plan) {
           currentInterviewPlan = data.plan;
           currentInterviewPlanSignature = conversationSignature();
@@ -4746,13 +5136,58 @@ CHAT_HTML = r"""<!doctype html>
         currentPayload.profileDebug = data;
         sessionContextState.profileDebug = data;
         renderSessionContext();
+        recordSessionTrace(
+          "profile_injected",
+          `profile injected: ${data.current_topic || "unknown"} (${data.weak_points_count ?? 0} weak, ${data.due_reviews_count ?? 0} due)`,
+          {
+            current_topic: data.current_topic || "",
+            topic_source: data.topic_source || "",
+            injected_to_prompt: Boolean(data.injected_to_prompt),
+            weak_points_count: data.weak_points_count ?? 0,
+            due_reviews_count: data.due_reviews_count ?? 0,
+            strong_points_count: data.strong_points_count ?? 0,
+            prompt_context_sha256: data.prompt_context_sha256 || "",
+            prompt_context_line_count: data.prompt_context_line_count ?? 0
+          }
+        );
+      }
+      if (eventName === "agent_step") {
+        addLocalSessionTrace({
+          event: "agent_step",
+          summary: `agent step ${data.index ?? ""}: ${data.kind || ""}`,
+          details: data
+        });
+      }
+      if (eventName === "tool_result") {
+        addLocalSessionTrace({
+          event: "tool_result",
+          summary: `${data.name || "tool"}: ${data.status || ""}`,
+          details: {name: data.name || "", ok: Boolean(data.ok), status: data.status || "", latency_ms: data.latency_ms ?? null}
+        });
+      }
+      if (eventName === "state_updated") {
+        currentInterviewState = data || null;
+        addLocalSessionTrace({
+          event: "state_updated",
+          summary: `state updated: ${data?.current_topic || ""} / ${data?.current_layer_name || ""}`,
+          details: data || {}
+        });
+        renderSessionContext();
       }
       if (eventName === "answer_delta") {
         currentAssistantText += data.text || "";
         if (currentAssistant) currentAssistant.querySelector(".answer").innerHTML = renderMarkdown(currentAssistantText);
         scrollToBottom();
       }
-      if (eventName === "answer") { currentPayload.answer = data; }
+      if (eventName === "answer") {
+        currentPayload.answer = data;
+        const answerText = String((data && (data.answer || data.text)) || "").trim();
+        if (answerText && !currentAssistantText.trim()) {
+          currentAssistantText = answerText;
+          if (currentAssistant) currentAssistant.querySelector(".answer").innerHTML = renderMarkdown(currentAssistantText);
+          scrollToBottom();
+        }
+      }
       if (eventName === "done") { currentPayload.done = data; }
       if (eventName === "error") {
         const error = new Error(data.message || "stream error");
@@ -4767,14 +5202,35 @@ CHAT_HTML = r"""<!doctype html>
       const topics = Array.isArray(plan.topics) ? plan.topics : [];
       if (!topics.length || !currentAssistant) return;
       currentAssistant.querySelectorAll(".plan").forEach((node) => node.remove());
-      const html = `<div class="plan"><div class="plan-title">Interview topics</div><div class="starter-grid">${topics.map((topic) => `<button type="button" data-topic="${escapeHtml(topic.name || "")}">${escapeHtml(topic.name || "Topic")}</button>`).join("")}</div></div>`;
+      const html = `<div class="plan"><div class="plan-title">面试方向</div><div class="starter-grid">${topics.map((topic) => `<button type="button" data-topic="${escapeHtml(topic.name || "")}">${escapeHtml(topic.name || "Topic")}</button>`).join("")}</div></div>`;
       currentAssistant.querySelector(".answer").insertAdjacentHTML("beforebegin", html);
       currentAssistant.querySelectorAll("[data-topic]").forEach((button) => {
-        button.addEventListener("click", () => {
-          $("query").value = `I want to start with ${button.dataset.topic}`;
-          $("query").focus();
+        button.addEventListener("click", async () => {
+          await selectInterviewTopic(button.dataset.topic || "");
         });
       });
+    }
+
+    async function selectInterviewTopic(topic) {
+      const selected = String(topic || "").trim();
+      if (!selected) return;
+      const sessionId = await ensureInterviewSession();
+      const response = await fetch(`/api/interview/sessions/${encodeURIComponent(sessionId)}/select-topic`, {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({
+          topic: selected,
+          reason: "user selected topic from interview plan UI",
+          source: "ui",
+          interview_plan: currentInterviewPlan
+        })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || "topic selection failed");
+      currentInterviewState = data.interview_state || data.session?.interview_state || currentInterviewState;
+      recordSessionTrace("topic_selected", `topic selected: ${selected}`, {interview_state: currentInterviewState});
+      $("query").value = `我想从${selected}开始`;
+      $("query").focus();
     }
 
     function renderAssistantExtras() {
@@ -4787,14 +5243,14 @@ CHAT_HTML = r"""<!doctype html>
     }
 
     function resetSessionContext() {
-      sessionContextState = {scope: null, stats: null, references: [], interviewPlan: null, profileDebug: null};
+      sessionContextState = {scope: null, stats: null, references: [], interviewPlan: null, profileDebug: null, trace: []};
       renderSessionContext();
     }
 
     function renderSessionContext() {
       const node = $("sessionContext");
       if (!node) return;
-      const hasContent = sessionContextState.scope || sessionContextState.interviewPlan || sessionContextState.profileDebug || (sessionContextState.references || []).length;
+      const hasContent = sessionContextState.scope || sessionContextState.interviewPlan || sessionContextState.profileDebug || (sessionContextState.references || []).length || (sessionContextState.trace || []).length;
       if (!hasContent) {
         node.className = "session-context";
         node.innerHTML = "";
@@ -4829,8 +5285,23 @@ CHAT_HTML = r"""<!doctype html>
             <h3>References</h3>
             ${renderReferences(sessionContextState.references || []) || `<div class="meta-line">not loaded</div>`}
           </section>
+          <section class="context-section">
+            <h3>Session Trace</h3>
+            ${renderSessionTrace(sessionContextState.trace || [])}
+          </section>
         </div>
       </details>`;
+    }
+
+    function renderSessionTrace(trace) {
+      if (!Array.isArray(trace) || !trace.length) return `<div class="meta-line">not recorded yet</div>`;
+      return `<ol class="trace-list">${trace.slice(-12).map((item, index) => {
+        const details = item.details ? JSON.stringify(item.details, null, 2) : "";
+        return `<li><strong>${escapeHtml(item.summary || item.event || `trace ${index + 1}`)}</strong>
+          <div class="meta-line">${escapeHtml(item.event || "")} · ${escapeHtml(item.created_at || "")}</div>
+          ${details && details !== "{}" ? `<details><summary>details</summary><pre class="debug-box">${escapeHtml(details)}</pre></details>` : ""}
+        </li>`;
+      }).join("")}</ol>`;
     }
 
     function renderProfileDebug(profile) {
@@ -4968,7 +5439,7 @@ CHAT_HTML = r"""<!doctype html>
       return true;
     }
 
-    async function requestTurnSummary(answerText) {
+    async function requestTurnSummary(answerText, turnIds) {
       try {
         const response = await fetch("/api/interview/summary", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
           scope_type: $("scopeType").value,
@@ -4977,6 +5448,10 @@ CHAT_HTML = r"""<!doctype html>
           chat_history: chatHistory.slice(-12),
           answer: answerText,
           interview_plan: currentInterviewPlan,
+          interview_state: currentInterviewState,
+          session_id: currentInterviewSessionId || null,
+          user_message_id: turnIds?.user?.id || null,
+          assistant_message_id: turnIds?.assistant?.id || null,
           notes_top_k: numberValue("notesTopK"),
           dense_top_k: numberValue("denseTopK"),
           hybrid_bm25_top_k: numberValue("hybridBm25TopK"),
@@ -5001,7 +5476,7 @@ CHAT_HTML = r"""<!doctype html>
       renderSummaryIntoAssistant(assistantNode, {pending: true});
       if (turnIds) await persistPendingTurnReview(turnIds);
       try {
-        const summary = await requestTurnSummary(answerText);
+        const summary = await requestTurnSummary(answerText, turnIds);
         renderSummaryIntoAssistant(assistantNode, summary);
         if (turnIds && summary && summary.available !== false) {
           await persistTurnReview(turnIds, summary);
@@ -5164,6 +5639,11 @@ CHAT_HTML = r"""<!doctype html>
       })});
       if (!response.ok) return null;
       const data = await response.json();
+      addLocalSessionTrace({
+        event: "assistant_completed",
+        summary: `assistant completed: ${turnIds.assistant.id}`,
+        details: {assistant_message_id: turnIds.assistant.id, output_chars: assistantContent.length}
+      });
       return data.assistant_message || null;
     }
 
@@ -5177,6 +5657,16 @@ CHAT_HTML = r"""<!doctype html>
       })});
       if (!response.ok) return null;
       const data = await response.json();
+      addLocalSessionTrace({
+        event: "assistant_failed",
+        summary: `assistant failed: ${turnIds.assistant.id}`,
+        details: {
+          assistant_message_id: turnIds.assistant.id,
+          error_type: error.errorType || error.name || "Error",
+          error_message: error.message || String(error),
+          retryable: error.retryable !== false
+        }
+      });
       return data.assistant_message || null;
     }
 
@@ -5202,6 +5692,11 @@ CHAT_HTML = r"""<!doctype html>
         context_note_paths: sourceNotePaths()
       })});
       if (!response.ok) return null;
+      addLocalSessionTrace({
+        event: "turn_review_pending",
+        summary: `turn_review pending: ${turnIds.assistant.id}`,
+        details: {user_message_id: turnIds.user.id, assistant_message_id: turnIds.assistant.id}
+      });
       return await response.json();
     }
 
@@ -5216,6 +5711,17 @@ CHAT_HTML = r"""<!doctype html>
         context_note_paths: summary.context_note_paths || sourceNotePaths(),
         profile_signals: summary.profile_signals || []
       })});
+      const signals = Array.isArray(summary.profile_signals) ? summary.profile_signals : [];
+      addLocalSessionTrace({
+        event: "turn_review_completed",
+        summary: `turn_review completed: ${signals.length} profile signal(s)`,
+        details: {
+          user_message_id: turnIds.user.id,
+          assistant_message_id: turnIds.assistant.id,
+          profile_signal_count: signals.length,
+          profile_signal_types: signals.map((signal) => signal.type || "").filter(Boolean)
+        }
+      });
     }
 
     async function persistFailedTurnReview(turnIds, error) {
@@ -5226,6 +5732,11 @@ CHAT_HTML = r"""<!doctype html>
         error: error.message || String(error),
         context_note_paths: sourceNotePaths()
       })});
+      addLocalSessionTrace({
+        event: "turn_review_failed",
+        summary: "turn_review failed",
+        details: {user_message_id: turnIds.user.id, assistant_message_id: turnIds.assistant.id, error: error.message || String(error)}
+      });
     }
 
     async function endInterviewSession() {
@@ -5235,6 +5746,17 @@ CHAT_HTML = r"""<!doctype html>
         const response = await fetch(`/api/interview/sessions/${encodeURIComponent(currentInterviewSessionId)}/end`, {method:"POST"});
         const data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(data.detail || "end interview failed");
+        const operations = (data.session && data.session.profile_update && data.session.profile_update.operations) || {};
+        addLocalSessionTrace({
+          event: data.session && data.session.status === "completed" ? "session_completed" : "session_end_failed",
+          summary: data.session && data.session.status === "completed"
+            ? `profile extraction completed: ${(operations.added || []).length} ADD, ${(operations.updated || []).length} UPDATE, ${(operations.partial || []).length} PARTIAL, ${(operations.improved || []).length} IMPROVE`
+            : "session end failed",
+          details: {
+            status: data.session?.status || "",
+            operations
+          }
+        });
         appendSystemMessage(data.session && data.session.status === "completed" ? "本次面试已保存，长期画像已更新。" : "本次面试已保存，但最终总结或画像更新失败。可以稍后从历史记录重试。");
         currentInterviewSessionId = "";
         localStorage.removeItem(activeInterviewSessionKey);
@@ -5315,7 +5837,8 @@ CHAT_HTML = r"""<!doctype html>
         },
         references,
         interviewPlan: session.interview_plan ? {available: true, source: "session", plan: session.interview_plan} : null,
-        profileDebug: null
+        profileDebug: null,
+        trace: Array.isArray(session.trace) ? session.trace : []
       };
     }
 
@@ -5340,6 +5863,10 @@ CHAT_HTML = r"""<!doctype html>
           <section class="context-section">
             <h3>References</h3>
             ${renderReferences(sessionContextState.references || []) || `<div class="meta-line">not loaded</div>`}
+          </section>
+          <section class="context-section">
+            <h3>Session Trace</h3>
+            ${renderSessionTrace(sessionContextState.trace || [])}
           </section>
         </div>
       </details>`;
@@ -5372,6 +5899,9 @@ CHAT_HTML = r"""<!doctype html>
 
     function updateInterviewState(userText, assistantText) {
       if (!currentInterviewState) currentInterviewState = {current_topic:null, current_layer_index:0, follow_up_count:0, sub_points_touched:[], last_user_answer:""};
+      const before = JSON.parse(JSON.stringify(currentInterviewState || {}));
+      let topicChanged = false;
+      let layerTransition = false;
       currentInterviewState.last_user_answer = userText.slice(0, 300);
       const topic = inferTopic(userText + "\n" + assistantText);
       if (topic && topic !== currentInterviewState.current_topic) {
@@ -5379,6 +5909,7 @@ CHAT_HTML = r"""<!doctype html>
         currentInterviewState.current_layer_index = 0;
         currentInterviewState.follow_up_count = 0;
         currentInterviewState.sub_points_touched = [];
+        topicChanged = true;
       }
       currentInterviewState.follow_up_count = (currentInterviewState.follow_up_count || 0) + 1;
       const question = extractLastQuestion(assistantText);
@@ -5389,6 +5920,32 @@ CHAT_HTML = r"""<!doctype html>
         currentInterviewState.current_layer_index = (currentInterviewState.current_layer_index || 0) + 1;
         currentInterviewState.follow_up_count = 0;
         currentInterviewState.sub_points_touched = [];
+        layerTransition = true;
+      }
+      return {
+        before,
+        after: JSON.parse(JSON.stringify(currentInterviewState || {})),
+        topic_changed: topicChanged,
+        layer_transition: layerTransition,
+        transition_source: layerTransition ? (currentTurnTrace.directorNoteInjected ? "director_note" : "llm_self") : "",
+      };
+    }
+
+    function isServerInterviewState() {
+      if (!currentInterviewState) return false;
+      if (currentInterviewState.source === "server") return true;
+      if (currentInterviewState.topic_phase) return true;
+      return false;
+    }
+
+    function recordInterviewStateTrace(change) {
+      if (!change) return;
+      if (change.topic_changed) {
+        recordSessionTrace("topic_changed", `topic changed: ${change.after?.current_topic || ""}`, change);
+      }
+      if (change.layer_transition) {
+        const source = change.transition_source === "director_note" ? "Director Note" : "LLM self";
+        recordSessionTrace("layer_transition", `layer transition by ${source}`, change);
       }
     }
 

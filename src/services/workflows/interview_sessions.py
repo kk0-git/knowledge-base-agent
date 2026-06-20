@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agent.interview.state import default_interview_state_dict, normalize_interview_state_payload
+
 
 SESSION_SCHEMA_VERSION = 1
 REVIEW_SCHEMA_VERSION = 1
@@ -51,6 +53,33 @@ def build_context(
     }
 
 
+def session_uses_server_interview_state(session: dict[str, Any]) -> bool:
+    agent = session.get("agent") or {}
+    if agent.get("runtime_version") or agent.get("skill") == "interviewer":
+        return True
+    state = session.get("interview_state")
+    if isinstance(state, dict) and ("topic_phase" in state or state.get("source") == "server"):
+        return True
+    extra = (session.get("context") or {}).get("extra") or {}
+    if extra.get("created_from") == "chat":
+        return True
+    return False
+
+
+def normalize_session_interview_state(session: dict[str, Any]) -> dict[str, Any]:
+    if not session_uses_server_interview_state(session):
+        return session
+    session_id = str(session.get("session_id") or "")
+    plan = session.get("interview_plan")
+    payload = session.get("interview_state")
+    if payload is None:
+        session["interview_state"] = default_interview_state_dict(session_id=session_id)
+        return session
+    if isinstance(payload, dict):
+        session["interview_state"] = normalize_interview_state_payload(payload, plan=plan, session_id=session_id)
+    return session
+
+
 class InterviewSessionStore:
     def __init__(self, root: Path | str):
         self.root = Path(root)
@@ -68,6 +97,14 @@ class InterviewSessionStore:
     ) -> dict[str, Any]:
         now = utc_now()
         session_id = make_session_id(source_value)
+        if interview_state is None:
+            interview_state = default_interview_state_dict(session_id=session_id)
+        else:
+            interview_state = normalize_interview_state_payload(
+                interview_state,
+                plan=interview_plan,
+                session_id=session_id,
+            )
         session = {
             "schema_version": SESSION_SCHEMA_VERSION,
             "session_id": session_id,
@@ -87,6 +124,7 @@ class InterviewSessionStore:
             "interview_plan": interview_plan or None,
             "interview_state": interview_state or None,
             "messages": [],
+            "trace": [],
             "final_review": None,
             "profile_update": None,
         }
@@ -131,7 +169,13 @@ class InterviewSessionStore:
         path = self.session_path(session_id)
         if not path.exists():
             raise FileNotFoundError(f"interview session not found: {session_id}")
-        return json.loads(path.read_text(encoding="utf-8-sig"))
+        session = json.loads(path.read_text(encoding="utf-8-sig"))
+        before = json.dumps(session.get("interview_state"), ensure_ascii=False, sort_keys=True)
+        session = normalize_session_interview_state(session)
+        after = json.dumps(session.get("interview_state"), ensure_ascii=False, sort_keys=True)
+        if before != after:
+            self.save_session(session)
+        return session
 
     def save_session(self, session: dict[str, Any]) -> None:
         session_id = str(session["session_id"])
@@ -199,6 +243,17 @@ class InterviewSessionStore:
         session["updated_at"] = now
         session["end_error"] = None
         self.save_session(session)
+        self.append_trace_event(
+            session_id=session_id,
+            event="turn_saved",
+            summary=f"turn saved: {user_message['id']} -> {assistant_message['id']}",
+            details={
+                "user_message_id": user_message["id"],
+                "assistant_message_id": assistant_message["id"],
+                "assistant_output_chars": len(assistant_content or ""),
+                "interview_state": interview_state or {},
+            },
+        )
         return {"user_message": user_message, "assistant_message": assistant_message, "session": session}
 
     def append_pending_turn(
@@ -246,6 +301,16 @@ class InterviewSessionStore:
         session["updated_at"] = now
         session["end_error"] = None
         self.save_session(session)
+        self.append_trace_event(
+            session_id=session_id,
+            event="turn_saved",
+            summary=f"pending turn saved: {user_message['id']} -> {assistant_message['id']}",
+            details={
+                "user_message_id": user_message["id"],
+                "assistant_message_id": assistant_message["id"],
+                "interview_state": interview_state or {},
+            },
+        )
         return {"user_message": user_message, "assistant_message": assistant_message, "session": session}
 
     def complete_assistant_message(
@@ -277,6 +342,16 @@ class InterviewSessionStore:
         session["updated_at"] = now
         session["end_error"] = None
         self.save_session(session)
+        self.append_trace_event(
+            session_id=session_id,
+            event="assistant_completed",
+            summary=f"assistant completed: {assistant_message_id}",
+            details={
+                "assistant_message_id": assistant_message_id,
+                "output_chars": len(assistant_content or ""),
+                "interview_state": interview_state or {},
+            },
+        )
         return {"assistant_message": message, "session": session}
 
     def fail_assistant_message(
@@ -300,6 +375,18 @@ class InterviewSessionStore:
         message["updated_at"] = now
         session["updated_at"] = now
         self.save_session(session)
+        self.append_trace_event(
+            session_id=session_id,
+            event="assistant_failed",
+            summary=f"assistant failed: {assistant_message_id} ({error_type})",
+            details={
+                "assistant_message_id": assistant_message_id,
+                "error_type": error_type,
+                "error_message": error_message,
+                "retryable": bool(retryable),
+                "partial_output_chars": len(message.get("content", "") or ""),
+            },
+        )
         return {"assistant_message": message, "session": session}
 
     def save_turn_review(
@@ -326,6 +413,18 @@ class InterviewSessionStore:
             existing["error"] = ""
             existing["updated_at"] = utc_now()
             self.save_reviews(reviews_doc)
+            self.append_trace_event(
+                session_id=session_id,
+                event="turn_review_completed",
+                summary=f"turn_review completed: {existing.get('turn_id')} ({len(existing.get('profile_signals') or [])} profile signal(s))",
+                details={
+                    "turn_id": existing.get("turn_id"),
+                    "user_message_id": user_message_id,
+                    "assistant_message_id": assistant_message_id,
+                    "profile_signal_count": len(existing.get("profile_signals") or []),
+                    "profile_signal_types": [str(signal.get("type") or "") for signal in existing.get("profile_signals") or [] if isinstance(signal, dict)],
+                },
+            )
             return existing
         review = {
             "turn_id": f"turn-{len(reviews) + 1:04d}",
@@ -343,6 +442,18 @@ class InterviewSessionStore:
         }
         reviews.append(review)
         self.save_reviews(reviews_doc)
+        self.append_trace_event(
+            session_id=session_id,
+            event="turn_review_completed",
+            summary=f"turn_review completed: {review.get('turn_id')} ({len(review.get('profile_signals') or [])} profile signal(s))",
+            details={
+                "turn_id": review.get("turn_id"),
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+                "profile_signal_count": len(review.get("profile_signals") or []),
+                "profile_signal_types": [str(signal.get("type") or "") for signal in review.get("profile_signals") or [] if isinstance(signal, dict)],
+            },
+        )
         return review
 
     def create_pending_review(
@@ -363,6 +474,17 @@ class InterviewSessionStore:
             existing["retry_count"] = int(existing.get("retry_count", 0) or 0) + 1
             existing["updated_at"] = now
             self.save_reviews(reviews_doc)
+            self.append_trace_event(
+                session_id=session_id,
+                event="turn_review_pending",
+                summary=f"turn_review pending: {existing.get('turn_id')}",
+                details={
+                    "turn_id": existing.get("turn_id"),
+                    "user_message_id": user_message_id,
+                    "assistant_message_id": assistant_message_id,
+                    "retry_count": existing.get("retry_count", 0),
+                },
+            )
             return existing
         review = {
             "turn_id": f"turn-{len(reviews) + 1:04d}",
@@ -380,6 +502,16 @@ class InterviewSessionStore:
         }
         reviews.append(review)
         self.save_reviews(reviews_doc)
+        self.append_trace_event(
+            session_id=session_id,
+            event="turn_review_pending",
+            summary=f"turn_review pending: {review.get('turn_id')}",
+            details={
+                "turn_id": review.get("turn_id"),
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+            },
+        )
         return review
 
     def mark_review_failed(
@@ -413,7 +545,76 @@ class InterviewSessionStore:
         review["retry_count"] = int(review.get("retry_count", 0) or 0)
         review["updated_at"] = now
         self.save_reviews(reviews_doc)
+        self.append_trace_event(
+            session_id=session_id,
+            event="turn_review_failed",
+            summary=f"turn_review failed: {review.get('turn_id')}",
+            details={
+                "turn_id": review.get("turn_id"),
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+                "error": error,
+            },
+        )
         return review
+
+    def append_memory_signal(self, *, session_id: str, signal: dict[str, Any]) -> dict[str, Any]:
+        session = self.load_session(session_id)
+        memory = session.setdefault("memory", {})
+        signals = memory.setdefault("profile_signals", [])
+        entry = dict(signal or {})
+        entry.setdefault("id", f"signal-{len(signals) + 1:04d}")
+        entry.setdefault("created_at", utc_now())
+        signals.append(entry)
+        if len(signals) > 200:
+            memory["profile_signals"] = signals[-200:]
+        session["updated_at"] = utc_now()
+        self.save_session(session)
+        self.append_trace_event(
+            session_id=session_id,
+            event="memory_signal_recorded",
+            summary=f"profile signal recorded: {entry.get('type', '')}",
+            details={
+                "signal_type": entry.get("type", ""),
+                "topic": entry.get("topic", ""),
+                "context_note_paths": entry.get("context_note_paths", []),
+            },
+        )
+        return entry
+
+    def list_memory_signals(self, *, session_id: str) -> list[dict[str, Any]]:
+        session = self.load_session(session_id)
+        memory = session.get("memory") if isinstance(session.get("memory"), dict) else {}
+        return list(memory.get("profile_signals") or [])
+
+    def append_observation_draft(self, *, session_id: str, draft: dict[str, Any]) -> dict[str, Any]:
+        session = self.load_session(session_id)
+        memory = session.setdefault("memory", {})
+        drafts = memory.setdefault("observation_drafts", [])
+        entry = dict(draft or {})
+        entry.setdefault("id", f"draft-{len(drafts) + 1:04d}")
+        entry.setdefault("created_at", utc_now())
+        drafts.append(entry)
+        if len(drafts) > 200:
+            memory["observation_drafts"] = drafts[-200:]
+        session["updated_at"] = utc_now()
+        self.save_session(session)
+        self.append_trace_event(
+            session_id=session_id,
+            event="observation_draft_written",
+            summary=f"observation draft written: {entry.get('topic', '')}",
+            details={
+                "topic": entry.get("topic", ""),
+                "category": entry.get("category", ""),
+                "context_note_paths": entry.get("context_note_paths", []),
+            },
+        )
+        return entry
+
+    def list_observation_drafts(self, *, session_id: str) -> list[dict[str, Any]]:
+        session = self.load_session(session_id)
+        memory = session.get("memory") if isinstance(session.get("memory"), dict) else {}
+        return list(memory.get("observation_drafts") or [])
 
     def mark_end_failed(self, session_id: str, error: str) -> dict[str, Any]:
         session = self.load_session(session_id)
@@ -421,6 +622,12 @@ class InterviewSessionStore:
         session["updated_at"] = utc_now()
         session["end_error"] = error
         self.save_session(session)
+        self.append_trace_event(
+            session_id=session_id,
+            event="session_end_failed",
+            summary="session end failed",
+            details={"error": error},
+        )
         return session
 
     def mark_completed(
@@ -439,6 +646,88 @@ class InterviewSessionStore:
         session["final_review"] = final_review
         session["profile_update"] = profile_update
         self.save_session(session)
+        operations = profile_update.get("operations", {}) if isinstance(profile_update, dict) else {}
+        self.append_trace_event(
+            session_id=session_id,
+            event="session_completed",
+            summary=(
+                "profile extraction completed: "
+                f"{len(operations.get('added') or [])} ADD, "
+                f"{len(operations.get('updated') or [])} UPDATE, "
+                f"{len(operations.get('partial') or [])} PARTIAL, "
+                f"{len(operations.get('improved') or [])} IMPROVE"
+            ),
+            details={
+                "profile_update_source": profile_update.get("source") if isinstance(profile_update, dict) else "",
+                "operation_counts": {
+                    key: len(value or []) for key, value in operations.items() if isinstance(value, list)
+                },
+            },
+        )
+        return session
+
+    def append_trace_event(
+        self,
+        *,
+        session_id: str,
+        event: str,
+        summary: str,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        session = self.load_session(session_id)
+        trace = session.setdefault("trace", [])
+        entry = {
+            "id": f"trace-{len(trace) + 1:04d}",
+            "created_at": utc_now(),
+            "event": str(event or "").strip() or "event",
+            "summary": str(summary or "").strip(),
+            "details": details or {},
+        }
+        trace.append(entry)
+        if len(trace) > 200:
+            session["trace"] = trace[-200:]
+        session["updated_at"] = utc_now()
+        self.save_session(session)
+        return entry
+
+    def record_agent_turn(
+        self,
+        *,
+        session_id: str,
+        skill: str,
+        trace_path: str,
+        trace_id: str,
+        interview_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        session = self.load_session(session_id)
+        agent = session.setdefault("agent", {})
+        agent["runtime_version"] = 1
+        agent["skill"] = skill
+        traces = agent.setdefault("traces", [])
+        trace_item = {
+            "trace_id": trace_id,
+            "path": trace_path,
+            "created_at": utc_now(),
+        }
+        if trace_path and not any(item.get("path") == trace_path for item in traces if isinstance(item, dict)):
+            traces.append(trace_item)
+        if len(traces) > 100:
+            agent["traces"] = traces[-100:]
+        if interview_state is not None:
+            session["interview_state"] = interview_state
+        session["updated_at"] = utc_now()
+        self.save_session(session)
+        self.append_trace_event(
+            session_id=session_id,
+            event="agent_trace_saved",
+            summary=f"agent trace saved: {trace_id}",
+            details={
+                "skill": skill,
+                "trace_id": trace_id,
+                "trace_path": trace_path,
+                "interview_state": interview_state or {},
+            },
+        )
         return session
 
     def session_path(self, session_id: str) -> Path:

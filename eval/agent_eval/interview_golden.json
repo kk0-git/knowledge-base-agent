@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "awaiting_topic_no_agent",
+      "type": "awaiting_topic",
+      "input": "start interview",
+      "expect": {"topic_phase": "awaiting_selection", "agent_steps": 0}
+    },
+    {
+      "id": "select_topic_active",
+      "type": "select_topic",
+      "input": "select MCP",
+      "expect": {"topic_phase": "active", "topic_selected": true}
+    },
+    {
+      "id": "routine_no_state_fetch",
+      "type": "interviewer",
+      "input": "hello",
+      "expect": {"routine_state_fetch": 0, "tool_call_count": 0}
+    },
+    {
+      "id": "search_read_notes",
+      "type": "interviewer",
+      "input": "please search notes about MCP",
+      "expect": {"notes_read": 1, "tool_sequence": ["search_notes", "read_note"]}
+    },
+    {
+      "id": "advance_layer_action",
+      "type": "interviewer",
+      "input": "please advance to next layer",
+      "expect": {"layer_advanced": true}
+    },
+    {
+      "id": "coach_schema_pure_review",
+      "type": "coach",
+      "input": "MCP is tool calling.",
+      "expect": {"schema_valid": true, "signal_count": 0}
+    },
+    {
+      "id": "memory_commit_bridge",
+      "type": "memory_commit",
+      "input": "session end",
+      "expect": {"consumed_signal_count": 1, "consumed_draft_count": 1}
+    }
+  ]
+}

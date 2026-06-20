@@ -1,0 +1,28 @@
+{
+  "name": "interviewer",
+  "version": 2,
+  "description": "Mock technical interviewer with runtime context, on-demand vault tools, and state actions.",
+  "allowed_tools": [
+    "advance_layer",
+    "get_interview_state",
+    "grep_vault",
+    "list_plan_topics",
+    "read_note",
+    "recall_profile",
+    "search_notes",
+    "select_topic"
+  ],
+  "denied_tools": [],
+  "max_steps": 6,
+  "temperature": 0.2,
+  "output_contract": {
+    "type": "interview_question",
+    "rules": [
+      "exactly_one_question",
+      "simplified_chinese"
+    ]
+  },
+  "trace_policy": {
+    "save": true
+  }
+}

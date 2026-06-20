@@ -1,0 +1,31 @@
+{
+  "name": "coach",
+  "version": 2,
+  "description": "Pure turn-review coach with optional note reading and structured JSON debrief.",
+  "allowed_tools": [
+    "get_interview_state",
+    "list_plan_topics",
+    "read_note"
+  ],
+  "denied_tools": [],
+  "max_steps": 4,
+  "temperature": 0.2,
+  "output_contract": {
+    "type": "turn_review_json",
+    "schema": {
+      "feedback": {
+        "question_requires": "string[]",
+        "coach_note": "string",
+        "covered": "string[]",
+        "gaps": "string[]",
+        "thinking_framework": "string",
+        "interviewer_followup_note": "string"
+      },
+      "expression_example": "string",
+      "profile_signals": "always empty compatibility array"
+    }
+  },
+  "trace_policy": {
+    "save": true
+  }
+}

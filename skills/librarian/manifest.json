@@ -1,0 +1,15 @@
+{
+  "name": "librarian",
+  "version": 1,
+  "description": "Vault librarian agent that searches and reads Obsidian notes on demand.",
+  "allowed_tools": ["grep_vault", "read_note", "search_notes"],
+  "denied_tools": [],
+  "max_steps": 6,
+  "temperature": 0.2,
+  "output_contract": {
+    "type": "grounded_answer"
+  },
+  "trace_policy": {
+    "save": true
+  }
+}

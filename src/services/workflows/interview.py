@@ -781,6 +781,23 @@ def render_interview_plan(plan: InterviewPlan | None) -> str:
     return "\n".join(lines)
 
 
+def format_interview_opening_message(plan: InterviewPlan | None) -> str:
+    if not plan or not plan.topics:
+        return "好的，我们开始面试。\n\n请先选择一个面试方向，或点击上方按钮开始。"
+    lines = [
+        "好的，我们开始面试。",
+        "",
+        "根据你的笔记，我们有以下几个面试方向可以选择：",
+        "",
+    ]
+    for index, topic in enumerate(plan.topics, start=1):
+        coverage_text = "、".join(topic.coverage) if topic.coverage else "核心概念与工程实践"
+        lines.append(f"{index}.  **{topic.name}**：{coverage_text}。")
+        lines.append("")
+    lines.append("你想从哪个方向开始？")
+    return "\n".join(lines).rstrip()
+
+
 def render_director_note(*, plan: InterviewPlan | None, session_state: InterviewSessionState | None) -> str:
     if not plan or not session_state:
         return "(none)"
