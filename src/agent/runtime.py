@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Iterator
+from typing import Callable, Iterator
 
 from agent.errors import AgentRuntimeError
 from agent.llm.tool_calling import LLMToolRequest, ToolCallingLLMClient
@@ -43,6 +43,7 @@ class AgentRuntime:
         user_input: str,
         state: AgentState | None = None,
         tool_context: ToolExecutionContext | None = None,
+        event_sink: Callable[[dict], None] | None = None,
     ) -> AgentResult:
         started_at = time.perf_counter()
         trace_id = new_trace_id()
@@ -52,7 +53,8 @@ class AgentRuntime:
 
         try:
             skill = self.skill_loader.load(config.skill_name)
-            registry = self.tool_registry.subset(sorted(skill.allowed_tools))
+            allowed_tools = effective_allowed_tools(skill=skill, config=config)
+            registry = self.tool_registry.subset(allowed_tools)
             run_state = initialize_state(skill, state)
             run_state.messages.append(AgentMessage(role="user", content=user_input))
             execution_context = merge_tool_context(tool_context, run_state.working)
@@ -60,19 +62,34 @@ class AgentRuntime:
 
             for step_index in range(max(1, config.max_steps)):
                 run_state.step_index = step_index
-                request = build_llm_request(config=config, skill=skill, state=run_state, registry=registry)
+                is_reserved_final_step = config.reserve_final_step and step_index == max(1, config.max_steps) - 1 and steps
+                if is_reserved_final_step:
+                    append_forced_final_instruction(run_state)
+                request = build_llm_request(
+                    config=config,
+                    skill=skill,
+                    state=run_state,
+                    registry=registry,
+                    allowed_tools=allowed_tools,
+                    disable_tools=is_reserved_final_step,
+                )
                 llm_started_at = time.perf_counter()
                 response = self.llm_client.complete_with_tools(request)
                 latency_ms = elapsed_ms(llm_started_at)
-                tool_calls = response.tool_calls[: max(1, config.max_tool_calls_per_step)]
-                if response.tool_calls:
+                tool_calls = [] if is_reserved_final_step else response.tool_calls[: max(1, config.max_tool_calls_per_step)]
+                if tool_calls:
                     assistant_message = AgentMessage(
                         role="assistant",
                         content=response.content,
                         tool_calls=tool_calls,
                     )
                     run_state.messages.append(assistant_message)
-                    tool_results = [executor.execute(call) for call in tool_calls]
+                    tool_results = []
+                    for call in tool_calls:
+                        emit_event(event_sink, "tool_started", to_jsonable(call))
+                        tool_result = executor.execute(call)
+                        tool_results.append(tool_result)
+                        emit_event(event_sink, "tool_result", to_jsonable(tool_result))
                     for result in tool_results:
                         run_state.messages.append(
                             AgentMessage(
@@ -81,36 +98,36 @@ class AgentRuntime:
                                 content=json_dumps(to_jsonable(result.output if result.ok else {"error": result.error, "status": result.status})),
                             )
                         )
-                    steps.append(
-                        AgentStep(
-                            index=step_index,
-                            kind=StepKind.TOOL,
-                            llm_input_chars=count_request_chars(request),
-                            llm_output_chars=count_response_chars(response.content, tool_calls),
-                            tool_calls=tool_calls,
-                            tool_results=tool_results,
-                            assistant_text=response.content,
-                            latency_ms=latency_ms + sum(result.latency_ms for result in tool_results),
-                            metadata={"finish_reason": response.finish_reason, "llm_mode": response.used_mode},
-                            working_snapshot=to_jsonable(run_state.working),
-                        )
+                    step = AgentStep(
+                        index=step_index,
+                        kind=StepKind.TOOL,
+                        llm_input_chars=count_request_chars(request),
+                        llm_output_chars=count_response_chars(response.content, tool_calls),
+                        tool_calls=tool_calls,
+                        tool_results=tool_results,
+                        assistant_text=response.content,
+                        latency_ms=latency_ms + sum(result.latency_ms for result in tool_results),
+                        metadata={"finish_reason": response.finish_reason, "llm_mode": response.used_mode},
+                        working_snapshot=to_jsonable(run_state.working),
                     )
+                    steps.append(step)
+                    emit_event(event_sink, "agent_step", to_jsonable(step))
                     continue
 
                 run_state.final_answer = response.content
                 run_state.finished = True
-                steps.append(
-                    AgentStep(
-                        index=step_index,
-                        kind=StepKind.FINAL,
-                        llm_input_chars=count_request_chars(request),
-                        llm_output_chars=len(response.content),
-                        assistant_text=response.content,
-                        latency_ms=latency_ms,
-                        metadata={"finish_reason": response.finish_reason, "llm_mode": response.used_mode},
-                        working_snapshot=to_jsonable(run_state.working),
-                    )
+                step = AgentStep(
+                    index=step_index,
+                    kind=StepKind.FINAL,
+                    llm_input_chars=count_request_chars(request),
+                    llm_output_chars=len(response.content),
+                    assistant_text=response.content,
+                    latency_ms=latency_ms,
+                    metadata={"finish_reason": response.finish_reason, "llm_mode": response.used_mode},
+                    working_snapshot=to_jsonable(run_state.working),
                 )
+                steps.append(step)
+                emit_event(event_sink, "agent_step", to_jsonable(step))
                 result = AgentResult(
                     state=run_state,
                     steps=steps,
@@ -118,6 +135,12 @@ class AgentRuntime:
                     total_ms=elapsed_ms(started_at),
                     stopped_reason="final",
                     trace_id=trace_id,
+                    metadata={
+                        "forced_final": is_reserved_final_step,
+                        "partial": False,
+                        "recoverable": False,
+                        "last_tool_statuses": last_tool_statuses(steps),
+                    },
                 )
                 return self._save_trace(result=result, config=config, skill=skill, user_input=user_input)
 
@@ -138,6 +161,12 @@ class AgentRuntime:
                 trace_id=trace_id,
                 error="agent reached max_steps",
                 error_type="MaxStepsExceeded",
+                metadata={
+                    "forced_final": False,
+                    "partial": False,
+                    "recoverable": True,
+                    "last_tool_statuses": last_tool_statuses(steps),
+                },
             )
             return self._save_trace(result=result, config=config, skill=skill, user_input=user_input)
         except Exception as exc:
@@ -158,10 +187,16 @@ class AgentRuntime:
                 steps=steps,
                 final_answer="",
                 total_ms=elapsed_ms(started_at),
-                stopped_reason="error",
+                stopped_reason="llm_error",
                 trace_id=trace_id,
                 error=str(exc),
                 error_type=type(exc).__name__,
+                metadata={
+                    "forced_final": False,
+                    "partial": False,
+                    "recoverable": True,
+                    "last_tool_statuses": last_tool_statuses(steps),
+                },
             )
             return self._save_trace(result=result, config=config, skill=skill, user_input=user_input)
 
@@ -238,15 +273,48 @@ def build_llm_request(
     skill: LoadedSkill,
     state: AgentState,
     registry: ToolRegistry,
+    allowed_tools: list[str] | None = None,
+    disable_tools: bool = False,
 ) -> LLMToolRequest:
+    tool_names = [] if disable_tools else allowed_tools or sorted(skill.allowed_tools)
     return LLMToolRequest(
         model=config.model,
         messages=state.messages,
-        tools=registry.schemas_for(sorted(skill.allowed_tools)),
+        tools=registry.schemas_for(tool_names),
         temperature=config.temperature if config.temperature is not None else skill.temperature,
         tool_choice="auto",
         tool_mode=config.tool_mode,
     )
+
+
+def append_forced_final_instruction(state: AgentState) -> None:
+    if state.messages and state.messages[-1].role == "system" and "You must now produce the final answer" in state.messages[-1].content:
+        return
+    state.messages.append(
+        AgentMessage(
+            role="system",
+            content=(
+                "You must now produce the final answer. Do not call tools. "
+                "Use only the prior observations and clearly state any evidence limits or uncertainty."
+            ),
+        )
+    )
+
+
+def last_tool_statuses(steps: list[AgentStep]) -> list[dict]:
+    statuses: list[dict] = []
+    for step in steps:
+        for result in step.tool_results:
+            statuses.append({"name": result.name, "ok": result.ok, "status": result.status})
+    return statuses[-8:]
+
+
+def effective_allowed_tools(*, skill: LoadedSkill, config: AgentRunConfig) -> list[str]:
+    skill_tools = {str(name) for name in skill.allowed_tools}
+    if config.allowed_tools is None:
+        return sorted(skill_tools)
+    requested = {str(name) for name in config.allowed_tools}
+    return sorted(skill_tools.intersection(requested))
 
 
 def count_request_chars(request: LLMToolRequest) -> int:
@@ -259,3 +327,9 @@ def count_response_chars(content: str, tool_calls: list[ToolCall]) -> int:
 
 def elapsed_ms(started_at: float) -> int:
     return int((time.perf_counter() - started_at) * 1000)
+
+
+def emit_event(event_sink: Callable[[dict], None] | None, event_type: str, payload: dict) -> None:
+    if event_sink is None:
+        return
+    event_sink({"type": event_type, "payload": payload})

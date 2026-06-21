@@ -52,6 +52,21 @@ class AlwaysToolLLM:
         )
 
 
+class ReserveAwareToolLLM:
+    def __init__(self) -> None:
+        self.requests: list[LLMToolRequest] = []
+
+    def complete_with_tools(self, request: LLMToolRequest) -> LLMToolResponse:
+        self.requests.append(request)
+        if not request.tools:
+            return LLMToolResponse(content="forced final from observations", finish_reason="stop", used_mode="fake")
+        return LLMToolResponse(
+            tool_calls=[ToolCall(id=f"call_loop_{len(self.requests)}", name="echo", arguments={"text": "loop"})],
+            finish_reason="tool_calls",
+            used_mode="fake",
+        )
+
+
 class TwoToolLLM:
     def __init__(self) -> None:
         self.requests: list[LLMToolRequest] = []
@@ -292,7 +307,27 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(result.steps[0].tool_results[0].status, "success")
             self.assertGreaterEqual(base_client.calls, 2)
 
-    def test_runtime_max_steps(self) -> None:
+    def test_runtime_reserves_last_step_for_final_answer(self) -> None:
+        registry = ToolRegistry()
+        register_debug_tools(registry)
+        llm = ReserveAwareToolLLM()
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = AgentRuntime(
+                llm_client=llm,
+                skill_loader=SkillLoader(PROJECT_ROOT / "skills", registry=registry),
+                tool_registry=registry,
+                trace_recorder=TraceRecorder(tmp),
+            )
+            result = runtime.run(
+                config=AgentRunConfig(skill_name="runtime_debug", model="fake", max_steps=2, trace_path=tmp),
+                user_input="loop",
+            )
+            self.assertEqual(result.stopped_reason, "final")
+            self.assertEqual(result.final_answer, "forced final from observations")
+            self.assertEqual(llm.requests[-1].tools, [])
+            self.assertTrue(result.metadata["forced_final"])
+
+    def test_runtime_max_steps_when_final_reserve_disabled(self) -> None:
         registry = ToolRegistry()
         register_debug_tools(registry)
         with tempfile.TemporaryDirectory() as tmp:
@@ -303,7 +338,13 @@ class AgentRuntimeTests(unittest.TestCase):
                 trace_recorder=TraceRecorder(tmp),
             )
             result = runtime.run(
-                config=AgentRunConfig(skill_name="runtime_debug", model="fake", max_steps=2, trace_path=tmp),
+                config=AgentRunConfig(
+                    skill_name="runtime_debug",
+                    model="fake",
+                    max_steps=2,
+                    trace_path=tmp,
+                    reserve_final_step=False,
+                ),
                 user_input="loop",
             )
             self.assertEqual(result.stopped_reason, "max_steps")

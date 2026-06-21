@@ -127,7 +127,7 @@ def build_coach_input(request: CoachTurnRequest) -> str:
             request.latest_user_answer or "(not available)",
             "",
             "# Follow-up Zone (read-only for evaluation)",
-            "Use ONLY for interviewer_followup_note, thinking_framework, and expression_example.",
+            "Use ONLY for interviewer_followup_note and thinking_framework. Do NOT use it for expression_example.",
             "Do NOT copy follow-up dimensions into gaps.",
             "",
             request.interviewer_followup or "(not available)",
@@ -138,7 +138,8 @@ def build_coach_input(request: CoachTurnRequest) -> str:
             "# Task",
             "Step 1 — Question decomposition: From Previous Interviewer Question alone, list question_requires.",
             "Step 2 — Coverage evaluation: Compare User Latest Answer to question_requires. Produce covered and gaps.",
-            "Step 3 — Follow-up interpretation: Read Follow-up Zone only for interviewer_followup_note, thinking_framework, expression_example.",
+            "Step 3 — Follow-up interpretation: Read Follow-up Zone only for interviewer_followup_note and thinking_framework.",
+            "Step 4 — Expression example: Write expression_example from Evaluation Zone only (question_requires + gaps). Do NOT incorporate Follow-up Zone direction into the example.",
             "",
             "Return only the required JSON object. Write feedback in Simplified Chinese.",
         ]
@@ -237,6 +238,8 @@ def rewrite_trace_memory_metadata(*, result: Any, signals: list[dict[str, Any]],
         return
     payload["working_memory"] = to_jsonable(result.state.working)
     payload["memory"] = {
+        "profile_signals_disabled": True,
+        "profile_write_source": "session_end_extractor",
         "profile_signal_count": len(signals),
         "profile_signals": to_jsonable(signals),
         "observation_draft_count": len(drafts),

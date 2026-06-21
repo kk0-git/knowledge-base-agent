@@ -14,7 +14,7 @@ Follow this order internally before writing JSON:
 
 1. Question decomposition: from the previous interviewer question alone, list what a complete answer should cover (`question_requires`).
 2. Coverage evaluation: compare the user's latest answer against `question_requires`; produce `covered` and `gaps`.
-3. Follow-up interpretation: read the interviewer follow-up only to explain why the interviewer probed further, and optionally to shape `thinking_framework` or `expression_example`.
+3. Follow-up interpretation: read the interviewer follow-up only to explain why the interviewer probed further (`interviewer_followup_note`) and to shape `thinking_framework`. Do not use the follow-up to steer or expand `expression_example`.
 
 The follow-up is not the grading rubric. A depth probe does not automatically mean the user's previous answer was wrong.
 
@@ -22,8 +22,8 @@ The follow-up is not the grading rubric. A depth probe does not automatically me
 
 The user message contains deliberately separated zones:
 
-- Evaluation Zone: previous interviewer question + user latest answer. Derive `question_requires`, `covered`, `gaps`, and `coach_note` from this zone only.
-- Follow-up Zone: interviewer follow-up after the user's answer. Use only for `interviewer_followup_note`, `thinking_framework`, and `expression_example`.
+- Evaluation Zone: previous interviewer question + user latest answer. Derive `question_requires`, `covered`, `gaps`, `coach_note`, and `expression_example` from this zone only.
+- Follow-up Zone: interviewer follow-up after the user's answer. Use only for `interviewer_followup_note` and `thinking_framework`. Do not use it to steer or expand `expression_example`.
 - Reference Context: topic, planned layer, optional note paths. Not the default evaluation ground truth.
 
 Notes are optional evidence for expression examples, not the primary rubric unless the previous question explicitly required note-specific facts.
@@ -65,6 +65,16 @@ Do not copy the interviewer's follow-up wording into `gaps` or `coach_note`.
 
 Tie the framework to the question type, such as concept-boundary, technical comparison, engineering design, troubleshooting, or tradeoff analysis.
 
+# Expression Example Boundary
+
+`expression_example` must demonstrate how to answer the **previous question** better. It is not a preview of the follow-up question.
+
+Do not use the follow-up question's direction to steer, expand, or add depth to the example — even if the follow-up happened to ask about a gap.
+Do not demonstrate answering the follow-up question inside `expression_example`.
+Do not add content that only makes sense because of what the follow-up asked.
+
+If the follow-up revealed a missing dimension, that dimension may appear in `gaps`. It enters `expression_example` only if `question_requires` independently requires it — not because the follow-up asked about it.
+
 # Expression Example
 
 Generate `expression_example` when one of these is true:
@@ -75,7 +85,7 @@ Generate `expression_example` when one of these is true:
 
 If the user answered clearly and no meaningful improvement point exists, leave `expression_example` empty.
 
-When you generate it, write in the candidate's speaking voice as a 60-90 second interview answer to the previous question, or demonstrate `thinking_framework`. It may incorporate follow-up depth only when `gaps` already support that need.
+When you generate it, write in the candidate's speaking voice as a 60-90 second interview answer to the **previous question**. Base the content on `question_requires` and `gaps` — not on what the follow-up asked. Do not extend the example into territory that the previous question did not require.
 
 # Special Cases
 

@@ -31,6 +31,7 @@ class ToolExecutionContext:
     interview_state: Any | None = None
     state_machine: Any | None = None
     profile_store: Any | None = None
+    online_search_client: Any | None = None
     turn_context: dict[str, Any] = field(default_factory=dict)
     profile_signals: list[dict[str, Any]] = field(default_factory=list)
     observation_drafts: list[dict[str, Any]] = field(default_factory=list)

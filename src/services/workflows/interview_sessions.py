@@ -32,6 +32,25 @@ def make_session_id(source_value: str | None = None) -> str:
     return f"{timestamp}-{slug}-{suffix}"
 
 
+def interview_state_trace_summary(interview_state: dict[str, Any] | None) -> dict[str, Any]:
+    state = interview_state or {}
+    if not isinstance(state, dict):
+        return {}
+    return {
+        "current_topic": state.get("current_topic"),
+        "current_layer_name": state.get("current_layer_name", ""),
+        "follow_up_count": state.get("follow_up_count", 0),
+        "last_assistant_question": state.get("last_assistant_question", ""),
+    }
+
+
+def coach_review_memory_policy() -> dict[str, Any]:
+    return {
+        "profile_signals_disabled": True,
+        "profile_write_source": "session_end_extractor",
+    }
+
+
 def build_context(
     *,
     source_type: str,
@@ -251,7 +270,9 @@ class InterviewSessionStore:
                 "user_message_id": user_message["id"],
                 "assistant_message_id": assistant_message["id"],
                 "assistant_output_chars": len(assistant_content or ""),
+                "state_phase": "pre_agent_commit",
                 "interview_state": interview_state or {},
+                **interview_state_trace_summary(interview_state),
             },
         )
         return {"user_message": user_message, "assistant_message": assistant_message, "session": session}
@@ -308,7 +329,9 @@ class InterviewSessionStore:
             details={
                 "user_message_id": user_message["id"],
                 "assistant_message_id": assistant_message["id"],
+                "state_phase": "pre_agent_commit",
                 "interview_state": interview_state or {},
+                **interview_state_trace_summary(interview_state),
             },
         )
         return {"user_message": user_message, "assistant_message": assistant_message, "session": session}
@@ -409,6 +432,7 @@ class InterviewSessionStore:
             existing["reference_answer"] = reference_answer or ""
             existing["context_note_paths"] = [str(path) for path in (context_note_paths or []) if str(path).strip()]
             existing["profile_signals"] = profile_signals or []
+            existing["memory_policy"] = coach_review_memory_policy()
             existing["status"] = "completed"
             existing["error"] = ""
             existing["updated_at"] = utc_now()
@@ -416,13 +440,14 @@ class InterviewSessionStore:
             self.append_trace_event(
                 session_id=session_id,
                 event="turn_review_completed",
-                summary=f"turn_review completed: {existing.get('turn_id')} ({len(existing.get('profile_signals') or [])} profile signal(s))",
+                summary=f"turn_review completed: {existing.get('turn_id')} (profile via session_end_extractor)",
                 details={
                     "turn_id": existing.get("turn_id"),
                     "user_message_id": user_message_id,
                     "assistant_message_id": assistant_message_id,
                     "profile_signal_count": len(existing.get("profile_signals") or []),
                     "profile_signal_types": [str(signal.get("type") or "") for signal in existing.get("profile_signals") or [] if isinstance(signal, dict)],
+                    **coach_review_memory_policy(),
                 },
             )
             return existing
@@ -435,6 +460,7 @@ class InterviewSessionStore:
             "reference_answer": reference_answer or "",
             "context_note_paths": [str(path) for path in (context_note_paths or []) if str(path).strip()],
             "profile_signals": profile_signals or [],
+            "memory_policy": coach_review_memory_policy(),
             "status": "completed",
             "error": "",
             "retry_count": 0,
@@ -445,13 +471,14 @@ class InterviewSessionStore:
         self.append_trace_event(
             session_id=session_id,
             event="turn_review_completed",
-            summary=f"turn_review completed: {review.get('turn_id')} ({len(review.get('profile_signals') or [])} profile signal(s))",
+            summary=f"turn_review completed: {review.get('turn_id')} (profile via session_end_extractor)",
             details={
                 "turn_id": review.get("turn_id"),
                 "user_message_id": user_message_id,
                 "assistant_message_id": assistant_message_id,
                 "profile_signal_count": len(review.get("profile_signals") or []),
                 "profile_signal_types": [str(signal.get("type") or "") for signal in review.get("profile_signals") or [] if isinstance(signal, dict)],
+                **coach_review_memory_policy(),
             },
         )
         return review
@@ -725,7 +752,9 @@ class InterviewSessionStore:
                 "skill": skill,
                 "trace_id": trace_id,
                 "trace_path": trace_path,
+                "state_phase": "post_agent_commit",
                 "interview_state": interview_state or {},
+                **interview_state_trace_summary(interview_state),
             },
         )
         return session

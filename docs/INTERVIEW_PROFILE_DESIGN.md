@@ -31,8 +31,45 @@
 1. **Universal 弱项**：任何 topic / session 下持续注入（带上限）。
 2. **Domain 弱项**：仅在与当前 session 知识域相关时注入，不依赖 topic 字符串精确匹配。
 3. **Topic 降级**：`topic` 仅作首次发现时的可读标签（provenance），不参与过滤。
-4. **Session 内 profile 冻结**：不在 turn 中更新 profile；证据链靠 `turn_review.profile_signals` + session 结束提取。
+4. **Session 内 profile 冻结**：不在 turn 中更新 profile；**Agent V2（方案 B）** 下长期画像的唯一写入入口是 **session 结束单层 extractor**（见下文「证据链（方案 B）」）。
 5. **去重稳定优先**：P0–P2 以 scope-aware 确定性匹配为主；Stage 2 LLM reconcile 后置（P3），待 profile 数据量增大后再引入。
+
+---
+
+## 证据链（方案 B，Agent V2）
+
+Coach 不再承担 profile 写入决策。每轮 coach 只产出给用户看的 turn review；profile 的提取、去噪、去重、合并、SR 更新全部在 session 结束时一次性完成。
+
+```text
+每轮（Coach，纯 turn-review）
+  输入：previous question + user answer + interviewer follow-up（分区）
+  输出：question_requires / coach_note / covered / gaps /
+        thinking_framework / expression_example
+  profile_signals → 始终 []（schema 兼容字段，不写入 profile）
+
+Session 结束（单层 extractor，主路径）
+  输入：
+    - session transcript（问答原文）
+    - turn reviews（coach 反馈作辅助证据，含 question_requires / gaps / coach_note）
+    - turn_review.context_note_paths（turn 级 provenance，非 profile_signals）
+    - existing profile（compact）
+    - interview_plan + interview_state（layer / topic 锚点）
+  输出：observations → apply_profile_observations() → interview_profile.json
+
+降级（extractor LLM 失败时）
+  - 优先从 turn_review.gaps + coach_note 合成 weak_point observations
+  - 仍无信号时，commit_bridge 可消费 session 级 record_signal / observation_draft（若其他 agent 写入）
+```
+
+**与旧设计的差异**
+
+| 维度 | Legacy / 旧文档 | 方案 B（当前 Agent V2） |
+|------|-----------------|-------------------------|
+| 每轮 profile 证据 | `turn_review.profile_signals` + `record_signal` | **无**；coach 不 recall、不 record |
+| Session 结束输入 | signals 为主 + transcript | **transcript + turn reviews 为主**；signals 仅作 commit_bridge 补充 |
+| `profile_signal_count` in trace | 有意义的审计指标 | Agent V2 coach 恒为 0，**不代表 coach 未发现 gap** |
+
+Legacy pipeline（`interview.py` 内旧 prompt）仍可能产出 `profile_signals`；Agent V2 coach（`skills/coach` + `interview_coach.py`）强制清空。新 session 以方案 B 为准。
 
 ---
 
@@ -78,15 +115,15 @@
 
 | 字段 | 类型 | 谁写 | 职责 |
 |------|------|------|------|
-| `scope` | `"domain"` \| `"universal"` | Stage 1 LLM（turn_review 信号同源） | 注入范围 |
-| `category` | `"knowledge_gap"` \| `"answer_structure"` \| `"communication"` \| `"thinking_pattern"` | Stage 1 LLM | 弱项性质；影响追问策略、`planned_layer` 语义、scope 自动升级白名单 |
+| `scope` | `"domain"` \| `"universal"` | Session-end extractor LLM | 注入范围 |
+| `category` | `"knowledge_gap"` \| `"answer_structure"` \| `"communication"` \| `"thinking_pattern"` | Session-end extractor LLM | 弱项性质；影响追问策略、`planned_layer` 语义、scope 自动升级白名单 |
 | `domain_anchor` | `object` | **代码**（`new_weak_point()`） | Domain 匹配主锚；见上文三元组 |
-| `topic` | `string`（保留） | Stage 1 LLM | 首次发现时的可读标签；**不参与注入过滤** |
-| `planned_layer` | `string`（保留） | Stage 1 LLM / turn_review | domain：InterviewPlan coverage layer；universal：probe hint |
+| `topic` | `string`（保留） | Session-end extractor LLM | 首次发现时的可读标签；**不参与注入过滤** |
+| `planned_layer` | `string`（保留） | Session-end extractor LLM / session state | domain：InterviewPlan coverage layer；universal：probe hint |
 | `source_note_paths` | `string[]`（保留） | **代码**（`new_weak_point()`） | Session 级 provenance：用户本次选中的全部笔记路径 |
 | `sr` | `object`（保留） | 代码（SM-2） | 间隔重复参数；见「Due reviews」 |
 
-### `scope` 分类规则（写入 Stage 1 prompt）
+### `scope` 分类规则（写入 session-end extractor prompt）
 
 | 观察 | scope | category 示例 |
 |------|-------|---------------|
@@ -113,14 +150,15 @@
 
 ### Turn 级数据补全（P1 前置）
 
-`context_note_paths` 优先来自 **turn 级实际 context**，不能从 plan 顺序猜测；但只有足够窄（≤3 条）时才作为强锚。P1 须在 turn_review 链路补写：
+`context_note_paths` 优先来自 **turn 级实际 context**，不能从 plan 顺序猜测；但只有足够窄（≤3 条）时才作为强锚。P1 须在 **turn_review 记录本身** 补写（不依赖 `profile_signals`）：
 
 | 补写位置 | 字段 | 来源 |
 |----------|------|------|
-| `turn_review` / `profile_signals` | `context_note_paths` | 本轮 interviewer prompt 实际注入的 context item paths |
-| `profile_signals`（已有） | `topic`、`turn_id` | 与 observation 回溯同源 |
+| `turn_review` | `context_note_paths` | 本轮 scope 内实际可用的 note paths（Agent V2：与 coach review 一并 persist） |
+| `turn_review.feedback` | `question_requires`、`gaps`、`coach_note` | Coach turn review（方案 B 下 extractor 的辅助证据，非最终 truth） |
+| `turn_review` | `profile_signals` | **Legacy 兼容**；Agent V2 coach 恒为 `[]`，不作为 extractor 主输入 |
 
-Session 结束 extraction 时，observation 通过 `turn_id` 或 signal 索引关联到对应 turn 的 `context_note_paths`。
+Session 结束 extraction 时，extractor 通过 transcript + turn review 列表关联每轮 evidence；`domain_anchor` 仍由代码从 session / turn 的 `context_note_paths` 写入。
 
 ### 写入逻辑
 
@@ -146,7 +184,7 @@ resolve_domain_anchor(topic_card, session, observation):
   plan_topic = session.interview_state.current_topic or observation.topic or ""
   scope_path = resolve_scope_path(session)   # folder/tag source_value 或 note 父目录
 
-  turn_context_paths = observation.context_note_paths   # 来自 turn_review 补数据
+  turn_context_paths = observation.context_note_paths   # 来自 turn_review.context_note_paths 或 observation 自带 paths
   if turn_context_paths and len(turn_context_paths) <= 3:
     context_note_paths = list(turn_context_paths)
   else:
@@ -290,11 +328,15 @@ domain_anchor.scope_path = ""   # 无法反推则留空
 
 ### 链路 1：创建（写入）
 
-**触发点**：`turn_review.profile_signal`（session 内证据） + Session 结束 Stage 1 extraction。
+**触发点（方案 B）**：Session 结束 **单层 extractor**（`extract_profile_observations` → `apply_profile_observations`）。Coach 每轮不写 profile。
 
-**LLM 产出**：`scope`、`category`、`point`、`topic`、`planned_layer`、`evidence` 等。**不含** `domain_anchor` 或 LLM 匹配字段。
+**Extractor LLM 输入**：transcript、turn reviews（含 `question_requires` / `gaps` / `coach_note`）、existing profile compact、session context、interview plan。
+
+**Extractor LLM 产出**：`scope`、`category`、`point`、`topic`、`planned_layer`、`evidence` 等。**不含** `domain_anchor` 或 LLM 匹配字段。
 
 **代码产出**：`domain_anchor`、`source_note_paths`、`sr` 初始值、`source_session_ids`。
+
+**Legacy 补充路径**：`commit_interview_memory` 可将 session 级 `record_signal` / observation draft 合成 synthetic review 交给同一 extractor；Agent V2 coach 不使用此路径。
 
 **不改**：Session 进行中不更新 profile 文件；面试官每轮读同一份冻结 profile。
 
@@ -307,9 +349,10 @@ domain_anchor.scope_path = ""   # 无法反推则留空
 **P0–P2 目标**：scope-aware 确定性匹配 + domain_anchor 联合规则 + P2 scope 自动升级；不引入 Stage 2 LLM。
 
 ```text
-Stage 1 LLM
-  输入：transcript、turn_review signals（含 context_note_paths）、existing profile（轻量 compact）
+Session-end extractor LLM（Stage 1）
+  输入：transcript、turn reviews（feedback + context_note_paths）、existing profile（轻量 compact）
   输出：observations（含 scope、category；不含 domain_anchor）
+  注：不再以 turn_review.profile_signals 为主输入；Agent V2 coach 该字段恒为空
 
 Deterministic reconcile（P2 起，主路径）
   scope-aware find_similar_profile_item()
@@ -398,7 +441,7 @@ D. topic_mastery → P5 可改为按 domain_anchor 聚合
 | 阶段 | 内容 | 依赖 | 验收 |
 |------|------|------|------|
 | **P0** | Schema v2 + `normalize_interview_profile()`；`domain_anchor` 默认值 | 无 | 旧 profile 可读；`anchor_note_paths` 可迁移 |
-| **P1** | turn_review 补 `context_note_paths`；Stage 1 输出 `scope`/`category`；`new_weak_point()` 写 `domain_anchor` | P0 | 新 session 弱项三元组完整 |
+| **P1** | turn_review 持久化 `context_note_paths` + coach feedback；session-end extractor 输出 `scope`/`category`；`new_weak_point()` 写 `domain_anchor` | P0 | 新 session 弱项三元组完整 |
 | **P2** | 注入：scope 分流 + `domain_relevant`；scope-aware 去重；**domain→universal 自动升级**（category 白名单） | P0, P1 | 同 note 不同 topic 名可注入；跨域结构类弱项升 universal |
 | **P3** | **后置** Stage 2 LLM reconcile | P0–P2；数据量足够 | 语义相同弱项 UPDATE 而非重复 ADD |
 | **P4** | 数据迁移：behavioral → `scope=universal`；补全 `domain_anchor` | P0–P2 | 历史 behavioral 弱项跨 topic 注入 |
@@ -421,7 +464,8 @@ D. topic_mastery → P5 可改为按 domain_anchor 聚合
 
 ### 发布前检查
 
-- [ ] turn_review / `profile_signals` 含 `context_note_paths`
+- [ ] turn_review 含 `context_note_paths`（独立于 `profile_signals`）
+- [ ] Agent V2 coach：`profile_signals` 恒空；extractor 主路径不依赖 per-turn signals
 - [ ] `normalize` 对缺失 `scope` / `domain_anchor` 有默认值
 - [ ] `new_weak_point()` 仅代码写 `domain_anchor`；Stage 1 schema 无 anchor 字段
 - [ ] `render_candidate_profile_context()` 用 `domain_relevant`，不用 `topic ==`
@@ -461,3 +505,4 @@ D. topic_mastery → P5 可改为按 domain_anchor 聚合
 | 2026-06-19 | 初稿：scope/category/anchor 字段契约、三链路、P0–P5 |
 | 2026-06-19 | 修订：turn-context 优先；无 anchor 强保护；P3 后置 |
 | 2026-06-19 | 定稿：`domain_anchor` 三元组；turn 补数据；P2 复现升级（category 白名单）；暂不落地 LLM 匹配字段 |
+| 2026-06-21 | 方案 B：证据链改为 session-end 单层 extractor；coach 不再产 profile_signals；更新 turn 级补数据与三链路描述 |

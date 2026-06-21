@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from services.rag.schema import TextChunk
+from services.markdown.sections import MarkdownSection, has_content_lines, is_fenced_code_marker, split_markdown_sections
 
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -36,14 +37,6 @@ class ChunkerConfig:
     chunk_overlap: int = 200
     chunk_split_mode: str = "indexed"
     strip_code_blocks: bool = False
-
-
-@dataclass(frozen=True)
-class MarkdownSection:
-    heading_path: list[str]
-    lines: list[str]
-    start_line: int
-    end_line: int
 
 
 @dataclass(frozen=True)
@@ -248,66 +241,6 @@ class HeadingChunker:
             start_index = next_start_index
 
         return chunks
-
-
-def split_markdown_sections(markdown: str) -> list[MarkdownSection]:
-    lines = markdown.splitlines()
-    sections: list[MarkdownSection] = []
-
-    heading_stack: list[tuple[int, str]] = []
-    current_heading_path: list[str] = []
-    current_lines: list[str] = []
-    current_start = 1
-    in_fenced_code = False
-
-    for line_number, line in enumerate(lines, start=1):
-        if is_fenced_code_marker(line):
-            current_lines.append(line)
-            in_fenced_code = not in_fenced_code
-            continue
-
-        match = None if in_fenced_code else HEADING_RE.match(line)
-
-        if match:
-            if current_lines:
-                sections.append(
-                    MarkdownSection(
-                        heading_path=current_heading_path,
-                        lines=current_lines,
-                        start_line=current_start,
-                        end_line=line_number - 1,
-                    )
-                )
-
-            level = len(match.group(1))
-            heading_text = match.group(2).strip()
-
-            while heading_stack and heading_stack[-1][0] >= level:
-                heading_stack.pop()
-
-            heading_stack.append((level, heading_text))
-            current_heading_path = [heading for _, heading in heading_stack]
-            current_lines = [line]
-            current_start = line_number
-            continue
-
-        current_lines.append(line)
-
-    if current_lines:
-        sections.append(
-            MarkdownSection(
-                heading_path=current_heading_path,
-                lines=current_lines,
-                start_line=current_start,
-                end_line=len(lines),
-            )
-        )
-
-    return [section for section in sections if has_content_lines(section.lines)]
-
-
-def is_fenced_code_marker(line: str) -> bool:
-    return line.lstrip().startswith("```")
 
 
 def create_chunk(
@@ -589,7 +522,3 @@ def minimum_split_chars(config: ChunkerConfig) -> int:
 
 def has_content(line_items: list[LineItem]) -> bool:
     return any(item.text.strip() for item in line_items)
-
-
-def has_content_lines(lines: list[str]) -> bool:
-    return any(line.strip() for line in lines)

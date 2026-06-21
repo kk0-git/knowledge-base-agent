@@ -21,7 +21,7 @@ class ToolExecutionStatus(str, Enum):
     ERROR = "error"
 
 
-StopReason = Literal["final", "max_steps", "error", "cancelled"]
+StopReason = Literal["final", "max_steps", "tool_timeout", "tool_error", "llm_error", "cancelled"]
 AgentRole = Literal["system", "user", "assistant", "tool"]
 
 
@@ -113,6 +113,8 @@ class AgentRunConfig:
     save_trace: bool = True
     trace_path: str | None = None
     tool_mode: Literal["native", "json", "auto"] = "auto"
+    allowed_tools: list[str] | None = None
+    reserve_final_step: bool = True
 
 
 @dataclass
@@ -126,6 +128,7 @@ class AgentResult:
     trace_path: str = ""
     error: str = ""
     error_type: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

@@ -1,24 +1,41 @@
 from __future__ import annotations
 
-import re
-from pathlib import Path
 from typing import Any
 
 from agent.schema import ToolSpec
 from agent.tool_executor import ToolExecutionContext
-from agent.tools.vault.guards import require_scope_allowed, resolve_vault_note_path, truncate_text
+from agent.tools.vault.note_sections import (
+    SHORT_NOTE_CHAR_THRESHOLD,
+    build_full_read_output,
+    build_outline_read_output,
+    build_section_read_output,
+    load_scoped_note_text,
+    parse_heading_path_argument,
+    resolve_target_section,
+)
+from services.markdown.sections import parse_markdown_sections
 
 
 def read_note_spec() -> ToolSpec:
     return ToolSpec(
         name="read_note",
-        description="Read a markdown note from the current vault scope.",
+        description=(
+            "Read a markdown note from the current vault scope. "
+            "Short notes return full content; long notes return an outline unless a section is requested."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "heading": {"type": "string"},
+                "heading": {"type": "string", "description": "Read a specific section by heading text."},
+                "heading_path": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Read a section by full heading path, e.g. [\"Memory\", \"Types\"].",
+                },
+                "section_id": {"type": "string", "description": "Read a section by id from inspect_note or outline."},
                 "max_chars": {"type": "integer"},
+                "reason": {"type": "string"},
             },
             "required": ["path"],
         },
@@ -29,50 +46,33 @@ def read_note_spec() -> ToolSpec:
 
 
 def read_note(arguments: dict[str, Any], ctx: ToolExecutionContext) -> dict[str, Any]:
-    relative = require_scope_allowed(str(arguments.get("path") or ""), ctx.scope_note_paths)
-    relative, full_path = resolve_vault_note_path(ctx.vault_root, relative)
+    relative, text = load_scoped_note_text(str(arguments.get("path") or ""), ctx)
     max_chars = max(1, min(int(arguments.get("max_chars") or 4000), ctx.max_tool_output_chars))
+    reason = str(arguments.get("reason") or "").strip()
     heading = str(arguments.get("heading") or "").strip()
-    text = full_path.read_text(encoding="utf-8", errors="replace")
-    content = extract_heading_section(text, heading) if heading else text
-    content = content.strip()
-    truncated_content, truncated = truncate_text(content, max_chars)
+    section_id = str(arguments.get("section_id") or "").strip()
+    heading_path = parse_heading_path_argument(arguments.get("heading_path"))
+
+    sections = parse_markdown_sections(text)
+    if heading or section_id or heading_path:
+        section = resolve_target_section(
+            sections,
+            heading=heading,
+            section_id=section_id,
+            heading_path=heading_path,
+        )
+        output = build_section_read_output(
+            relative=relative,
+            section=section,
+            max_chars=max_chars,
+            reason=reason,
+            all_sections=sections,
+        )
+    elif len(text) <= SHORT_NOTE_CHAR_THRESHOLD:
+        output = build_full_read_output(relative=relative, text=text, max_chars=max_chars, reason=reason)
+    else:
+        output = build_outline_read_output(relative=relative, text=text, reason=reason)
+
     if relative not in ctx.working.notes_read_this_turn:
         ctx.working.notes_read_this_turn.append(relative)
-    return {
-        "path": relative,
-        "title": Path(relative).stem,
-        "heading": heading,
-        "content": truncated_content,
-        "char_count": len(content),
-        "truncated": truncated,
-    }
-
-
-def extract_heading_section(text: str, heading: str) -> str:
-    target = normalize_heading_text(heading)
-    lines = text.splitlines()
-    start_index: int | None = None
-    start_level = 0
-    for index, line in enumerate(lines):
-        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
-        if not match:
-            continue
-        title = normalize_heading_text(match.group(2))
-        if title == target:
-            start_index = index
-            start_level = len(match.group(1))
-            break
-    if start_index is None:
-        return text
-    end_index = len(lines)
-    for index in range(start_index + 1, len(lines)):
-        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", lines[index])
-        if match and len(match.group(1)) <= start_level:
-            end_index = index
-            break
-    return "\n".join(lines[start_index:end_index])
-
-
-def normalize_heading_text(value: str) -> str:
-    return " ".join(str(value or "").strip().lower().split())
+    return output

@@ -1,0 +1,35 @@
+{
+  "schema_version": "agent_eval_cases_v1",
+  "cases": [
+    {
+      "id": "librarian_search_read",
+      "type": "librarian",
+      "input": "How should Redis Stream events be consumed?",
+      "scope_type": "all_vault",
+      "expect": {
+        "stopped_reason": "final",
+        "notes_read": 1,
+        "search_count": 1,
+        "schema_valid": true
+      }
+    },
+    {
+      "id": "librarian_selected_scope_no_search",
+      "type": "librarian",
+      "input": "Summarize this selected MCP note.",
+      "scope_type": "selected_notes",
+      "scope_note_paths": [
+        "mcp.md"
+      ],
+      "selected_note_paths": [
+        "mcp.md"
+      ],
+      "expect": {
+        "stopped_reason": "final",
+        "tool_call_count": 1,
+        "notes_read": 1,
+        "schema_valid": true
+      }
+    }
+  ]
+}

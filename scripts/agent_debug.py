@@ -14,6 +14,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from agent.llm.tool_calling import LLMToolRequest, LLMToolResponse, OpenAICompatibleToolCallingClient
+from agent.apps import LibrarianApp, LibrarianRequest
 from agent.runtime import AgentRuntime
 from agent.schema import AgentRunConfig, ToolCall
 from agent.skill_loader import SkillLoader
@@ -190,6 +191,15 @@ class DeterministicDebugLLM:
         )
 
     def _complete_librarian(self, request: LLMToolRequest, tool_names: set[str]) -> LLMToolResponse:
+        if self.calls == 1 and "search_notes" not in tool_names and "read_note" in tool_names:
+            path = first_selected_note_path(request)
+            if path:
+                return LLMToolResponse(
+                    tool_calls=[ToolCall(id="call_read_1", name="read_note", arguments={"path": path, "max_chars": 1200})],
+                    finish_reason="tool_calls",
+                    raw={"fake": True},
+                    used_mode=f"fake-{request.tool_mode}",
+                )
         if self.calls == 1 and "search_notes" in tool_names:
             return LLMToolResponse(
                 tool_calls=[
@@ -269,6 +279,11 @@ def run_agent(args: argparse.Namespace) -> int:
         trace_recorder=TraceRecorder(PROJECT_ROOT / "eval-results" / "agent-debug" / "traces"),
     )
     model = "debug-fake" if args.llm_mode == "fake" else load_llm_config(PROJECT_ROOT).model
+    if args.skill == "librarian":
+        result = run_librarian_app(args=args, runtime=runtime, model=model)
+        print_agent_result(result=result, print_steps=args.print_steps)
+        return 0 if result.stopped_reason in {"final", "max_steps"} else 1
+
     result = runtime.run(
         config=AgentRunConfig(
             skill_name=args.skill,
@@ -282,6 +297,11 @@ def run_agent(args: argparse.Namespace) -> int:
         tool_context=build_tool_context(args),
     )
 
+    print_agent_result(result=result, print_steps=args.print_steps)
+    return 0 if result.stopped_reason in {"final", "max_steps"} else 1
+
+
+def print_agent_result(*, result, print_steps: bool) -> None:
     print(result.final_answer or f"(no final answer; stopped_reason={result.stopped_reason})")
     print()
     print(f"stopped_reason: {result.stopped_reason}")
@@ -289,14 +309,37 @@ def run_agent(args: argparse.Namespace) -> int:
     print(f"trace_path: {Path(result.trace_path).resolve() if result.trace_path else '(not saved)'}")
     if result.error:
         print(f"error: {result.error_type}: {result.error}")
-    if args.print_steps:
+    if print_steps:
         print()
         print("steps:")
         for step in result.steps:
             tool_names = ", ".join(call.name for call in step.tool_calls) or "-"
             statuses = ", ".join(tool.status for tool in step.tool_results) or "-"
             print(f"- {step.index}: {step.kind.value} tools=[{tool_names}] statuses=[{statuses}] latency_ms={step.latency_ms}")
-    return 0 if result.stopped_reason in {"final", "max_steps"} else 1
+
+
+def run_librarian_app(*, args: argparse.Namespace, runtime: AgentRuntime, model: str):
+    if not args.vault:
+        raise ValueError("--vault is required for librarian skill")
+    vault_root = Path(args.vault)
+    manager = build_rag_manager(args, vault_root)
+    scope_paths = resolve_scope_note_paths(args, vault_root=vault_root, manager=manager)
+    return LibrarianApp(runtime).run(
+        LibrarianRequest(
+            query=args.input,
+            scope_type=args.scope_type,
+            scope_value=args.scope_value or "",
+            scope_note_paths=tuple(scope_paths),
+            selected_note_paths=tuple(scope_paths) if args.scope_type == "selected_notes" else (),
+            vault_root=vault_root,
+            rag_manager=manager,
+            rag_manager_factory=lambda: build_rag_manager(args, vault_root),
+            model=model,
+            tool_mode=args.tool_mode,
+            trace_path=args.trace_out,
+            max_tool_calls_per_step=args.max_tool_calls_per_step,
+        )
+    )
 
 
 def build_llm_client(mode: str):
@@ -578,6 +621,30 @@ def first_search_hit_path(request: LLMToolRequest) -> str:
             first = hits[0]
             if isinstance(first, dict) and first.get("path"):
                 return str(first["path"])
+    return ""
+
+
+def first_selected_note_path(request: LLMToolRequest) -> str:
+    for message in request.messages:
+        if message.role != "user":
+            continue
+        content = str(message.content or "")
+        marker = "# Runtime Context"
+        if marker not in content:
+            continue
+        section = content.split(marker, 1)[1]
+        if "# Short Conversation History" in section:
+            section = section.split("# Short Conversation History", 1)[0]
+        try:
+            payload = json.loads(section.strip())
+        except Exception:
+            continue
+        scope = payload.get("scope") if isinstance(payload, dict) else {}
+        paths = scope.get("selected_note_paths") if isinstance(scope, dict) else []
+        if isinstance(paths, list):
+            for path in paths:
+                if str(path or "").strip():
+                    return str(path)
     return ""
 
 

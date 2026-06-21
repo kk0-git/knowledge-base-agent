@@ -12,6 +12,8 @@ TOPIC_AWAITING_SELECTION = "awaiting_selection"
 TOPIC_ACTIVE = "active"
 TOPIC_CLOSING = "closing"
 TOPIC_PHASES = {TOPIC_AWAITING_SELECTION, TOPIC_ACTIVE, TOPIC_CLOSING}
+QUESTION_MARKS = ("?", "？")
+ASSISTANT_ANCHOR_CHARS = 160
 
 
 def utc_now() -> str:
@@ -82,6 +84,8 @@ class InterviewStateMachine:
         question = extract_last_question(assistant_text)
         self.state.last_assistant_question = question
         if question:
+            # Stores recent interviewer probes or fallback reply anchors, not only
+            # punctuation-terminated questions.
             append_unique_tail(self.state.sub_points_touched, question, max_items=8)
         if self.state.topic_phase == TOPIC_ACTIVE and self.state.current_topic:
             self.state.follow_up_count = max(0, int(self.state.follow_up_count or 0)) + 1
@@ -382,11 +386,18 @@ def normalize_topic_phase(value: Any, *, has_topic: bool) -> str:
 
 
 def extract_last_question(text: str) -> str:
-    parts = re.split(r"(?<=[??])", str(text or ""))
-    questions = [part.strip() for part in parts if part.strip().endswith(("?", "?"))]
-    if not questions:
+    clean = truncate_one_line(str(text or ""), 600)
+    if not clean:
         return ""
-    return truncate_one_line(questions[-1], 160)
+    parts = re.split(r"(?<=[?？])", clean)
+    questions = [part.strip() for part in parts if part.strip().endswith(QUESTION_MARKS)]
+    if questions:
+        return truncate_one_line(questions[-1], ASSISTANT_ANCHOR_CHARS)
+    # Fallback mirrors MemCoach-style anchoring: keep a stable reply anchor even
+    # when the interviewer asks an imperative question without punctuation.
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    fallback = lines[-1] if lines else clean
+    return truncate_one_line(fallback, ASSISTANT_ANCHOR_CHARS)
 
 
 def append_unique_tail(items: list[str], value: str, *, max_items: int) -> None:

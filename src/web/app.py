@@ -17,7 +17,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from agent.apps import CoachTurnRequest, InterviewCoachApp, InterviewInterviewerApp, InterviewTurnRequest
+from agent.apps import (
+    CoachTurnRequest,
+    InterviewCoachApp,
+    InterviewInterviewerApp,
+    InterviewTurnRequest,
+    LibrarianApp,
+    LibrarianRequest,
+)
 from agent.llm.tool_calling import OpenAICompatibleToolCallingClient
 from agent.interview.state import build_interview_state_machine
 from agent.runtime import AgentRuntime
@@ -197,6 +204,7 @@ class AgentRequest(BaseModel):
     online_provider: str | None = Field(default=None)
     online_top_k: int = Field(default=5, ge=1, le=20)
     speculative_notes_search: bool = Field(default=True)
+    strict_evidence: bool = Field(default=False)
     interview_max_chars_per_note: int = Field(default=4000, ge=500, le=12000)
     interview_max_context_chars: int = Field(default=24000, ge=2000, le=60000)
     interview_plan: dict[str, Any] | None = Field(default=None)
@@ -896,6 +904,14 @@ def create_app(
         value = os.getenv("AGENT_V2_COACH", "").strip().lower()
         return value in {"1", "true", "yes", "on"}
 
+    def agent_v2_librarian_enabled() -> bool:
+        value = os.getenv("AGENT_V2_LIBRARIAN", "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def librarian_online_enabled(request: AgentRequest) -> bool:
+        provider = str(request.online_provider or "").strip().lower()
+        return provider not in {"", "0", "false", "no", "none", "off", "disabled"}
+
     def build_interview_rag_manager(request: AgentRequest):
         return service.build_manager(
             SearchOptions(
@@ -906,6 +922,55 @@ def create_app(
                 rrf_k=request.rrf_k,
             )
         )
+
+    def build_librarian_rag_manager(request: AgentRequest, *, query: str | None = None):
+        return service.build_manager(
+            SearchOptions(
+                query=query or request.query,
+                mode="hybrid",
+                dense_top_k=request.dense_top_k,
+                bm25_top_k=request.hybrid_bm25_top_k,
+                rrf_k=request.rrf_k,
+            )
+        )
+
+    def resolve_librarian_scope(request: AgentRequest):
+        if runtime_config.vault_path is None:
+            raise HTTPException(status_code=400, detail="vault path is required for librarian agent")
+        scope_type = str(request.scope_type or "all_vault")
+        if scope_type == "all_vault":
+            return None, (), {}
+        rag_manager = (
+            build_librarian_rag_manager(request, query=request.scope_value or request.query)
+            if scope_type == "search"
+            else None
+        )
+        resolver = ScopeResolver(
+            vault_root=runtime_config.vault_path,
+            wiki_state_store=WikiStateStore(runtime_config.wiki_state_path) if runtime_config.wiki_state_path else None,
+            wiki_dir=runtime_config.wiki_dir,
+            rag_manager=rag_manager,
+            overview_note_threshold=runtime_config.overview_note_threshold,
+        )
+        scope = resolver.resolve(
+            ScopeSpec(
+                type=scope_type,
+                value=request.scope_value or None,
+                paths=tuple(request.scope_paths or ()),
+                top_k=request.notes_top_k,
+                options={
+                    "dense_top_k": request.dense_top_k,
+                    "bm25_top_k": request.hybrid_bm25_top_k,
+                    "rrf_k": request.rrf_k,
+                },
+            )
+        )
+        scope_paths = tuple(
+            str(item.get("path") or item.get("relative_path") or "")
+            for item in scope.notes
+            if str(item.get("path") or item.get("relative_path") or "").strip()
+        )
+        return scope, scope_paths, scope.metadata
 
     def prewarm_interview_rag(request: AgentRequest) -> None:
         nonlocal rag_prewarm_started
@@ -921,6 +986,55 @@ def create_app(
                 pass
 
         threading.Thread(target=run, name="interview-rag-prewarm", daemon=True).start()
+
+    def stream_librarian_agent_v2(request: AgentRequest, llm_client, llm_config):
+        if runtime_config.vault_path is None:
+            raise HTTPException(status_code=400, detail="vault path is required for librarian agent")
+
+        yield sse_event("status", {"stage": "agent_v2_started", "message": "starting librarian agent runtime"})
+        scope, scope_note_paths, scope_metadata = resolve_librarian_scope(request)
+        yield sse_event(
+            "context",
+            {
+                "mode": "answer",
+                "strict_evidence": bool(request.strict_evidence),
+                "scope": {
+                    "type": request.scope_type,
+                    "value": request.scope_value,
+                    "paths": request.scope_paths,
+                    "metadata": scope_metadata,
+                    "note_count": len(scope_note_paths),
+                },
+                "items": list(scope.notes) if scope is not None else [],
+                "stats": {"context_items": len(scope_note_paths), "agent_v2": True},
+            },
+        )
+
+        online_enabled = librarian_online_enabled(request)
+        online_client = OnlineSearchClient(provider=request.online_provider) if online_enabled else None
+        rag_manager_factory = lambda: build_librarian_rag_manager(request)
+        app_runner = LibrarianApp(build_interview_agent_runtime(llm_client))
+        for event in app_runner.run_stream(
+            LibrarianRequest(
+                query=request.query,
+                scope_type=request.scope_type,
+                scope_value=request.scope_value or "",
+                scope_note_paths=scope_note_paths,
+                selected_note_paths=tuple(request.scope_paths or ()) if request.scope_type == "selected_notes" else (),
+                chat_history=list(request.chat_history or []),
+                vault_root=runtime_config.vault_path,
+                rag_manager=build_librarian_rag_manager(request),
+                rag_manager_factory=rag_manager_factory,
+                online_search_client=online_client,
+                online_enabled=online_enabled,
+                strict_evidence=bool(request.strict_evidence),
+                model=llm_config.model,
+                tool_mode="auto",
+                trace_path=str(project_root / "eval-results" / "agent-debug" / "traces"),
+                temperature=llm_config.temperature,
+            )
+        ):
+            yield sse_event(event["type"], event.get("payload") or {})
 
     def stream_interview_agent_v2(request: AgentRequest, llm_client, llm_config):
         if runtime_config.vault_path is None:
@@ -2037,6 +2151,9 @@ def create_app(
                         yield from stream_interview_agent_v2(request, llm_client, llm_config)
                         return
                     yield from stream_study_or_interview(request, llm_client, llm_config)
+                    return
+                if request.chat_mode == "answer" and agent_v2_librarian_enabled():
+                    yield from stream_librarian_agent_v2(request, llm_client, llm_config)
                     return
 
                 router = build_web_router(request.command, llm_client, llm_config)
@@ -4718,6 +4835,26 @@ CHAT_HTML = r"""<!doctype html>
     .answer ul, .answer ol { margin: 8px 0 10px 20px; padding: 0; }
     .answer pre { overflow-x: auto; padding: 10px; border-radius: 6px; background: var(--code); }
     .answer code { background: var(--code); padding: 1px 4px; border-radius: 4px; }
+    .answer table { width: 100%; border-collapse: collapse; margin: 10px 0 12px; font-size: 14px; line-height: 1.5; }
+    .answer th, .answer td { border: 1px solid var(--line); padding: 7px 9px; text-align: left; vertical-align: top; }
+    .answer th { background: var(--soft); font-weight: 800; }
+    .answer tr:nth-child(even) td { background: #fafbf9; }
+    .answer hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+    .agent-process { border: 1px solid var(--line); border-radius: 8px; background: #f8fbfa; margin: 0 0 12px; overflow: hidden; }
+    .agent-process[hidden] { display: none; }
+    .agent-process summary { list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; color: var(--accent-dark); font-weight: 800; }
+    .agent-process summary::-webkit-details-marker { display: none; }
+    .agent-process-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .agent-process-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px rgba(15,118,110,.12); flex: 0 0 auto; }
+    .agent-process:not(.done) .agent-process-dot { animation: processPulse 1.3s ease-in-out infinite; }
+    .agent-process.done .agent-process-dot { background: #64748b; box-shadow: none; }
+    .agent-process-summary { color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
+    .agent-process-body { padding: 0 12px 11px; display: grid; gap: 7px; }
+    .agent-process-item { display: grid; grid-template-columns: 18px 1fr; gap: 8px; color: #2f3b37; font-size: 13px; line-height: 1.45; }
+    .agent-process-icon { color: var(--accent-dark); font-weight: 900; }
+    .agent-process-item.active .agent-process-icon { animation: processPulse 1.3s ease-in-out infinite; }
+    .agent-process-item small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; word-break: break-word; }
+    @keyframes processPulse { 0%, 100% { opacity: .42; } 50% { opacity: 1; } }
     .composer { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px; display: grid; gap: 10px; }
     .controls, .session-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
@@ -4795,6 +4932,7 @@ CHAT_HTML = r"""<!doctype html>
         <label>模式<select id="chatMode"><option value="interview" selected>面试</option><option value="study">复习</option><option value="answer">问答</option></select></label>
         <label>范围<select id="scopeType"><option value="tag">标签</option><option value="folder" selected>文件夹</option><option value="selected_notes">指定笔记</option><option value="search">搜索</option></select></label>
         <label>范围值<input id="scopeValue" value="个人/面试/agent面试" /></label>
+        <label><span>仅依据资料</span><input id="strictEvidence" type="checkbox" /></label>
       </div>
       <textarea id="query" placeholder="输入你的问题..."></textarea>
       <div id="starters" class="starter-grid"></div>
@@ -4845,6 +4983,7 @@ CHAT_HTML = r"""<!doctype html>
     let lastContextItems = [];
     let sessionContextState = {scope: null, stats: null, references: [], interviewPlan: null, profileDebug: null, trace: []};
     let currentTurnTrace = {directorNoteInjected: false};
+    let currentProcess = createAgentProcessState();
     const activeInterviewSessionKey = "knowledge_agent.active_interview_session_id";
 
     $("sendBtn").addEventListener("click", sendMessage);
@@ -4856,7 +4995,7 @@ CHAT_HTML = r"""<!doctype html>
     $("closeHistory").addEventListener("click", closeHistory);
     $("historyModal").addEventListener("click", (event) => { if (event.target === $("historyModal")) closeHistory(); });
     $("endInterview").addEventListener("click", endInterviewSession);
-    ["chatMode", "scopeType", "scopeValue"].forEach((id) => $(id).addEventListener("change", resetConversationIfNeeded));
+    ["chatMode", "scopeType", "scopeValue", "strictEvidence"].forEach((id) => $(id).addEventListener("change", resetConversationIfNeeded));
     restoreActiveInterviewSession();
 
     function resetConversationIfNeeded() {
@@ -4884,6 +5023,8 @@ CHAT_HTML = r"""<!doctype html>
       currentAssistant = appendAssistantMessage("");
       currentAssistantText = "";
       currentPayload = {router: null, retrieval: null, retrievalStatus: null, interviewPlan: null, profileDebug: null, context: null, answer: null, done: null, errors: []};
+      currentProcess = createAgentProcessState();
+      renderAgentProcess();
       setBusy(true, "Starting...");
 
       const body = buildAgentRequestBody(query);
@@ -4951,6 +5092,7 @@ CHAT_HTML = r"""<!doctype html>
         hybrid_bm25_top_k: numberValue("hybridBm25TopK"),
         rrf_k: numberValue("rrfK"),
         online_provider: $("onlineProvider").value.trim() || null,
+        strict_evidence: $("strictEvidence").checked,
         speculative_notes_search: $("speculative").checked
       };
     }
@@ -5035,8 +5177,10 @@ CHAT_HTML = r"""<!doctype html>
       currentAssistant = assistantNode;
       currentAssistantText = "";
       currentPayload = {router: null, retrieval: null, retrievalStatus: null, interviewPlan: currentInterviewPlan, profileDebug: null, context: null, answer: null, done: null, errors: []};
+      currentProcess = createAgentProcessState();
       assistantNode.querySelectorAll(".retry-answer, .assistant-extra, details.review").forEach((node) => node.remove());
       assistantNode.querySelector(".answer").innerHTML = "";
+      renderAgentProcess();
       setBusy(true, "Retrying...");
       try {
         const body = buildAgentRequestBody(query);
@@ -5109,6 +5253,7 @@ CHAT_HTML = r"""<!doctype html>
         sessionContextState.scope = data.scope || null;
         sessionContextState.stats = data.stats || null;
         sessionContextState.references = data.items || [];
+        updateProcessFromContext(data);
         renderSessionContext();
       }
       if (eventName === "interview_plan") {
@@ -5152,18 +5297,26 @@ CHAT_HTML = r"""<!doctype html>
         );
       }
       if (eventName === "agent_step") {
-        addLocalSessionTrace({
-          event: "agent_step",
-          summary: `agent step ${data.index ?? ""}: ${data.kind || ""}`,
-          details: data
-        });
+        if ($("chatMode").value === "interview") {
+          addLocalSessionTrace({
+            event: "agent_step",
+            summary: `agent step ${data.index ?? ""}: ${data.kind || ""}`,
+            details: data
+          });
+        }
+      }
+      if (eventName === "tool_started") {
+        updateProcessFromToolStarted(data);
       }
       if (eventName === "tool_result") {
-        addLocalSessionTrace({
-          event: "tool_result",
-          summary: `${data.name || "tool"}: ${data.status || ""}`,
-          details: {name: data.name || "", ok: Boolean(data.ok), status: data.status || "", latency_ms: data.latency_ms ?? null}
-        });
+        updateProcessFromToolResult(data);
+        if ($("chatMode").value === "interview") {
+          addLocalSessionTrace({
+            event: "tool_result",
+            summary: `${data.name || "tool"}: ${data.status || ""}`,
+            details: {name: data.name || "", ok: Boolean(data.ok), status: data.status || "", latency_ms: data.latency_ms ?? null}
+          });
+        }
       }
       if (eventName === "state_updated") {
         currentInterviewState = data || null;
@@ -5175,6 +5328,7 @@ CHAT_HTML = r"""<!doctype html>
         renderSessionContext();
       }
       if (eventName === "answer_delta") {
+        collapseProcessForAnswer();
         currentAssistantText += data.text || "";
         if (currentAssistant) currentAssistant.querySelector(".answer").innerHTML = renderMarkdown(currentAssistantText);
         scrollToBottom();
@@ -5188,7 +5342,13 @@ CHAT_HTML = r"""<!doctype html>
           scrollToBottom();
         }
       }
-      if (eventName === "done") { currentPayload.done = data; }
+      if (eventName === "agent_stopped") {
+        handleAgentStopped(data);
+      }
+      if (eventName === "done") {
+        currentPayload.done = data;
+        finishAgentProcess(data);
+      }
       if (eventName === "error") {
         const error = new Error(data.message || "stream error");
         error.errorType = data.error_type || "Error";
@@ -5196,6 +5356,245 @@ CHAT_HTML = r"""<!doctype html>
         error.retryable = data.retryable !== false;
         throw error;
       }
+    }
+
+    function createAgentProcessState() {
+      return {
+        visible: false,
+        done: false,
+        collapsed: false,
+        items: [],
+        readPaths: new Set(),
+        searched: 0,
+        checked: 0,
+        listed: 0,
+        online: 0,
+        clueCount: 0,
+        matchCount: 0,
+        active: null,
+        stopped: false,
+        stopReason: "",
+        stopMessage: ""
+      };
+    }
+
+    function shouldShowAgentProcess() {
+      return $("chatMode").value === "answer" && currentAssistant;
+    }
+
+    function ensureAgentProcessVisible() {
+      if (!shouldShowAgentProcess()) return false;
+      currentProcess.visible = true;
+      return true;
+    }
+
+    function updateProcessFromContext(data) {
+      if (!data || data.mode !== "answer" || !data.stats?.agent_v2) return;
+      if (!ensureAgentProcessVisible()) return;
+      const scope = data.scope || {};
+      const noteCount = Number(scope.note_count ?? data.stats?.context_items ?? 0);
+      const label = scopeLabel(scope.type, scope.value);
+      addProcessItem("确定查阅范围", `${label}${noteCount ? `，约 ${noteCount} 篇候选笔记` : ""}`);
+      renderAgentProcess();
+    }
+
+    function updateProcessFromToolStarted(data) {
+      if (!data || !data.name) return;
+      if (!ensureAgentProcessVisible()) return;
+      const args = data.arguments && typeof data.arguments === "object" ? data.arguments : {};
+      const item = plannedProcessItem(data.name, args);
+      if (!item) return;
+      currentProcess.active = {name: data.name, index: addProcessItem(item.title, item.detail, "active")};
+      renderAgentProcess();
+    }
+
+    function updateProcessFromToolResult(data) {
+      if (!data || !data.name) return;
+      if (!ensureAgentProcessVisible()) return;
+      const output = data.output && typeof data.output === "object" ? data.output : {};
+      const ok = data.ok !== false && data.status !== "error";
+      const suffix = ok ? "" : "未成功";
+      let item = null;
+      if (data.name === "search_notes") {
+        currentProcess.searched += 1;
+        currentProcess.clueCount += Number(output.result_count || 0);
+        item = ["找到相关笔记线索", `${Number(output.result_count || 0)} 条线索${sourcePathSummary(output.source_paths)}`];
+      } else if (data.name === "grep_vault") {
+        currentProcess.checked += 1;
+        currentProcess.matchCount += Number(output.result_count || 0);
+        item = ["核对关键词出现位置", `${Number(output.result_count || 0)} 处匹配${sourcePathSummary(output.source_paths)}`];
+      } else if (data.name === "list_notes") {
+        currentProcess.listed += 1;
+        item = ["浏览可用笔记", `${Number(output.result_count || 0)} 篇候选${output.truncated ? "，已截断" : ""}`];
+      } else if (data.name === "read_note") {
+        const path = String(output.path || "").trim();
+        if (path) currentProcess.readPaths.add(path);
+        const mode = String(output.mode || "").trim();
+        const sectionLabel = output.heading_path && output.heading_path.length
+          ? ` · ${output.heading_path.join(" > ")}`
+          : (output.heading ? ` · ${output.heading}` : "");
+        const modeLabel = mode === "outline" ? "，返回目录" : (mode === "section" ? "，读取章节" : "");
+        item = ["阅读笔记", `${path || "指定笔记"}${output.reason ? `：${output.reason}` : ""}${sectionLabel}${modeLabel}${output.truncated ? "，内容较长已截断" : ""}`];
+      } else if (data.name === "inspect_note") {
+        const path = String(output.path || "").trim();
+        item = ["查看笔记结构", `${path || "指定笔记"}${output.reason ? `：${output.reason}` : ""} · ${Number(output.heading_count || 0)} 个章节`];
+      } else if (data.name === "online_search") {
+        currentProcess.online += 1;
+        currentProcess.clueCount += Number(output.result_count || 0);
+        item = ["查找公开资料", `${Number(output.result_count || 0)} 条结果`];
+      } else if (!ok) {
+        item = ["调整查阅方式", suffix || "工具调用未成功"];
+      } else {
+        return;
+      }
+      finishActiveProcessItem(data.name, item[0], item[1]);
+      renderAgentProcess();
+    }
+
+    function collapseProcessForAnswer() {
+      if (!currentProcess.visible || currentProcess.collapsed) return;
+      currentProcess.collapsed = true;
+      addProcessItem("整理回答", "正在把查阅到的材料组织成回复", "active");
+      renderAgentProcess();
+    }
+
+    function handleAgentStopped(data) {
+      if (!data) return;
+      currentPayload.agentStopped = data;
+      if (ensureAgentProcessVisible()) {
+        currentProcess.stopped = true;
+        currentProcess.stopReason = String(data.reason || "");
+        currentProcess.stopMessage = String(data.message || "");
+        currentProcess.collapsed = false;
+        currentProcess.items = currentProcess.items.map((item) => item.status === "active" ? {...item, status: "done"} : item);
+        currentProcess.active = null;
+        addProcessItem("已停止继续查阅", stopReasonLabel(currentProcess.stopReason), "done");
+        renderAgentProcess();
+      }
+      const message = String(data.message || "").trim();
+      if (message && currentAssistant && !currentAssistantText.trim()) {
+        currentAssistant.querySelector(".answer").innerHTML = renderMarkdown(message);
+        scrollToBottom();
+      }
+    }
+
+    function finishAgentProcess(data) {
+      if (!currentProcess.visible) return;
+      currentProcess.done = true;
+      currentProcess.collapsed = true;
+      currentProcess.items = currentProcess.items.map((item) => item.status === "active" ? {...item, status: "done"} : item);
+      currentProcess.active = null;
+      const metrics = data?.telemetry?.derived_metrics || {};
+      if (Array.isArray(metrics.source_paths)) {
+        metrics.source_paths.forEach((path) => {
+          if (path) currentProcess.readPaths.add(String(path));
+        });
+      }
+      renderAgentProcess();
+    }
+
+    function addProcessItem(title, detail, status = "done") {
+      const last = currentProcess.items[currentProcess.items.length - 1];
+      if (last && last.title === title && last.detail === detail) return currentProcess.items.length - 1;
+      currentProcess.items.push({title, detail, status});
+      if (currentProcess.items.length > 8) currentProcess.items = currentProcess.items.slice(-8);
+      return currentProcess.items.length - 1;
+    }
+
+    function finishActiveProcessItem(toolName, title, detail) {
+      const active = currentProcess.active;
+      if (active && active.name === toolName && currentProcess.items[active.index]) {
+        currentProcess.items[active.index] = {title, detail, status: "done"};
+        currentProcess.active = null;
+        return;
+      }
+      addProcessItem(title, detail, "done");
+    }
+
+    function renderAgentProcess() {
+      if (!currentAssistant) return;
+      const node = currentAssistant.querySelector(".agent-process");
+      if (!node) return;
+      if (!currentProcess.visible || !currentProcess.items.length) {
+        node.hidden = true;
+        return;
+      }
+      node.hidden = false;
+      node.open = !currentProcess.collapsed;
+      node.classList.toggle("done", Boolean(currentProcess.done));
+      const summary = processSummary();
+      node.innerHTML = `
+        <summary>
+          <span class="agent-process-title"><span class="agent-process-dot"></span><span>${currentProcess.done ? "已完成资料查阅" : "正在查阅资料"}</span></span>
+          <span class="agent-process-summary">${escapeHtml(summary)}</span>
+        </summary>
+        <div class="agent-process-body">
+          ${currentProcess.items.map((item) => `
+            <div class="agent-process-item ${item.status === "active" ? "active" : ""}">
+              <span class="agent-process-icon">${item.status === "active" ? "•" : "✓"}</span>
+              <span>${escapeHtml(item.title)}${item.detail ? `<small>${escapeHtml(item.detail)}</small>` : ""}</span>
+            </div>
+          `).join("")}
+        </div>
+      `;
+      applyStoppedProcessTitle(node);
+    }
+
+    function applyStoppedProcessTitle(node) {
+      if (!currentProcess.stopped || !node) return;
+      const titleNode = node.querySelector(".agent-process-title span:last-child");
+      if (titleNode) titleNode.textContent = "已停止继续查阅";
+      const summaryNode = node.querySelector(".agent-process-summary");
+      if (summaryNode) summaryNode.textContent = stopReasonLabel(currentProcess.stopReason);
+    }
+
+    function processSummary() {
+      const parts = [];
+      const evidenceCount = currentProcess.clueCount + currentProcess.matchCount;
+      if (evidenceCount) parts.push(`找到 ${evidenceCount} 条线索`);
+      if (currentProcess.readPaths.size) parts.push(`已阅读 ${currentProcess.readPaths.size} 篇笔记`);
+      if (currentProcess.online) parts.push("包含公开资料");
+      if (!parts.length && currentProcess.active) return "正在查阅";
+      return parts.length ? parts.join("，") : "准备中";
+    }
+
+    function stopReasonLabel(reason) {
+      if (reason === "max_steps") return "\u8fbe\u5230\u672c\u8f6e\u6b65\u9aa4\u4e0a\u9650";
+      if (reason === "tool_timeout") return "\u5de5\u5177\u8c03\u7528\u8d85\u65f6";
+      if (reason === "tool_error") return "\u5de5\u5177\u8c03\u7528\u5931\u8d25";
+      if (reason === "llm_error") return "\u6a21\u578b\u8c03\u7528\u5931\u8d25";
+      return reason ? `\u505c\u6b62\u539f\u56e0\uff1a${reason}` : "\u5df2\u505c\u6b62";
+    }
+
+    function plannedProcessItem(name, args) {
+      if (name === "search_notes") return ["查找相关笔记", queryDetail(args.query)];
+      if (name === "grep_vault") return ["核对关键词出现位置", queryDetail(args.query)];
+      if (name === "list_notes") return ["浏览可用笔记", args.filter ? `筛选：${args.filter}` : "查看当前范围内可用笔记"];
+      if (name === "read_note") return ["阅读笔记", `${String(args.path || "指定笔记")}${args.reason ? `：${args.reason}` : ""}${args.heading ? ` · ${args.heading}` : ""}`];
+      if (name === "inspect_note") return ["查看笔记结构", `${String(args.path || "指定笔记")}${args.reason ? `：${args.reason}` : ""}`];
+      if (name === "online_search") return ["查找公开资料", queryDetail(args.query)];
+      return null;
+    }
+
+    function queryDetail(query) {
+      const text = String(query || "").trim();
+      return text ? `关键词：${text.slice(0, 80)}` : "";
+    }
+
+    function sourcePathSummary(paths) {
+      if (!Array.isArray(paths) || !paths.length) return "";
+      const unique = Array.from(new Set(paths.map((path) => String(path || "").trim()).filter(Boolean)));
+      if (!unique.length) return "";
+      return `，涉及 ${unique.slice(0, 3).join("、")}${unique.length > 3 ? " 等" : ""}`;
+    }
+
+    function scopeLabel(type, value) {
+      if (type === "selected_notes") return "指定笔记";
+      if (type === "folder") return `文件夹 ${value || ""}`.trim();
+      if (type === "tag") return `标签 ${value || ""}`.trim();
+      if (type === "search") return `搜索范围 ${value || ""}`.trim();
+      if (type === "all_vault") return "全库";
+      return "当前范围";
     }
 
     function renderInterviewPlan(plan) {
@@ -5714,12 +6113,14 @@ CHAT_HTML = r"""<!doctype html>
       const signals = Array.isArray(summary.profile_signals) ? summary.profile_signals : [];
       addLocalSessionTrace({
         event: "turn_review_completed",
-        summary: `turn_review completed: ${signals.length} profile signal(s)`,
+        summary: "turn_review completed: profile via session_end_extractor",
         details: {
           user_message_id: turnIds.user.id,
           assistant_message_id: turnIds.assistant.id,
           profile_signal_count: signals.length,
-          profile_signal_types: signals.map((signal) => signal.type || "").filter(Boolean)
+          profile_signal_types: signals.map((signal) => signal.type || "").filter(Boolean),
+          profile_signals_disabled: true,
+          profile_write_source: "session_end_extractor"
         }
       });
     }
@@ -5979,7 +6380,7 @@ CHAT_HTML = r"""<!doctype html>
     function appendAssistantMessage(text = "") {
       const node = document.createElement("article");
       node.className = "message assistant";
-      node.innerHTML = `<div class="role">Assistant</div><div class="answer">${text ? renderMarkdown(text) : ""}</div>`;
+      node.innerHTML = `<div class="role">Assistant</div><details class="agent-process" hidden open></details><div class="answer">${text ? renderMarkdown(text) : ""}</div>`;
       messages.appendChild(node);
       scrollToBottom();
       return node;
@@ -6003,14 +6404,46 @@ CHAT_HTML = r"""<!doctype html>
       const lines = safe.split(/\r?\n/);
       const html = [];
       let list = [];
-      const flush = () => { if (list.length) { html.push(`<ul>${list.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</ul>`); list = []; } };
-      for (const line of lines) {
+      let orderedList = [];
+      const flush = () => {
+        if (list.length) { html.push(`<ul>${list.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</ul>`); list = []; }
+        if (orderedList.length) { html.push(`<ol>${orderedList.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</ol>`); orderedList = []; }
+      };
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
         const trimmed = line.trim();
-        if (!trimmed) { flush(); continue; }
+        if (!trimmed) {
+          const previous = lines[i - 1] ? lines[i - 1].trim() : "";
+          const next = lines[i + 1] ? lines[i + 1].trim() : "";
+          if (isTableRow(previous) && isTableRow(next)) continue;
+          flush();
+          continue;
+        }
+        if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) { flush(); html.push("<hr>"); continue; }
         const heading = /^(#{1,4})\s+(.+)$/.exec(trimmed);
         if (heading) { flush(); html.push(`<h${Math.min(heading[1].length + 1, 5)}>${inlineMarkdown(heading[2])}</h${Math.min(heading[1].length + 1, 5)}>`); continue; }
+        if (isTableRow(trimmed) && isTableSeparator(lines[i + 1] ? lines[i + 1].trim() : "")) {
+          flush();
+          const rows = [trimmed];
+          i += 2;
+          while (i < lines.length) {
+            const row = lines[i].trim();
+            if (!row) {
+              const next = lines[i + 1] ? lines[i + 1].trim() : "";
+              if (isTableRow(next)) { i += 1; continue; }
+              break;
+            }
+            if (!isTableRow(row)) { i -= 1; break; }
+            rows.push(row);
+            i += 1;
+          }
+          html.push(renderMarkdownTable(rows));
+          continue;
+        }
         const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
-        if (bullet) { list.push(bullet[1]); continue; }
+        if (bullet) { if (orderedList.length) flush(); list.push(bullet[1]); continue; }
+        const ordered = /^\d+[.)]\s+(.+)$/.exec(trimmed);
+        if (ordered) { if (list.length) flush(); orderedList.push(ordered[1]); continue; }
         flush();
         html.push(`<p>${inlineMarkdown(trimmed)}</p>`);
       }
@@ -6018,6 +6451,35 @@ CHAT_HTML = r"""<!doctype html>
       let rendered = html.join("");
       codeBlocks.forEach((block, index) => { rendered = rendered.replace(`@@CODE_${index}@@`, block); });
       return rendered;
+    }
+
+    function isTableRow(text) {
+      const value = String(text || "").trim();
+      return value.includes("|") && /^\|?.+\|.+\|?$/.test(value);
+    }
+
+    function isTableSeparator(text) {
+      const cells = splitTableRow(text);
+      return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+    }
+
+    function splitTableRow(text) {
+      let value = String(text || "").trim();
+      if (!value.includes("|")) return [];
+      if (value.startsWith("|")) value = value.slice(1);
+      if (value.endsWith("|")) value = value.slice(0, -1);
+      return value.split("|").map((cell) => cell.trim());
+    }
+
+    function renderMarkdownTable(rows) {
+      const header = splitTableRow(rows[0]);
+      const body = rows.slice(1).map(splitTableRow).filter((cells) => cells.length);
+      const headerHtml = header.map((cell) => `<th>${inlineMarkdown(cell)}</th>`).join("");
+      const bodyHtml = body.map((cells) => {
+        const padded = header.length ? cells.concat(Array(Math.max(0, header.length - cells.length)).fill("")) : cells;
+        return `<tr>${padded.slice(0, Math.max(header.length, cells.length)).map((cell) => `<td>${inlineMarkdown(cell)}</td>`).join("")}</tr>`;
+      }).join("");
+      return `<table><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>`;
     }
 
     function inlineMarkdown(text) {
@@ -6044,7 +6506,7 @@ CHAT_HTML = r"""<!doctype html>
 
     function numberValue(id) { return Number($(id).value); }
     function scopePaths() { return $("scopeType").value === "selected_notes" ? $("scopeValue").value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) : []; }
-    function conversationSignature() { return JSON.stringify({mode:$("chatMode").value, scopeType:$("scopeType").value, scopeValue:$("scopeValue").value.trim(), scopePaths:scopePaths()}); }
+    function conversationSignature() { return JSON.stringify({mode:$("chatMode").value, scopeType:$("scopeType").value, scopeValue:$("scopeValue").value.trim(), scopePaths:scopePaths(), strictEvidence:$("strictEvidence").checked}); }
     function scrollToBottom() { messages.scrollTop = messages.scrollHeight; }
     function escapeHtml(value) { return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;"); }
   </script>

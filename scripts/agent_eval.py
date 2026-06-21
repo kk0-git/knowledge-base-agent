@@ -15,7 +15,14 @@ if str(PROJECT_SRC) not in sys.path:
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from agent.apps import CoachTurnRequest, InterviewCoachApp, InterviewInterviewerApp, InterviewTurnRequest
+from agent.apps import (
+    CoachTurnRequest,
+    InterviewCoachApp,
+    InterviewInterviewerApp,
+    InterviewTurnRequest,
+    LibrarianApp,
+    LibrarianRequest,
+)
 from agent.interview.state import build_interview_state_machine
 from agent.runtime import AgentRuntime
 from agent.skill_loader import SkillLoader
@@ -69,6 +76,8 @@ def run_case(*, case: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 actual = eval_coach(case=case, root=root, out_dir=out_dir)
             elif case_type == "memory_commit":
                 actual = eval_memory_commit(root=root)
+            elif case_type == "librarian":
+                actual = eval_librarian(case=case, root=root, out_dir=out_dir)
             else:
                 raise ValueError(f"unsupported case type: {case_type}")
             passed, failures = match_expectations(actual, case.get("expect") or {})
@@ -122,6 +131,38 @@ def eval_interviewer(*, case: dict[str, Any], root: Path, out_dir: Path) -> dict
         "tool_sequence": tool_sequence,
         "trace_path": result.trace_path,
         "stopped_reason": result.stopped_reason,
+    }
+
+
+def eval_librarian(*, case: dict[str, Any], root: Path, out_dir: Path) -> dict[str, Any]:
+    vault_root = root / "vault"
+    vault_root.mkdir()
+    (vault_root / "redis.md").write_text("# Redis Stream\nUse XREADGROUP for consumer groups.", encoding="utf-8")
+    (vault_root / "mcp.md").write_text("# MCP\nHost, client, and server are separate roles.", encoding="utf-8")
+    runtime = build_runtime(trace_dir=out_dir / "traces")
+    app = LibrarianApp(runtime)
+    scope_type = str(case.get("scope_type") or "all_vault")
+    scope_note_paths = tuple(case.get("scope_note_paths") or ())
+    selected_note_paths = tuple(case.get("selected_note_paths") or ())
+    result = app.run(
+        LibrarianRequest(
+            query=str(case.get("input") or "How does Redis Stream work?"),
+            scope_type=scope_type,
+            scope_note_paths=scope_note_paths,
+            selected_note_paths=selected_note_paths,
+            vault_root=vault_root,
+            rag_manager=FileScanRAGManager(vault_root),
+            model="debug-fake",
+            tool_mode="json",
+            trace_path=str(out_dir / "traces"),
+        )
+    )
+    metrics = result.state.working.extra.get("derived_metrics") or {}
+    return {
+        **metrics,
+        "trace_path": result.trace_path,
+        "stopped_reason": result.stopped_reason,
+        "schema_valid": bool(result.final_answer),
     }
 
 
@@ -257,12 +298,14 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "over_search": 0,
         "signal_count": 0,
         "schema_valid": 0,
+        "online_used": 0,
+        "search_count": 0,
     }
     for result in results:
         actual = result.get("actual") or {}
-        for key in ["routine_state_fetch", "tool_call_count", "notes_read", "profile_recalled", "signal_count"]:
+        for key in ["routine_state_fetch", "tool_call_count", "notes_read", "profile_recalled", "signal_count", "search_count"]:
             totals[key] += int(actual.get(key) or 0)
-        for key in ["layer_advanced", "topic_selected", "over_search", "schema_valid"]:
+        for key in ["layer_advanced", "topic_selected", "over_search", "schema_valid", "online_used"]:
             totals[key] += 1 if actual.get(key) else 0
     return totals
 

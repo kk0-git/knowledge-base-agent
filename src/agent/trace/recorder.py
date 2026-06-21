@@ -63,6 +63,7 @@ def build_trace_payload(
             "model": config.model,
             "tool_mode": config.tool_mode,
             "stream_final": config.stream_final,
+            "reserve_final_step": config.reserve_final_step,
         },
         "input": {
             "summary": truncate_text(user_input, 500),
@@ -82,6 +83,7 @@ def build_trace_payload(
             "total_ms": result.total_ms,
             "error": result.error,
             "error_type": result.error_type,
+            "metadata": to_jsonable(result.metadata),
         },
     }
 

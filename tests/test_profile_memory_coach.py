@@ -244,8 +244,12 @@ class CoachAgentTests(unittest.TestCase):
             reviews = session_store.load_reviews(session["session_id"])["reviews"]
             self.assertEqual(len(reviews), 1)
             self.assertEqual(reviews[0]["profile_signals"], [])
+            self.assertTrue(reviews[0]["memory_policy"]["profile_signals_disabled"])
+            self.assertEqual(reviews[0]["memory_policy"]["profile_write_source"], "session_end_extractor")
             payload = json.loads(Path(result.trace_path).read_text(encoding="utf-8"))
             self.assertEqual(payload["memory"]["profile_signal_count"], 0)
+            self.assertTrue(payload["memory"]["profile_signals_disabled"])
+            self.assertEqual(payload["memory"]["profile_write_source"], "session_end_extractor")
 
     def test_memory_commit_bridge_consumes_legacy_session_signals_and_drafts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

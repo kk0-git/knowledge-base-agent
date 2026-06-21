@@ -13,7 +13,7 @@ if str(PROJECT_SRC) not in sys.path:
 
 from agent.apps import InterviewInterviewerApp, InterviewTurnRequest
 from agent.apps.interview_interviewer import build_interviewer_runtime_context, build_turn_input
-from agent.interview.state import TOPIC_CLOSING, build_interview_state_machine, interview_state_from_payload
+from agent.interview.state import TOPIC_CLOSING, build_interview_state_machine, extract_last_question, interview_state_from_payload
 from agent.llm.tool_calling import LLMToolRequest, LLMToolResponse, OpenAICompatibleToolCallingClient
 from agent.runtime import AgentRuntime
 from agent.schema import ToolCall, WorkingMemory
@@ -181,6 +181,17 @@ class InterviewOpeningMessageTests(unittest.TestCase):
 
 
 class InterviewStateMachineTests(unittest.TestCase):
+    def test_extract_last_question_supports_fullwidth_halfwidth_and_fallback(self) -> None:
+        self.assertEqual(extract_last_question("你能解释一下吗？"), "你能解释一下吗？")
+        self.assertEqual(extract_last_question("What is MCP?"), "What is MCP?")
+        self.assertEqual(extract_last_question("第一问? 第二问？"), "第二问？")
+        fallback = extract_last_question("请你区分 Host、Client、Server 三者职责")
+        self.assertEqual(fallback, "请你区分 Host、Client、Server 三者职责")
+        long_text = "a" * 200
+        self.assertTrue(extract_last_question(long_text).endswith("..."))
+        self.assertLess(len(extract_last_question(long_text)), len(long_text))
+        self.assertEqual(extract_last_question(""), "")
+
     def test_initialize_awaits_topic_selection_and_select_topic(self) -> None:
         machine = build_interview_state_machine(plan=sample_plan(), session_id="s1")
         snapshot = machine.snapshot()
@@ -192,8 +203,28 @@ class InterviewStateMachineTests(unittest.TestCase):
         self.assertEqual(machine.snapshot()["current_topic"], "MCP ??")
         self.assertEqual(machine.snapshot()["topic_phase"], "active")
         self.assertEqual(machine.snapshot()["current_layer_name"], "????")
-        machine.commit_turn(user_text="answer", assistant_text="?????")
+        machine.commit_turn(user_text="answer", assistant_text="你能解释这一层吗？")
         self.assertEqual(machine.snapshot()["follow_up_count"], 1)
+        self.assertEqual(machine.snapshot()["last_assistant_question"], "你能解释这一层吗？")
+        self.assertEqual(machine.snapshot()["sub_points_touched"], ["你能解释这一层吗？"])
+
+    def test_commit_turn_tracks_assistant_anchor_and_dedupes_sub_points(self) -> None:
+        machine = build_interview_state_machine(plan=sample_plan(), session_id="s1")
+        machine.select_topic(name="MCP ??", reason="start", source="test")
+        machine.commit_turn(user_text="answer 1", assistant_text="第一问？")
+        machine.commit_turn(user_text="answer 2", assistant_text="第一问？")
+        self.assertEqual(machine.snapshot()["follow_up_count"], 2)
+        self.assertEqual(machine.snapshot()["sub_points_touched"], ["第一问？"])
+        machine.commit_turn(user_text="answer 3", assistant_text="请你区分 Host、Client、Server 三者职责")
+        snapshot = machine.snapshot()
+        self.assertEqual(snapshot["last_assistant_question"], "请你区分 Host、Client、Server 三者职责")
+        self.assertEqual(snapshot["sub_points_touched"][-1], snapshot["last_assistant_question"])
+
+    def test_commit_turn_does_not_increment_when_topic_not_active(self) -> None:
+        machine = build_interview_state_machine(plan=sample_plan(), session_id="s1")
+        machine.commit_turn(user_text="answer", assistant_text="还没选 topic 吗？")
+        self.assertEqual(machine.snapshot()["topic_phase"], "awaiting_selection")
+        self.assertEqual(machine.snapshot()["follow_up_count"], 0)
 
     def test_legacy_payload_and_transition_threshold(self) -> None:
         state = interview_state_from_payload({"current_topic": "MCP ??", "current_layer_index": 1, "follow_up_count": 4}, plan=sample_plan())
@@ -590,6 +621,8 @@ class InterviewerRuntimeTests(unittest.TestCase):
             self.assertEqual(updated["interview_state"]["source"], "server")
             self.assertEqual(updated["agent"]["skill"], "interviewer")
             self.assertEqual(updated["agent"]["traces"][0]["trace_id"], "agent-test")
+            trace = store.load_session(session["session_id"])["trace"]
+            self.assertEqual(trace[-1]["details"]["state_phase"], "post_agent_commit")
 
 
 if __name__ == "__main__":
