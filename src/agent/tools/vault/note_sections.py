@@ -4,15 +4,11 @@ from pathlib import Path
 from typing import Any
 
 from agent.tool_executor import ToolExecutionContext
-from agent.tools.vault.guards import require_scope_allowed, resolve_vault_note_path, truncate_text
-from services.markdown.sections import (
-    build_note_outline,
-    child_sections,
-    find_sections,
-)
+from agent.tools.vault.guards import require_scope_allowed, resolve_vault_note_path
+from services.markdown.sections import build_section_map, find_sections
 
 
-SHORT_NOTE_CHAR_THRESHOLD = 2500
+DEFAULT_READ_MAX_CHARS = 4000
 
 
 def load_scoped_note_text(path: str, ctx: ToolExecutionContext) -> tuple[str, str]:
@@ -64,77 +60,75 @@ def resolve_target_section(
     return matches[0]
 
 
-def build_section_read_output(
-    *,
-    relative: str,
-    section,
-    max_chars: int,
-    reason: str,
-    all_sections: list,
-) -> dict[str, Any]:
-    content = section.content
-    truncated_content, truncated = truncate_text(content, max_chars)
-    child_headings = [
-        {
-            "section_id": child.section_id(),
-            "heading": child.heading,
-            "heading_path": child.heading_path,
-            "start_line": child.start_line,
-            "end_line": child.end_line,
-        }
-        for child in child_sections(section, all_sections)
-    ]
-    return {
-        "path": relative,
-        "title": Path(relative).stem,
-        "mode": "section",
-        "section_id": section.section_id(),
-        "heading": section.heading,
-        "heading_path": list(section.heading_path),
-        "reason": reason,
-        "content": truncated_content,
-        "start_line": section.start_line,
-        "end_line": section.end_line,
-        "char_count": section.char_count,
-        "truncated": truncated,
-        "child_headings": child_headings,
-        "hint": "Section is still long; read a child section with section_id or heading_path."
-        if truncated or child_headings
-        else "",
-    }
+def char_slice_to_line_range(text: str, start: int, end: int) -> tuple[int, int]:
+    if not text or start >= len(text):
+        line = text.count("\n") + 1 if text else 1
+        return line, line
+    start_line = text.count("\n", 0, start) + 1
+    end_line = text.count("\n", 0, max(start, end - 1)) + 1
+    return start_line, end_line
 
 
-def build_full_read_output(*, relative: str, text: str, max_chars: int, reason: str) -> dict[str, Any]:
-    content = text.strip()
-    truncated_content, truncated = truncate_text(content, max_chars)
-    return {
-        "path": relative,
-        "title": Path(relative).stem,
-        "mode": "full",
-        "reason": reason,
-        "content": truncated_content,
-        "char_count": len(content),
-        "truncated": truncated,
-    }
-
-
-def build_outline_read_output(
+def build_read_note_output(
     *,
     relative: str,
     text: str,
+    sections: list,
+    max_chars: int,
+    offset: int,
     reason: str,
-    preview_chars: int = 120,
+    section: Any | None = None,
 ) -> dict[str, Any]:
-    outline = build_note_outline(
-        path=relative,
-        title=Path(relative).stem,
-        text=text,
-        preview_chars=preview_chars,
-    )
-    outline["mode"] = "outline"
-    outline["reason"] = reason
-    outline["hint"] = (
-        "Note is long; this is the outline only. "
-        "Use read_note with heading, heading_path, or section_id to read specific sections."
-    )
-    return outline
+    if section is not None:
+        window = "\n".join(section.lines)
+        line_offset = section.start_line - 1
+        active_section = section
+    else:
+        window = text
+        line_offset = 0
+        active_section = None
+
+    window_char_count = len(window)
+    total_char_count = len(text)
+    start = max(0, int(offset))
+    end = min(len(window), start + max_chars)
+    content = window[start:end]
+    truncated = end < len(window)
+    returned_chars = len(content)
+
+    rel_start, rel_end = char_slice_to_line_range(window, start, end)
+    start_line = rel_start + line_offset
+    end_line = rel_end + line_offset
+
+    output: dict[str, Any] = {
+        "path": relative,
+        "title": Path(relative).stem,
+        "reason": reason,
+        "content": content,
+        "truncated": truncated,
+        "offset": start,
+        "returned_chars": returned_chars,
+        "window_char_count": window_char_count,
+        "total_char_count": total_char_count,
+        "start_line": start_line,
+        "end_line": end_line,
+        "section_id": active_section.section_id() if active_section else "",
+        "heading": active_section.heading if active_section else "",
+        "heading_path": list(active_section.heading_path) if active_section else [],
+    }
+
+    if truncated:
+        output["next_offset"] = end
+        output["sections"] = build_section_map(sections)
+        if active_section is not None:
+            output["hint"] = (
+                f"Section content was truncated. Continue with offset={end}, "
+                "or read another section_id from sections."
+            )
+        else:
+            output["hint"] = (
+                f"Note content was truncated. Continue with offset={end}, "
+                "or jump to a section_id from sections."
+            )
+
+    return output

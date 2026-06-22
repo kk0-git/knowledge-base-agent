@@ -13,7 +13,7 @@ from agent.serialization import to_jsonable
 from agent.tool_executor import ToolExecutionContext
 
 
-LOCAL_TOOLS = ["grep_vault", "inspect_note", "list_notes", "read_note", "search_notes"]
+LOCAL_TOOLS = ["grep_vault", "list_notes", "read_note", "search_notes"]
 SCOPE_INDEX_COMPLETE_LIMIT = 30
 
 
@@ -22,6 +22,7 @@ class LibrarianBudget:
     effort_level: str
     max_steps: int
     allowed_tools: list[str]
+    disabled_tools: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -67,6 +68,7 @@ class LibrarianApp:
             scope_type=request.scope_type,
             scope_value=request.scope_value,
             online_search_client=request.online_search_client if request.online_enabled else None,
+            metadata={"collect_citations": True},
             turn_context={"runtime_context": runtime_context},
         )
         result = self.runtime.run(
@@ -79,12 +81,14 @@ class LibrarianApp:
                 tool_mode=request.tool_mode,  # type: ignore[arg-type]
                 trace_path=request.trace_path,
                 allowed_tools=budget.allowed_tools,
+                disabled_tools=budget.disabled_tools,
             ),
             user_input=build_librarian_input(request=request, runtime_context=runtime_context),
             state=state,
             tool_context=tool_context,
             event_sink=event_sink,
         )
+        result.state.working.extra["citations"] = list(tool_context.citations)
         result.state.working.extra["derived_metrics"] = derive_librarian_metrics(result)
         return result
 
@@ -138,50 +142,44 @@ class LibrarianApp:
                     "command": "LibrarianAgentV2",
                     "agent_v2": True,
                     "derived_metrics": result.state.working.extra.get("derived_metrics", {}),
+                    "citations": result.state.working.extra.get("citations", []),
                     "total_ms": result.total_ms,
                 },
             },
         }
 
 
-def build_librarian_fallback(result: Any) -> dict[str, Any]:
+def build_librarian_degraded_fallback(result: Any) -> dict[str, Any]:
     if result.final_answer or result.stopped_reason != "max_steps":
         return {}
+
     successful_results = [
         tool_result
         for step in result.steps
         for tool_result in step.tool_results
         if tool_result.ok
     ]
-    source_paths = sorted(
-        {
-            str(path)
-            for step in result.steps
-            for tool_result in step.tool_results
-            if isinstance(tool_result.output, dict)
-            for path in (
-                list(tool_result.output.get("source_paths") or [])
-                + ([tool_result.output.get("path")] if tool_result.output.get("path") else [])
-            )
-            if path
-        }
-    )
+    source_paths = collect_librarian_source_paths(result)
+    fallback_reason = str(result.metadata.get("fallback_reason") or result.error_type or "max_steps")
+
     if successful_results:
+        evidence_summary = summarize_librarian_observations(successful_results)
         source_line = ""
         if source_paths:
             source_line = "\n\n已查阅/命中的资料：" + "、".join(source_paths[:5])
             if len(source_paths) > 5:
-                source_line += " 等"
+                source_line += f" 等 {len(source_paths)} 项"
         message = (
-            "本轮查阅已达到步骤上限，未能生成完整回答。"
+            "本轮查阅已触达运行边界，未能生成完整回答。"
             "我先基于已完成的资料查阅给出阶段性结果；你可以继续追问，我会接着当前问题收敛。"
-            f"{source_line}"
+            f"{source_line}{evidence_summary}"
         )
     else:
         message = (
-            "本轮查阅已达到步骤上限，且没有获得可用资料结果。"
+            "本轮查阅已触达运行边界，且没有获得可用资料结果。"
             "请缩小范围、改写问题，或稍后重试。"
         )
+
     return {
         "answer": message,
         "stopped": {
@@ -190,8 +188,51 @@ def build_librarian_fallback(result: Any) -> dict[str, Any]:
             "trace_path": result.trace_path,
             "recoverable": True,
             "partial": bool(successful_results),
+            "fallback_reason": fallback_reason,
         },
     }
+
+
+def collect_librarian_source_paths(result: Any) -> list[str]:
+    paths = {
+        str(path)
+        for step in result.steps
+        for tool_result in step.tool_results
+        if isinstance(tool_result.output, dict)
+        for path in (
+            list(tool_result.output.get("source_paths") or [])
+            + ([tool_result.output.get("path")] if tool_result.output.get("path") else [])
+        )
+        if path
+    }
+    return sorted(paths)
+
+
+def summarize_librarian_observations(tool_results: list[Any]) -> str:
+    lines: list[str] = []
+    for tool_result in tool_results:
+        output = tool_result.output if isinstance(tool_result.output, dict) else {}
+        name = str(tool_result.name or "")
+        if name == "read_note":
+            path = str(output.get("path") or "")
+            content = str(output.get("content") or "").strip().replace("\n", " ")
+            preview = content[:180] + ("..." if len(content) > 180 else "")
+            lines.append(f"- 已阅读 {path}: {preview}" if preview else f"- 已阅读 {path}")
+        elif name in {"search_notes", "grep_vault"}:
+            query = str(output.get("query") or "")
+            count = output.get("result_count", 0)
+            sources = ", ".join(str(path) for path in (output.get("source_paths") or [])[:3])
+            suffix = f"，涉及 {sources}" if sources else ""
+            lines.append(f"- {name} 查询 `{query}` 找到 {count} 条结果{suffix}")
+        if len(lines) >= 6:
+            break
+    if not lines:
+        return ""
+    return "\n\n阶段性依据：\n" + "\n".join(lines)
+
+
+def build_librarian_fallback(result: Any) -> dict[str, Any]:
+    return build_librarian_degraded_fallback(result)
 
 
 def route_librarian_scope(*, scope_type: str, online_enabled: bool) -> LibrarianBudget:
@@ -290,17 +331,26 @@ def build_librarian_input(*, request: LibrarianRequest, runtime_context: dict[st
             request.query,
             "",
             "# Task",
-            "Answer the user using the bounded librarian tool loop. Respect scope and evidence policy.",
+            "Answer the user's question. Use tools only when note facts are needed; stop retrieving once you can answer.",
         ]
     )
     return "\n\n".join(sections)
 
 
 def derive_librarian_metrics(result: Any) -> dict[str, Any]:
-    tool_names = [call.name for step in result.steps for call in step.tool_calls]
+    tool_names: list[str] = []
+    grep_count = 0
+    verification_search_count = 0
     read_paths: set[str] = set()
     source_paths: set[str] = set()
+    seen_read = False
     for step in result.steps:
+        for call in step.tool_calls:
+            tool_names.append(call.name)
+            if call.name == "grep_vault":
+                grep_count += 1
+            elif call.name == "search_notes" and seen_read:
+                verification_search_count += 1
         for tool_result in step.tool_results:
             output = tool_result.output if isinstance(tool_result.output, dict) else {}
             for path in output.get("source_paths") or []:
@@ -308,11 +358,14 @@ def derive_librarian_metrics(result: Any) -> dict[str, Any]:
             if tool_result.name == "read_note" and tool_result.ok and output.get("path"):
                 read_paths.add(str(output.get("path")))
                 source_paths.add(str(output.get("path")))
+                seen_read = True
     return {
         "tool_call_count": len(tool_names),
         "tool_sequence": tool_names,
         "notes_read": len(read_paths),
         "source_paths": sorted(source_paths),
         "online_used": "online_search" in tool_names,
+        "grep_count": grep_count,
+        "verification_search_count": verification_search_count,
         "search_count": sum(1 for name in tool_names if name in {"search_notes", "grep_vault", "list_notes"}),
     }

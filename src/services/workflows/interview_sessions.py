@@ -223,6 +223,7 @@ class InterviewSessionStore:
         interview_plan: dict[str, Any] | None = None,
         interview_state: dict[str, Any] | None = None,
         source_note_paths: list[str] | tuple[str, ...] | None = None,
+        agent_actions: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         session = self.load_session(session_id)
         if session.get("status") not in {"active", "end_failed"}:
@@ -242,6 +243,8 @@ class InterviewSessionStore:
             "content": assistant_content,
             "created_at": now,
         }
+        if agent_actions is not None:
+            assistant_message["agent_actions"] = list(agent_actions)
         messages.extend([user_message, assistant_message])
 
         if interview_plan is not None:
@@ -270,6 +273,7 @@ class InterviewSessionStore:
                 "user_message_id": user_message["id"],
                 "assistant_message_id": assistant_message["id"],
                 "assistant_output_chars": len(assistant_content or ""),
+                "agent_action_count": len(agent_actions or []),
                 "state_phase": "pre_agent_commit",
                 "interview_state": interview_state or {},
                 **interview_state_trace_summary(interview_state),
@@ -345,6 +349,7 @@ class InterviewSessionStore:
         interview_plan: dict[str, Any] | None = None,
         interview_state: dict[str, Any] | None = None,
         source_note_paths: list[str] | tuple[str, ...] | None = None,
+        agent_actions: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         session = self.load_session(session_id)
         message = self._find_message(session, assistant_message_id, role="assistant")
@@ -354,6 +359,8 @@ class InterviewSessionStore:
         message["error_type"] = ""
         message["error_message"] = ""
         message["retryable"] = False
+        if agent_actions is not None:
+            message["agent_actions"] = list(agent_actions)
         message["updated_at"] = now
         self._update_session_context(
             session,
@@ -372,6 +379,7 @@ class InterviewSessionStore:
             details={
                 "assistant_message_id": assistant_message_id,
                 "output_chars": len(assistant_content or ""),
+                "agent_action_count": len(agent_actions or []),
                 "interview_state": interview_state or {},
             },
         )

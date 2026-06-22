@@ -1,32 +1,55 @@
-# Librarian 结构化读取工具设计
+# Librarian Read Tools Design
 
-> 将 vault 读取从「前 N 字符截断」升级为「先结构、再按 section 精读」。
+> 单一 `read_note` 工具：永远返回正文，固定字符预算，section_id 主续读，offset 节内翻页。
 
-## 工具层
+## 工具
 
 | 工具 | 用途 |
 |------|------|
-| `inspect_note` | 返回 path/title/char_count/sections（含 preview、line range、section_id） |
-| `read_note` | Smart entry：短笔记 `mode=full`；长笔记 `mode=outline`；带 `heading` / `heading_path` / `section_id` 时 `mode=section` |
+| `read_note` | 读取笔记正文；截断时附带 `sections` 导航 map |
 
-## 共享解析器
+已删除 `inspect_note`：结构导航合并进 `read_note` 的截断响应。
 
-- `src/services/markdown/sections.py`
-- RAG chunker 与 agent tools 共用 `split_markdown_sections` / `parse_markdown_sections`
-- Section 定位失败返回 error，不再 silent fallback 到全文
+## 契约
 
-## Agent 决策链（SKILL）
+### 参数
+
+| 参数 | 说明 |
+|------|------|
+| `path` | 必填 |
+| `section_id` | 主定位：跳转到指定 section |
+| `heading` / `heading_path` | 便捷定位（解析为 section） |
+| `offset` | 字符偏移，相对当前阅读窗口 |
+| `max_chars` | 默认 4000 |
+| `reason` | trace / 前端展示 |
+
+### 响应
+
+- **永远有** `content`
+- `truncated=true` 时附带 `sections`、`next_offset`、`hint`
+- 无 `mode` 分支（不再 full / outline / section）
+
+### 阅读窗口
+
+1. 有 `section_id` / `heading` / `heading_path` → section 内容
+2. 否则 → 整篇笔记
+
+### 分页
+
+在窗口内按字符 `offset` + `max_chars` 切片。截断时 `next_offset` 供续读。
+
+## Agent 决策链
 
 ```
-search/grep 命中
-  → inspect_note 或 read_note(path) 获取 outline
-  → read_note(section) 精读 1-3 个相关章节
-  → 回答
+read_note(path) → 正文（可能截断）+ sections（若截断）
+  → section_id 跳节 / offset 续读
 ```
 
-## 阈值
+## 设计原则
 
-- `SHORT_NOTE_CHAR_THRESHOLD = 2500`：低于此值 `read_note` 直接返回全文
+- 工具行为固定、可预测（对齐 Cursor / Claude Code）
+- 不在工具层按字数自动切换 outline 模式
+- `scope_index`（note 级）+ `sections`（note 内）两级导航
 
 ## 延后
 

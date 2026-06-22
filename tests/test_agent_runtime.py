@@ -17,6 +17,8 @@ from agent.llm.tool_calling import (
     LLMToolRequest,
     LLMToolResponse,
     OpenAICompatibleToolCallingClient,
+    has_dsml_tool_intent,
+    parse_dsml_tool_calls,
     parse_json_object,
     parse_fallback_tool_calls,
 )
@@ -62,6 +64,44 @@ class ReserveAwareToolLLM:
             return LLMToolResponse(content="forced final from observations", finish_reason="stop", used_mode="fake")
         return LLMToolResponse(
             tool_calls=[ToolCall(id=f"call_loop_{len(self.requests)}", name="echo", arguments={"text": "loop"})],
+            finish_reason="tool_calls",
+            used_mode="fake",
+        )
+
+
+class DuplicateCounterLLM:
+    def __init__(self, tool_name: str):
+        self.tool_name = tool_name
+        self.requests: list[LLMToolRequest] = []
+
+    def complete_with_tools(self, request: LLMToolRequest) -> LLMToolResponse:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            return LLMToolResponse(
+                tool_calls=[
+                    ToolCall(id="call_counter_1", name=self.tool_name, arguments={"value": "same"}),
+                    ToolCall(id="call_counter_2", name=self.tool_name, arguments={"value": "same"}),
+                ],
+                finish_reason="tool_calls",
+                used_mode="fake",
+            )
+        return LLMToolResponse(content="final", finish_reason="stop", used_mode="fake")
+
+
+class ReservedDirtyDsmlLLM:
+    def __init__(self) -> None:
+        self.requests: list[LLMToolRequest] = []
+
+    def complete_with_tools(self, request: LLMToolRequest) -> LLMToolResponse:
+        self.requests.append(request)
+        if not request.tools:
+            return LLMToolResponse(
+                content='<tool_calls><invoke name="echo"><parameter name="text" string="true">again</parameter></invoke></tool_calls>',
+                finish_reason="stop",
+                used_mode="fake",
+            )
+        return LLMToolResponse(
+            tool_calls=[ToolCall(id="call_echo", name="echo", arguments={"text": "first"})],
             finish_reason="tool_calls",
             used_mode="fake",
         )
@@ -118,10 +158,18 @@ class AgentRuntimeTests(unittest.TestCase):
             description="sample tool",
             parameters={"type": "object", "properties": {}, "required": []},
             handler=lambda args, ctx: None,
+            display_name="Sample Tool",
+            icon="search",
+            default_enabled=False,
+            requires_config=True,
         )
         payload = to_jsonable(spec)
         self.assertEqual(payload["name"], "sample")
         self.assertIsInstance(payload["handler"], str)
+        self.assertEqual(payload["display_name"], "Sample Tool")
+        self.assertEqual(payload["icon"], "search")
+        self.assertFalse(payload["default_enabled"])
+        self.assertTrue(payload["requires_config"])
 
     def test_tool_registry_exports_openai_schema_and_blocks_duplicates(self) -> None:
         registry = ToolRegistry()
@@ -286,6 +334,102 @@ class AgentRuntimeTests(unittest.TestCase):
             tool_names = [schema["function"]["name"] for schema in llm.requests[0].tools]
             self.assertEqual(tool_names, ["echo"])
 
+    def test_runtime_applies_allowed_and_disabled_tools(self) -> None:
+        registry = ToolRegistry()
+        register_debug_tools(registry)
+        llm = SequenceLLM([LLMToolResponse(content="done", finish_reason="stop", used_mode="fake")])
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = AgentRuntime(
+                llm_client=llm,
+                skill_loader=SkillLoader(PROJECT_ROOT / "skills", registry=registry),
+                tool_registry=registry,
+                trace_recorder=TraceRecorder(tmp),
+            )
+            runtime.run(
+                config=AgentRunConfig(
+                    skill_name="runtime_debug",
+                    model="fake",
+                    trace_path=tmp,
+                    allowed_tools=["echo", "get_time"],
+                    disabled_tools=["echo"],
+                ),
+                user_input="hello",
+            )
+            tool_names = [schema["function"]["name"] for schema in llm.requests[0].tools]
+            self.assertEqual(tool_names, ["get_time"])
+
+    def test_runtime_caches_duplicate_read_only_tool_calls_within_run(self) -> None:
+        registry = ToolRegistry()
+        calls = {"count": 0}
+
+        def counter(args, ctx):
+            calls["count"] += 1
+            return {"value": args["value"], "count": calls["count"]}
+
+        registry.register(
+            ToolSpec(
+                name="counter",
+                description="counter",
+                parameters={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]},
+                handler=counter,
+                side_effect="none",
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            write_temp_skill(tmp, "counter_skill", ["counter"])
+            runtime = AgentRuntime(
+                llm_client=DuplicateCounterLLM("counter"),
+                skill_loader=SkillLoader(tmp, registry=registry),
+                tool_registry=registry,
+                trace_recorder=TraceRecorder(tmp),
+            )
+            result = runtime.run(
+                config=AgentRunConfig(skill_name="counter_skill", model="fake", trace_path=tmp),
+                user_input="hello",
+            )
+            self.assertEqual(result.stopped_reason, "final")
+            self.assertEqual(calls["count"], 1)
+            self.assertEqual(result.steps[0].tool_results[0].output["count"], 1)
+            self.assertEqual(result.steps[0].tool_results[1].output["count"], 1)
+            self.assertTrue(result.steps[0].tool_results[1].stats["cached"])
+            self.assertEqual(result.steps[0].tool_results[1].call_id, "call_counter_2")
+
+    def test_runtime_does_not_cache_state_write_tools(self) -> None:
+        registry = ToolRegistry()
+        calls = {"count": 0}
+
+        def write_counter(args, ctx):
+            calls["count"] += 1
+            return {"value": args["value"], "count": calls["count"]}
+
+        registry.register(
+            ToolSpec(
+                name="write_counter",
+                description="write counter",
+                parameters={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]},
+                handler=write_counter,
+                side_effect="state_write",
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            write_temp_skill(tmp, "write_counter_skill", ["write_counter"])
+            runtime = AgentRuntime(
+                llm_client=DuplicateCounterLLM("write_counter"),
+                skill_loader=SkillLoader(tmp, registry=registry),
+                tool_registry=registry,
+                trace_recorder=TraceRecorder(tmp),
+            )
+            result = runtime.run(
+                config=AgentRunConfig(skill_name="write_counter_skill", model="fake", trace_path=tmp),
+                user_input="hello",
+                tool_context=ToolExecutionContext(working=WorkingMemory(), confirmed_tools={"write_counter"}),
+            )
+            self.assertEqual(result.stopped_reason, "final")
+            self.assertEqual(calls["count"], 2)
+            self.assertEqual(result.steps[0].tool_results[0].output["count"], 1)
+            self.assertEqual(result.steps[0].tool_results[1].output["count"], 2)
+            self.assertNotIn("cached", result.steps[0].tool_results[1].stats)
+
     def test_runtime_executes_real_json_fallback_adapter_path(self) -> None:
         registry = ToolRegistry()
         register_debug_tools(registry)
@@ -350,6 +494,40 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(result.stopped_reason, "max_steps")
             self.assertEqual(result.error_type, "MaxStepsExceeded")
 
+    def test_dsml_tool_call_parser_uses_allowed_tool_whitelist_and_dedupes(self) -> None:
+        text = (
+            '<tool_calls><invoke name="echo"><parameter name="text" string="true">hello</parameter></invoke>'
+            '<invoke name="unknown"><parameter name="text">bad</parameter></invoke>'
+            '<invoke name="echo"><parameter name="text" string="true">hello</parameter></invoke></tool_calls>'
+        )
+        self.assertTrue(has_dsml_tool_intent(text))
+        calls = parse_dsml_tool_calls(text, {"echo"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "echo")
+        self.assertEqual(calls[0].arguments["text"], "hello")
+
+    def test_reserved_final_with_dsml_tool_intent_degrades_to_recoverable_max_steps(self) -> None:
+        registry = ToolRegistry()
+        register_debug_tools(registry)
+        llm = ReservedDirtyDsmlLLM()
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = AgentRuntime(
+                llm_client=llm,
+                skill_loader=SkillLoader(PROJECT_ROOT / "skills", registry=registry),
+                tool_registry=registry,
+                trace_recorder=TraceRecorder(tmp),
+            )
+            result = runtime.run(
+                config=AgentRunConfig(skill_name="runtime_debug", model="fake", max_steps=2, trace_path=tmp),
+                user_input="loop",
+            )
+            self.assertEqual(result.stopped_reason, "max_steps")
+            self.assertEqual(result.error_type, "DirtyFinalToolIntent")
+            self.assertEqual(result.final_answer, "")
+            self.assertTrue(result.metadata["recoverable"])
+            self.assertEqual(result.metadata["fallback_reason"], "dirty_dsml_reserved_final")
+            self.assertEqual(llm.requests[-1].tools, [])
+
     def test_json_fallback_parser(self) -> None:
         payload = parse_json_object(
             '{"tool_calls":[{"id":"call_1","name":"echo","arguments":{"text":"hi"}}]}'
@@ -357,6 +535,28 @@ class AgentRuntimeTests(unittest.TestCase):
         calls = parse_fallback_tool_calls(payload["tool_calls"])
         self.assertEqual(calls[0].name, "echo")
         self.assertEqual(calls[0].arguments["text"], "hi")
+
+
+def write_temp_skill(root: str, name: str, allowed_tools: list[str]) -> None:
+    skill_dir = Path(root) / name
+    skill_dir.mkdir()
+    (skill_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "name": name,
+                "version": 1,
+                "description": name,
+                "allowed_tools": allowed_tools,
+                "denied_tools": [],
+                "max_steps": 4,
+                "temperature": 0.0,
+                "output_contract": {"type": "debug_text"},
+                "trace_policy": {"save": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (skill_dir / "SKILL.md").write_text("Use tools when needed.", encoding="utf-8")
 
 
 if __name__ == "__main__":

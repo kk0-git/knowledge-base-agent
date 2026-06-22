@@ -129,25 +129,66 @@ class VaultToolTests(unittest.TestCase):
                 ToolExecutionContext(working=WorkingMemory(), vault_root=root),
             ).execute(ToolCall(id="1", name="read_note", arguments={"path": "note.md", "heading": "B"}))
             self.assertTrue(result.ok)
-            self.assertEqual(result.output["mode"], "section")
             self.assertIn("## B", result.output["content"])
             self.assertNotIn("# C", result.output["content"])
+            self.assertTrue(result.output["section_id"])
 
-    def test_read_note_long_note_returns_outline(self) -> None:
+    def test_read_note_long_note_returns_content_with_truncation(self) -> None:
         registry = ToolRegistry()
         register_vault_tools(registry)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            body = "# Memory\n" + ("detail line\n" * 400)
+            body = "detail line for pagination test\n" * 300
             (root / "long.md").write_text(body, encoding="utf-8")
             result = ToolExecutor(
                 registry,
                 ToolExecutionContext(working=WorkingMemory(), vault_root=root),
-            ).execute(ToolCall(id="1", name="read_note", arguments={"path": "long.md"}))
+            ).execute(ToolCall(id="1", name="read_note", arguments={"path": "long.md", "max_chars": 4000}))
             self.assertTrue(result.ok)
-            self.assertEqual(result.output["mode"], "outline")
+            self.assertIn("content", result.output)
+            self.assertTrue(result.output["truncated"])
             self.assertIn("sections", result.output)
-            self.assertNotIn("content", result.output)
+            self.assertEqual(result.output["next_offset"], 4000)
+
+    def test_read_note_offset_continues_within_note(self) -> None:
+        registry = ToolRegistry()
+        register_vault_tools(registry)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            body = "".join(f"chunk-{i:04d}-" for i in range(500))
+            (root / "long.md").write_text(body, encoding="utf-8")
+            executor = ToolExecutor(registry, ToolExecutionContext(working=WorkingMemory(), vault_root=root))
+            first = executor.execute(
+                ToolCall(id="1", name="read_note", arguments={"path": "long.md", "max_chars": 100})
+            )
+            second = executor.execute(
+                ToolCall(
+                    id="2",
+                    name="read_note",
+                    arguments={"path": "long.md", "max_chars": 100, "offset": first.output["next_offset"]},
+                )
+            )
+            self.assertTrue(first.ok)
+            self.assertTrue(second.ok)
+            self.assertEqual(first.output["offset"], 0)
+            self.assertEqual(second.output["offset"], 100)
+            self.assertNotEqual(first.output["content"], second.output["content"])
+            self.assertTrue(body.startswith(first.output["content"]))
+            self.assertTrue(body[100:].startswith(second.output["content"]))
+
+    def test_read_note_short_note_has_no_sections(self) -> None:
+        registry = ToolRegistry()
+        register_vault_tools(registry)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "short.md").write_text("# Title\n\nshort content", encoding="utf-8")
+            result = ToolExecutor(
+                registry,
+                ToolExecutionContext(working=WorkingMemory(), vault_root=root),
+            ).execute(ToolCall(id="1", name="read_note", arguments={"path": "short.md"}))
+            self.assertTrue(result.ok)
+            self.assertFalse(result.output["truncated"])
+            self.assertNotIn("sections", result.output)
 
     def test_read_note_missing_section_returns_error(self) -> None:
         registry = ToolRegistry()
@@ -161,28 +202,6 @@ class VaultToolTests(unittest.TestCase):
             ).execute(ToolCall(id="1", name="read_note", arguments={"path": "note.md", "heading": "Missing"}))
             self.assertFalse(result.ok)
             self.assertIn("section not found", result.error)
-
-    def test_inspect_note_returns_outline(self) -> None:
-        registry = ToolRegistry()
-        register_vault_tools(registry)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "note.md").write_text("# Memory\nintro\n## Types\nshort", encoding="utf-8")
-            result = ToolExecutor(
-                registry,
-                ToolExecutionContext(working=WorkingMemory(), vault_root=root),
-            ).execute(
-                ToolCall(
-                    id="1",
-                    name="inspect_note",
-                    arguments={"path": "note.md", "reason": "check memory structure"},
-                )
-            )
-            self.assertTrue(result.ok)
-            self.assertEqual(result.output["path"], "note.md")
-            self.assertEqual(result.output["heading_count"], 2)
-            self.assertEqual(len(result.output["sections"]), 2)
-            self.assertEqual(result.output["reason"], "check memory structure")
 
     def test_grep_vault_filters_scope(self) -> None:
         registry = ToolRegistry()

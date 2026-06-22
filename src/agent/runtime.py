@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
+import json
 import time
 from typing import Callable, Iterator
 
 from agent.errors import AgentRuntimeError
-from agent.llm.tool_calling import LLMToolRequest, ToolCallingLLMClient
+from agent.llm.tool_calling import LLMToolRequest, ToolCallingLLMClient, has_dsml_tool_intent, parse_dsml_tool_calls
 from agent.schema import (
     AgentMessage,
     AgentResult,
@@ -13,6 +15,8 @@ from agent.schema import (
     AgentStep,
     StepKind,
     ToolCall,
+    ToolResult,
+    ToolSpec,
     WorkingMemory,
 )
 from agent.serialization import json_dumps, to_jsonable
@@ -50,6 +54,7 @@ class AgentRuntime:
         skill: LoadedSkill | None = None
         steps: list[AgentStep] = []
         run_state: AgentState
+        tool_call_cache: dict[tuple[str, str], ToolResult] = {}
 
         try:
             skill = self.skill_loader.load(config.skill_name)
@@ -76,6 +81,47 @@ class AgentRuntime:
                 llm_started_at = time.perf_counter()
                 response = self.llm_client.complete_with_tools(request)
                 latency_ms = elapsed_ms(llm_started_at)
+                residual_dsml_calls = parse_dsml_tool_calls(response.content, allowed_tools) if is_reserved_final_step else []
+                if is_reserved_final_step and residual_dsml_calls:
+                    step = AgentStep(
+                        index=step_index,
+                        kind=StepKind.ERROR,
+                        llm_input_chars=count_request_chars(request),
+                        llm_output_chars=len(response.content),
+                        assistant_text=response.content,
+                        latency_ms=latency_ms,
+                        metadata={
+                            "finish_reason": response.finish_reason,
+                            "llm_mode": response.used_mode,
+                            "error_type": "DirtyFinalToolIntent",
+                            "final_quality": "dirty_dsml",
+                            "residual_tool_calls": to_jsonable(residual_dsml_calls[: max(1, config.max_tool_calls_per_step)]),
+                        },
+                        working_snapshot=to_jsonable(run_state.working),
+                    )
+                    steps.append(step)
+                    emit_event(event_sink, "agent_step", to_jsonable(step))
+                    result = AgentResult(
+                        state=run_state,
+                        steps=steps,
+                        final_answer="",
+                        total_ms=elapsed_ms(started_at),
+                        stopped_reason="max_steps",
+                        trace_id=trace_id,
+                        error="reserved final step still contained tool intent",
+                        error_type="DirtyFinalToolIntent",
+                        metadata={
+                            "forced_final": True,
+                            "partial": True,
+                            "recoverable": True,
+                            "final_quality": "dirty_dsml",
+                            "final_had_residual_tool_intent": True,
+                            "dsml_parsed": False,
+                            "fallback_reason": "dirty_dsml_reserved_final",
+                            "last_tool_statuses": last_tool_statuses(steps),
+                        },
+                    )
+                    return self._save_trace(result=result, config=config, skill=skill, user_input=user_input)
                 tool_calls = [] if is_reserved_final_step else response.tool_calls[: max(1, config.max_tool_calls_per_step)]
                 if tool_calls:
                     assistant_message = AgentMessage(
@@ -87,7 +133,12 @@ class AgentRuntime:
                     tool_results = []
                     for call in tool_calls:
                         emit_event(event_sink, "tool_started", to_jsonable(call))
-                        tool_result = executor.execute(call)
+                        tool_result = execute_with_run_cache(
+                            call=call,
+                            registry=registry,
+                            executor=executor,
+                            cache=tool_call_cache,
+                        )
                         tool_results.append(tool_result)
                         emit_event(event_sink, "tool_result", to_jsonable(tool_result))
                     for result in tool_results:
@@ -107,12 +158,94 @@ class AgentRuntime:
                         tool_results=tool_results,
                         assistant_text=response.content,
                         latency_ms=latency_ms + sum(result.latency_ms for result in tool_results),
-                        metadata={"finish_reason": response.finish_reason, "llm_mode": response.used_mode},
+                        metadata={
+                            "finish_reason": response.finish_reason,
+                            "llm_mode": response.used_mode,
+                            "dsml_parsed": bool(getattr(response, "raw", {}).get("dsml_parsed")),
+                        },
                         working_snapshot=to_jsonable(run_state.working),
                     )
                     steps.append(step)
                     emit_event(event_sink, "agent_step", to_jsonable(step))
                     continue
+
+                if has_dsml_tool_intent(response.content):
+                    step = AgentStep(
+                        index=step_index,
+                        kind=StepKind.ERROR,
+                        llm_input_chars=count_request_chars(request),
+                        llm_output_chars=len(response.content),
+                        assistant_text=response.content,
+                        latency_ms=latency_ms,
+                        metadata={
+                            "finish_reason": response.finish_reason,
+                            "llm_mode": response.used_mode,
+                            "error_type": "DirtyFinalToolIntent",
+                            "final_quality": "dirty_dsml",
+                        },
+                        working_snapshot=to_jsonable(run_state.working),
+                    )
+                    steps.append(step)
+                    emit_event(event_sink, "agent_step", to_jsonable(step))
+                    result = AgentResult(
+                        state=run_state,
+                        steps=steps,
+                        final_answer="",
+                        total_ms=elapsed_ms(started_at),
+                        stopped_reason="max_steps",
+                        trace_id=trace_id,
+                        error="model returned unparseable tool intent in content",
+                        error_type="DirtyFinalToolIntent",
+                        metadata={
+                            "forced_final": is_reserved_final_step,
+                            "partial": True,
+                            "recoverable": True,
+                            "final_quality": "dirty_dsml",
+                            "final_had_residual_tool_intent": True,
+                            "dsml_parsed": False,
+                            "fallback_reason": "dirty_dsml_unparseable",
+                            "last_tool_statuses": last_tool_statuses(steps),
+                        },
+                    )
+                    return self._save_trace(result=result, config=config, skill=skill, user_input=user_input)
+
+                if not response.content.strip():
+                    step = AgentStep(
+                        index=step_index,
+                        kind=StepKind.ERROR,
+                        llm_input_chars=count_request_chars(request),
+                        llm_output_chars=0,
+                        assistant_text=response.content,
+                        latency_ms=latency_ms,
+                        metadata={
+                            "finish_reason": response.finish_reason,
+                            "llm_mode": response.used_mode,
+                            "error_type": "DirtyEmptyFinal",
+                            "final_quality": "dirty_empty",
+                        },
+                        working_snapshot=to_jsonable(run_state.working),
+                    )
+                    steps.append(step)
+                    emit_event(event_sink, "agent_step", to_jsonable(step))
+                    result = AgentResult(
+                        state=run_state,
+                        steps=steps,
+                        final_answer="",
+                        total_ms=elapsed_ms(started_at),
+                        stopped_reason="max_steps",
+                        trace_id=trace_id,
+                        error="model returned empty final answer",
+                        error_type="DirtyEmptyFinal",
+                        metadata={
+                            "forced_final": is_reserved_final_step,
+                            "partial": True,
+                            "recoverable": True,
+                            "final_quality": "dirty_empty",
+                            "fallback_reason": "dirty_empty_final",
+                            "last_tool_statuses": last_tool_statuses(steps),
+                        },
+                    )
+                    return self._save_trace(result=result, config=config, skill=skill, user_input=user_input)
 
                 run_state.final_answer = response.content
                 run_state.finished = True
@@ -123,7 +256,7 @@ class AgentRuntime:
                     llm_output_chars=len(response.content),
                     assistant_text=response.content,
                     latency_ms=latency_ms,
-                    metadata={"finish_reason": response.finish_reason, "llm_mode": response.used_mode},
+                    metadata={"finish_reason": response.finish_reason, "llm_mode": response.used_mode, "final_quality": "clean"},
                     working_snapshot=to_jsonable(run_state.working),
                 )
                 steps.append(step)
@@ -139,6 +272,8 @@ class AgentRuntime:
                         "forced_final": is_reserved_final_step,
                         "partial": False,
                         "recoverable": False,
+                        "final_quality": "clean" if response.content.strip() else "dirty_empty",
+                        "dsml_parsed": bool(getattr(response, "raw", {}).get("dsml_parsed")),
                         "last_tool_statuses": last_tool_statuses(steps),
                     },
                 )
@@ -312,9 +447,61 @@ def last_tool_statuses(steps: list[AgentStep]) -> list[dict]:
 def effective_allowed_tools(*, skill: LoadedSkill, config: AgentRunConfig) -> list[str]:
     skill_tools = {str(name) for name in skill.allowed_tools}
     if config.allowed_tools is None:
-        return sorted(skill_tools)
-    requested = {str(name) for name in config.allowed_tools}
-    return sorted(skill_tools.intersection(requested))
+        allowed = set(skill_tools)
+    else:
+        requested = {str(name) for name in config.allowed_tools}
+        allowed = skill_tools.intersection(requested)
+    disabled = {str(name) for name in (config.disabled_tools or [])}
+    return sorted(allowed.difference(disabled))
+
+
+def execute_with_run_cache(
+    *,
+    call: ToolCall,
+    registry: ToolRegistry,
+    executor: ToolExecutor,
+    cache: dict[tuple[str, str], ToolResult],
+) -> ToolResult:
+    spec = registry.get(call.name)
+    if not is_cacheable_tool(spec):
+        return executor.execute(call)
+    key = tool_cache_key(call)
+    cached = cache.get(key)
+    if cached is not None:
+        return clone_cached_tool_result(cached, call_id=call.id)
+    result = executor.execute(call)
+    if result.ok:
+        cache[key] = result
+    return result
+
+
+def is_cacheable_tool(spec: ToolSpec) -> bool:
+    if spec.side_effect != "none" or spec.requires_confirmation:
+        return False
+    return spec.name not in {"advance_layer", "select_topic", "record_signal", "write_observation_draft"}
+
+
+def tool_cache_key(call: ToolCall) -> tuple[str, str]:
+    rendered_args = json.dumps(to_jsonable(call.arguments), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return call.name, rendered_args
+
+
+def clone_cached_tool_result(result: ToolResult, *, call_id: str) -> ToolResult:
+    stats = copy.deepcopy(result.stats)
+    stats["cached"] = True
+    return ToolResult(
+        call_id=call_id,
+        name=result.name,
+        ok=result.ok,
+        output=copy.deepcopy(result.output),
+        status=result.status,
+        error=result.error,
+        error_type=result.error_type,
+        latency_ms=0,
+        result_size=result.result_size,
+        summary=result.summary,
+        stats=stats,
+    )
 
 
 def count_request_chars(request: LLMToolRequest) -> int:

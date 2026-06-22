@@ -136,9 +136,16 @@ def eval_interviewer(*, case: dict[str, Any], root: Path, out_dir: Path) -> dict
 
 def eval_librarian(*, case: dict[str, Any], root: Path, out_dir: Path) -> dict[str, Any]:
     vault_root = root / "vault"
-    vault_root.mkdir()
-    (vault_root / "redis.md").write_text("# Redis Stream\nUse XREADGROUP for consumer groups.", encoding="utf-8")
-    (vault_root / "mcp.md").write_text("# MCP\nHost, client, and server are separate roles.", encoding="utf-8")
+    vault_root.mkdir(parents=True, exist_ok=True)
+    vault_files = case.get("vault_files")
+    if isinstance(vault_files, dict) and vault_files:
+        for rel_path, content in vault_files.items():
+            path = vault_root / str(rel_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(str(content), encoding="utf-8")
+    else:
+        (vault_root / "redis.md").write_text("# Redis Stream\nUse XREADGROUP for consumer groups.", encoding="utf-8")
+        (vault_root / "mcp.md").write_text("# MCP\nHost, client, and server are separate roles.", encoding="utf-8")
     runtime = build_runtime(trace_dir=out_dir / "traces")
     app = LibrarianApp(runtime)
     scope_type = str(case.get("scope_type") or "all_vault")
@@ -150,6 +157,7 @@ def eval_librarian(*, case: dict[str, Any], root: Path, out_dir: Path) -> dict[s
             scope_type=scope_type,
             scope_note_paths=scope_note_paths,
             selected_note_paths=selected_note_paths,
+            strict_evidence=bool(case.get("strict_evidence")),
             vault_root=vault_root,
             rag_manager=FileScanRAGManager(vault_root),
             model="debug-fake",
@@ -300,10 +308,12 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "schema_valid": 0,
         "online_used": 0,
         "search_count": 0,
+        "grep_count": 0,
+        "verification_search_count": 0,
     }
     for result in results:
         actual = result.get("actual") or {}
-        for key in ["routine_state_fetch", "tool_call_count", "notes_read", "profile_recalled", "signal_count", "search_count"]:
+        for key in ["routine_state_fetch", "tool_call_count", "notes_read", "profile_recalled", "signal_count", "search_count", "grep_count", "verification_search_count"]:
             totals[key] += int(actual.get(key) or 0)
         for key in ["layer_advanced", "topic_selected", "over_search", "schema_valid", "online_used"]:
             totals[key] += 1 if actual.get(key) else 0

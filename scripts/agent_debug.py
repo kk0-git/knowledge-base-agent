@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_SRC = PROJECT_ROOT / "src"
@@ -191,6 +192,11 @@ class DeterministicDebugLLM:
         )
 
     def _complete_librarian(self, request: LLMToolRequest, tool_names: set[str]) -> LLMToolResponse:
+        user_text = latest_user_text(request)
+        if is_strict_name_lookup(user_text, request):
+            return self._complete_librarian_strict(request, tool_names)
+        if is_agent_boundary_question(user_text):
+            return self._complete_librarian_agent_boundary(request, tool_names)
         if self.calls == 1 and "search_notes" not in tool_names and "read_note" in tool_names:
             path = first_selected_note_path(request)
             if path:
@@ -206,7 +212,7 @@ class DeterministicDebugLLM:
                     ToolCall(
                         id="call_search_1",
                         name="search_notes",
-                        arguments={"query": latest_user_text(request), "top_k": 3},
+                        arguments={"query": user_text, "top_k": 3},
                     )
                 ],
                 finish_reason="tool_calls",
@@ -224,6 +230,64 @@ class DeterministicDebugLLM:
                 )
         return LLMToolResponse(
             content="Phase 1 librarian debug run completed. The agent searched notes, read one note when available, and returned a final answer.",
+            tool_calls=[],
+            finish_reason="stop",
+            raw={"fake": True},
+            used_mode=f"fake-{request.tool_mode}",
+        )
+
+    def _complete_librarian_agent_boundary(self, request: LLMToolRequest, tool_names: set[str]) -> LLMToolResponse:
+        if self.calls == 1 and "search_notes" in tool_names:
+            return LLMToolResponse(
+                tool_calls=[
+                    ToolCall(
+                        id="call_search_1",
+                        name="search_notes",
+                        arguments={"query": "memory profile coach agent", "top_k": 5},
+                    )
+                ],
+                finish_reason="tool_calls",
+                raw={"fake": True},
+                used_mode=f"fake-{request.tool_mode}",
+            )
+        if self.calls == 2 and "read_note" in tool_names:
+            return LLMToolResponse(
+                tool_calls=[
+                    ToolCall(id="call_read_1", name="read_note", arguments={"path": "memory.md", "max_chars": 4000}),
+                    ToolCall(id="call_read_2", name="read_note", arguments={"path": "multi-agent.md", "max_chars": 4000}),
+                ],
+                finish_reason="tool_calls",
+                raw={"fake": True},
+                used_mode=f"fake-{request.tool_mode}",
+            )
+        if self.calls == 3 and "grep_vault" in tool_names:
+            return LLMToolResponse(
+                tool_calls=[
+                    ToolCall(id="call_grep_1", name="grep_vault", arguments={"query": "profile", "ignore_case": True}),
+                    ToolCall(id="call_grep_2", name="grep_vault", arguments={"query": "coach", "ignore_case": True}),
+                ],
+                finish_reason="tool_calls",
+                raw={"fake": True},
+                used_mode=f"fake-{request.tool_mode}",
+            )
+        return LLMToolResponse(
+            content="Memory 负责存储与检索；Profile 维护用户稳定信息；Coach 负责评估与反思。vault 中没有独立的 profile/coach agent 命名，以上边界基于 memory 与 multi-agent 相关材料整理。",
+            tool_calls=[],
+            finish_reason="stop",
+            raw={"fake": True},
+            used_mode=f"fake-{request.tool_mode}",
+        )
+
+    def _complete_librarian_strict(self, request: LLMToolRequest, tool_names: set[str]) -> LLMToolResponse:
+        if self.calls == 1 and "grep_vault" in tool_names:
+            return LLMToolResponse(
+                tool_calls=[ToolCall(id="call_grep_1", name="grep_vault", arguments={"query": "coach", "ignore_case": True})],
+                finish_reason="tool_calls",
+                raw={"fake": True},
+                used_mode=f"fake-{request.tool_mode}",
+            )
+        return LLMToolResponse(
+            content="vault 中未找到 coach 的直接证据，无法在 strict evidence 模式下描述 Coach Agent 设计。",
             tool_calls=[],
             finish_reason="stop",
             raw={"fake": True},
@@ -568,18 +632,58 @@ def file_scan_result(*, relative: str, text: str, score: float) -> SearchResult:
     )
 
 
+def is_agent_boundary_question(user_text: str) -> bool:
+    lowered = user_text.lower()
+    has_names = "profile" in lowered and "coach" in lowered
+    has_topic = any(token in user_text for token in ["memory", "Memory", "记忆", "职责", "边界"])
+    return has_names and has_topic
+
+
+def is_strict_name_lookup(user_text: str, request: LLMToolRequest) -> bool:
+    ctx = runtime_context_from_request(request)
+    if not ctx.get("strict_evidence"):
+        return False
+    return "coach" in user_text.lower()
+
+
+def runtime_context_from_request(request: LLMToolRequest) -> dict[str, Any]:
+    for message in request.messages:
+        if message.role != "user":
+            continue
+        content = str(message.content or "")
+        marker = "# Runtime Context"
+        if marker not in content:
+            continue
+        section = content.split(marker, 1)[1]
+        for stop_marker in ("# Strict Evidence Constraint", "# Short Conversation History", "# Task"):
+            if stop_marker in section:
+                section = section.split(stop_marker, 1)[0]
+        try:
+            payload = json.loads(section.strip())
+        except Exception:
+            continue
+        return payload if isinstance(payload, dict) else {}
+    return {}
+
+
 def latest_user_text(request: LLMToolRequest) -> str:
     for message in reversed(request.messages):
         if message.role != "user":
             continue
         content = message.content
-        marker = "# Current User Message"
-        task_marker = "# Task"
-        if marker in content:
+        for marker, stop_markers in (
+            ("# User Request", ("# Task",)),
+            ("# Current User Message", ("# Task",)),
+        ):
+            if marker not in content:
+                continue
             tail = content.split(marker, 1)[1]
-            if task_marker in tail:
-                tail = tail.split(task_marker, 1)[0]
-            return tail.strip()
+            for stop in stop_markers:
+                if stop in tail:
+                    tail = tail.split(stop, 1)[0]
+            text = tail.strip()
+            if text:
+                return text
         return content
     return ""
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -39,7 +41,11 @@ class InterviewInterviewerApp:
     def __init__(self, runtime: AgentRuntime):
         self.runtime = runtime
 
-    def run_turn(self, request: InterviewTurnRequest) -> tuple[Any, InterviewStateMachine]:
+    def run_turn(
+        self,
+        request: InterviewTurnRequest,
+        event_sink: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[Any, InterviewStateMachine]:
         machine = build_interview_state_machine(
             plan=request.interview_plan,
             state_payload=request.interview_state,
@@ -85,6 +91,7 @@ class InterviewInterviewerApp:
             user_input=build_turn_input(request, runtime_context=runtime_context),
             state=state,
             tool_context=tool_context,
+            event_sink=event_sink,
         )
         if result.final_answer:
             machine.commit_turn(user_text=request.query, assistant_text=result.final_answer)
@@ -105,11 +112,35 @@ class InterviewInterviewerApp:
         return result, machine
 
     def run_turn_stream(self, request: InterviewTurnRequest) -> Iterator[dict[str, Any]]:
-        result, machine = self.run_turn(request)
-        for step in result.steps:
-            yield {"type": "agent_step", "payload": to_jsonable(step)}
-            for tool_result in step.tool_results:
-                yield {"type": "tool_result", "payload": to_jsonable(tool_result)}
+        event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        holder: dict[str, Any] = {}
+
+        def event_sink(event: dict[str, Any]) -> None:
+            event_queue.put(event)
+
+        def worker() -> None:
+            try:
+                result, machine = self.run_turn(request, event_sink=event_sink)
+                holder["result"] = result
+                holder["machine"] = machine
+            except BaseException as exc:
+                holder["error"] = exc
+            finally:
+                event_queue.put(None)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        while True:
+            event = event_queue.get()
+            if event is None:
+                break
+            yield event
+        thread.join()
+        if holder.get("error") is not None:
+            raise holder["error"]
+
+        result = holder["result"]
+        machine = holder["machine"]
         yield {"type": "state_updated", "payload": machine.snapshot()}
         if result.final_answer:
             yield {"type": "answer_delta", "payload": {"text": result.final_answer}}

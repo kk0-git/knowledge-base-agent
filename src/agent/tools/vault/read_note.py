@@ -5,10 +5,8 @@ from typing import Any
 from agent.schema import ToolSpec
 from agent.tool_executor import ToolExecutionContext
 from agent.tools.vault.note_sections import (
-    SHORT_NOTE_CHAR_THRESHOLD,
-    build_full_read_output,
-    build_outline_read_output,
-    build_section_read_output,
+    DEFAULT_READ_MAX_CHARS,
+    build_read_note_output,
     load_scoped_note_text,
     parse_heading_path_argument,
     resolve_target_section,
@@ -20,21 +18,29 @@ def read_note_spec() -> ToolSpec:
     return ToolSpec(
         name="read_note",
         description=(
-            "Read a markdown note from the current vault scope. "
-            "Short notes return full content; long notes return an outline unless a section is requested."
+            "Read markdown note content from the current vault scope. "
+            "Always returns content. Use section_id to jump to a section, "
+            "or offset to continue within the current reading window."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
+                "section_id": {
+                    "type": "string",
+                    "description": "Read a specific section by id from a previous read_note sections map.",
+                },
                 "heading": {"type": "string", "description": "Read a specific section by heading text."},
                 "heading_path": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Read a section by full heading path, e.g. [\"Memory\", \"Types\"].",
                 },
-                "section_id": {"type": "string", "description": "Read a section by id from inspect_note or outline."},
-                "max_chars": {"type": "integer"},
+                "offset": {
+                    "type": "integer",
+                    "description": "Character offset within the current reading window for pagination.",
+                },
+                "max_chars": {"type": "integer", "description": "Maximum characters to return. Default 4000."},
                 "reason": {"type": "string"},
             },
             "required": ["path"],
@@ -47,31 +53,32 @@ def read_note_spec() -> ToolSpec:
 
 def read_note(arguments: dict[str, Any], ctx: ToolExecutionContext) -> dict[str, Any]:
     relative, text = load_scoped_note_text(str(arguments.get("path") or ""), ctx)
-    max_chars = max(1, min(int(arguments.get("max_chars") or 4000), ctx.max_tool_output_chars))
+    max_chars = max(1, min(int(arguments.get("max_chars") or DEFAULT_READ_MAX_CHARS), ctx.max_tool_output_chars))
+    offset = max(0, int(arguments.get("offset") or 0))
     reason = str(arguments.get("reason") or "").strip()
     heading = str(arguments.get("heading") or "").strip()
     section_id = str(arguments.get("section_id") or "").strip()
     heading_path = parse_heading_path_argument(arguments.get("heading_path"))
 
     sections = parse_markdown_sections(text)
-    if heading or section_id or heading_path:
+    section = None
+    if section_id or heading or heading_path:
         section = resolve_target_section(
             sections,
             heading=heading,
             section_id=section_id,
             heading_path=heading_path,
         )
-        output = build_section_read_output(
-            relative=relative,
-            section=section,
-            max_chars=max_chars,
-            reason=reason,
-            all_sections=sections,
-        )
-    elif len(text) <= SHORT_NOTE_CHAR_THRESHOLD:
-        output = build_full_read_output(relative=relative, text=text, max_chars=max_chars, reason=reason)
-    else:
-        output = build_outline_read_output(relative=relative, text=text, reason=reason)
+
+    output = build_read_note_output(
+        relative=relative,
+        text=text,
+        sections=sections,
+        max_chars=max_chars,
+        offset=offset,
+        reason=reason,
+        section=section,
+    )
 
     if relative not in ctx.working.notes_read_this_turn:
         ctx.working.notes_read_this_turn.append(relative)

@@ -185,6 +185,20 @@ def find_sections(
     return [], "not_found"
 
 
+def build_section_map(sections: list[MarkdownSection]) -> list[dict[str, object]]:
+    return [
+        {
+            "section_id": section.section_id(),
+            "heading": section.heading,
+            "heading_path": list(section.heading_path),
+            "start_line": section.start_line,
+            "end_line": section.end_line,
+            "char_count": section.char_count,
+        }
+        for section in sections
+    ]
+
+
 def build_note_outline(
     *,
     path: str,

@@ -43,8 +43,7 @@ query
 - **原子工具已按 scope guard 实现**：
   - `search_notes`：hybrid 检索，`filter_items_by_scope`，k 值内置。
   - `grep_vault`：精确/正则，`filter_items_by_scope`。
-  - `read_note`：支持 `heading` / `heading_path` / `section_id` 结构化读取；短笔记返回全文，长笔记返回 outline；`reason` 记录选择理由。
-  - `inspect_note`：只返回笔记结构与 section preview，不读正文。
+  - `read_note`：永远返回 `content`；`section_id` 跳节，`offset` 节内续读；`truncated=true` 时附带 `sections` map。
 - **scope guard 链路就绪**：`ToolExecutionContext.scope_note_paths` + `guards.py`。
 
 ### 1.3 缺口（本 Phase 要补）

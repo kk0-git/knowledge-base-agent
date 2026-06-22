@@ -99,12 +99,18 @@ class OpenAICompatibleToolCallingClient:
 
         choice = raw.get("choices", [{}])[0]
         message = choice.get("message") or {}
+        content = str(message.get("content") or "")
+        tool_calls = parse_openai_tool_calls(message.get("tool_calls") or [])
+        if not tool_calls:
+            dsml_calls = parse_dsml_tool_calls(content, allowed_tool_names_from_schemas(request.tools))
+            if dsml_calls:
+                tool_calls = dsml_calls
         return LLMToolResponse(
-            content=str(message.get("content") or ""),
-            tool_calls=parse_openai_tool_calls(message.get("tool_calls") or []),
-            finish_reason=str(choice.get("finish_reason") or ""),
-            raw=raw,
-            used_mode="native",
+            content=content,
+            tool_calls=tool_calls,
+            finish_reason="tool_calls" if tool_calls else str(choice.get("finish_reason") or ""),
+            raw={**raw, "dsml_parsed": bool(tool_calls and not (message.get("tool_calls") or []))},
+            used_mode="native_dsml" if tool_calls and not (message.get("tool_calls") or []) else "native",
         )
 
     def _complete_json_fallback(
@@ -211,6 +217,80 @@ def parse_fallback_tool_calls(raw_calls: list[Any]) -> list[ToolCall]:
         arguments = parse_arguments(raw.get("arguments") or function.get("arguments") or {})
         calls.append(ToolCall(id=str(raw.get("id") or f"call_{index}"), name=name, arguments=arguments))
     return calls
+
+
+def allowed_tool_names_from_schemas(tools: list[dict[str, Any]]) -> set[str]:
+    names: set[str] = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        name = str(function.get("name") or tool.get("name") or "").strip()
+        if name:
+            names.add(name)
+    return names
+
+
+def has_dsml_tool_intent(text: str) -> bool:
+    return bool(re.search(r"\binvoke\s+name\s*=", str(text or ""), flags=re.IGNORECASE))
+
+
+def parse_dsml_tool_calls(text: str, allowed_tool_names: set[str] | list[str] | tuple[str, ...]) -> list[ToolCall]:
+    allowed = {str(name) for name in allowed_tool_names if str(name).strip()}
+    if not allowed or not has_dsml_tool_intent(text):
+        return []
+    calls: list[ToolCall] = []
+    seen: set[tuple[str, str]] = set()
+    matches = list(re.finditer(r"\binvoke\s+name\s*=\s*['\"]([^'\"]+)['\"]", text, flags=re.IGNORECASE))
+    for index, match in enumerate(matches, start=1):
+        name = match.group(1).strip()
+        if name not in allowed:
+            continue
+        block_end = matches[index].start() if index < len(matches) else len(text)
+        block = text[match.end() : block_end]
+        arguments = parse_dsml_parameters(block)
+        signature = (name, json.dumps(arguments, ensure_ascii=False, sort_keys=True))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        calls.append(ToolCall(id=f"dsml_call_{index}", name=name, arguments=arguments))
+    return calls
+
+
+def parse_dsml_parameters(block: str) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    pattern = re.compile(
+        r"\bparameter\s+name\s*=\s*['\"]([^'\"]+)['\"][^>]*>(.*?)(?=<[^>]*parameter\b|</|$)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(block or ""):
+        key = match.group(1).strip()
+        value = strip_dsml_value(match.group(2))
+        if key:
+            args[key] = coerce_dsml_value(value)
+    return args
+
+
+def strip_dsml_value(value: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", "", str(value or ""), flags=re.DOTALL)
+    return cleaned.strip()
+
+
+def coerce_dsml_value(value: str) -> Any:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
 
 
 def parse_arguments(raw: Any) -> dict[str, Any]:

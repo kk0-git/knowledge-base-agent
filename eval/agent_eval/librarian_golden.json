@@ -10,6 +10,7 @@
         "stopped_reason": "final",
         "notes_read": 1,
         "search_count": 1,
+        "verification_search_count": 0,
         "schema_valid": true
       }
     },
@@ -28,6 +29,67 @@
         "stopped_reason": "final",
         "tool_call_count": 1,
         "notes_read": 1,
+        "search_count": 0,
+        "verification_search_count": 0,
+        "schema_valid": true
+      }
+    },
+    {
+      "id": "librarian_l2_memory_types_only",
+      "type": "librarian",
+      "input": "解释 memory 的工作记忆、短期记忆、长期记忆区别。",
+      "scope_type": "selected_notes",
+      "scope_note_paths": [
+        "memory.md"
+      ],
+      "selected_note_paths": [
+        "memory.md"
+      ],
+      "vault_files": {
+        "memory.md": "# memory\n\n1. 工作记忆：当前 LLM 调用中的输入视图。\n2. 短期记忆：当前会话状态。\n3. 长期记忆：跨会话持久化的信息。"
+      },
+      "expect": {
+        "stopped_reason": "final",
+        "tool_call_count": 1,
+        "notes_read": 1,
+        "search_count": 0,
+        "grep_count": 0,
+        "verification_search_count": 0,
+        "schema_valid": true
+      }
+    },
+    {
+      "id": "librarian_l1_agent_boundary_grep",
+      "type": "librarian",
+      "input": "对比 memory、profile、coach agent 的设计与职责边界。",
+      "scope_type": "all_vault",
+      "vault_files": {
+        "memory.md": "# memory\n\n长期记忆包含语义知识，例如用户 profile、profile.json。\nObserve → Extract → Store → Retrieve → Inject → Update → Forget",
+        "multi-agent.md": "# Multi-agent\n\nReviewer 负责审查其他 agent 的输出质量。"
+      },
+      "expect": {
+        "stopped_reason": "final",
+        "tool_call_count": 5,
+        "notes_read": 2,
+        "grep_count": 2,
+        "verification_search_count": 0,
+        "schema_valid": true
+      }
+    },
+    {
+      "id": "librarian_strict_coach_missing",
+      "type": "librarian",
+      "input": "coach agent 的设计是什么？",
+      "strict_evidence": true,
+      "scope_type": "all_vault",
+      "vault_files": {
+        "memory.md": "# memory\n\n长期记忆包含语义知识与情景记忆。"
+      },
+      "expect": {
+        "stopped_reason": "final",
+        "tool_call_count": 1,
+        "grep_count": 1,
+        "verification_search_count": 0,
         "schema_valid": true
       }
     }

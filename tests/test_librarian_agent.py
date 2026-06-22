@@ -155,7 +155,7 @@ class LibrarianAgentTests(unittest.TestCase):
                 ),
             )
         tool_names = [schema["function"]["name"] for schema in llm.requests[0].tools]
-        self.assertEqual(tool_names, ["grep_vault", "inspect_note", "list_notes", "online_search", "read_note", "search_notes"])
+        self.assertEqual(tool_names, ["grep_vault", "list_notes", "online_search", "read_note", "search_notes"])
 
     def test_scope_router_maps_selected_notes_to_read_budget(self) -> None:
         budget = route_librarian_scope(scope_type="selected_notes", online_enabled=False)

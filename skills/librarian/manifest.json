@@ -2,7 +2,7 @@
   "name": "librarian",
   "version": 2,
   "description": "Adaptive vault QA and synthesis librarian with bounded read-only tools.",
-  "allowed_tools": ["grep_vault", "inspect_note", "list_notes", "online_search", "read_note", "search_notes"],
+  "allowed_tools": ["grep_vault", "list_notes", "online_search", "read_note", "search_notes"],
   "denied_tools": [],
   "max_steps": 6,
   "temperature": 0.2,

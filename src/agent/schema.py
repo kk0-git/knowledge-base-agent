@@ -35,6 +35,10 @@ class ToolSpec:
     permission_level: str = "read"
     side_effect: str = "none"
     requires_confirmation: bool = False
+    display_name: str = ""
+    icon: str = ""
+    default_enabled: bool = True
+    requires_config: bool = False
 
 
 @dataclass
@@ -56,6 +60,7 @@ class ToolResult:
     latency_ms: int = 0
     result_size: int = 0
     summary: str = ""
+    stats: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -114,6 +119,7 @@ class AgentRunConfig:
     trace_path: str | None = None
     tool_mode: Literal["native", "json", "auto"] = "auto"
     allowed_tools: list[str] | None = None
+    disabled_tools: list[str] | None = None
     reserve_final_step: bool = True
 
 

@@ -247,6 +247,7 @@ class InterviewSessionAppendTurnRequest(BaseModel):
     interview_plan: dict[str, Any] | None = Field(default=None)
     interview_state: dict[str, Any] | None = Field(default=None)
     source_note_paths: list[str] = Field(default_factory=list)
+    agent_actions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class InterviewSessionPendingTurnRequest(BaseModel):
@@ -261,6 +262,7 @@ class InterviewSessionCompleteAssistantRequest(BaseModel):
     interview_plan: dict[str, Any] | None = Field(default=None)
     interview_state: dict[str, Any] | None = Field(default=None)
     source_note_paths: list[str] = Field(default_factory=list)
+    agent_actions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class InterviewSessionFailAssistantRequest(BaseModel):
@@ -1838,6 +1840,7 @@ def create_app(
                 interview_plan=request.interview_plan,
                 interview_state=request.interview_state,
                 source_note_paths=request.source_note_paths,
+                agent_actions=request.agent_actions,
             )
             return {
                 "user_message": result["user_message"],
@@ -1887,6 +1890,7 @@ def create_app(
                 interview_plan=request.interview_plan,
                 interview_state=request.interview_state,
                 source_note_paths=request.source_note_paths,
+                agent_actions=request.agent_actions,
             )
             return {"assistant_message": result["assistant_message"], "session": result["session"]}
         except FileNotFoundError as exc:
@@ -4850,9 +4854,12 @@ CHAT_HTML = r"""<!doctype html>
     .agent-process.done .agent-process-dot { background: #64748b; box-shadow: none; }
     .agent-process-summary { color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
     .agent-process-body { padding: 0 12px 11px; display: grid; gap: 7px; }
+    .agent-process-progress { height: 2px; background: rgba(15,118,110,.10); overflow: hidden; }
+    .agent-process-progress-bar { height: 100%; background: var(--accent); transition: width .24s ease; }
     .agent-process-item { display: grid; grid-template-columns: 18px 1fr; gap: 8px; color: #2f3b37; font-size: 13px; line-height: 1.45; }
     .agent-process-icon { color: var(--accent-dark); font-weight: 900; }
     .agent-process-item.active .agent-process-icon { animation: processPulse 1.3s ease-in-out infinite; }
+    .agent-process-item.error .agent-process-icon { color: #b42318; }
     .agent-process-item small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; word-break: break-word; }
     @keyframes processPulse { 0%, 100% { opacity: .42; } 50% { opacity: 1; } }
     .composer { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px; display: grid; gap: 10px; }
@@ -5274,7 +5281,9 @@ CHAT_HTML = r"""<!doctype html>
         if (data.plan) {
           currentInterviewPlan = data.plan;
           currentInterviewPlanSignature = conversationSignature();
-          renderInterviewPlan(data.plan);
+          if (shouldRenderInterviewPlanForCurrentTurn()) {
+            renderInterviewPlan(data.plan);
+          }
         }
       }
       if (eventName === "profile_debug") {
@@ -5372,6 +5381,8 @@ CHAT_HTML = r"""<!doctype html>
         clueCount: 0,
         matchCount: 0,
         active: null,
+        actionRuns: [],
+        phase: "preparing",
         stopped: false,
         stopReason: "",
         stopMessage: ""
@@ -5379,7 +5390,7 @@ CHAT_HTML = r"""<!doctype html>
     }
 
     function shouldShowAgentProcess() {
-      return $("chatMode").value === "answer" && currentAssistant;
+      return ["answer", "interview"].includes($("chatMode").value) && currentAssistant;
     }
 
     function ensureAgentProcessVisible() {
@@ -5391,6 +5402,7 @@ CHAT_HTML = r"""<!doctype html>
     function updateProcessFromContext(data) {
       if (!data || data.mode !== "answer" || !data.stats?.agent_v2) return;
       if (!ensureAgentProcessVisible()) return;
+      currentProcess.phase = "preparing";
       const scope = data.scope || {};
       const noteCount = Number(scope.note_count ?? data.stats?.context_items ?? 0);
       const label = scopeLabel(scope.type, scope.value);
@@ -5401,60 +5413,64 @@ CHAT_HTML = r"""<!doctype html>
     function updateProcessFromToolStarted(data) {
       if (!data || !data.name) return;
       if (!ensureAgentProcessVisible()) return;
-      const args = data.arguments && typeof data.arguments === "object" ? data.arguments : {};
-      const item = plannedProcessItem(data.name, args);
-      if (!item) return;
-      currentProcess.active = {name: data.name, index: addProcessItem(item.title, item.detail, "active")};
+      const run = toolCallToActionRun(data);
+      if (!run) return;
+      currentProcess.phase = "tool_running";
+      upsertActionRun(run);
+      currentProcess.active = {name: data.name, actionId: run.id, index: addProcessItem(run.label, run.detail, "active")};
       renderAgentProcess();
     }
 
     function updateProcessFromToolResult(data) {
       if (!data || !data.name) return;
       if (!ensureAgentProcessVisible()) return;
-      const output = data.output && typeof data.output === "object" ? data.output : {};
-      const ok = data.ok !== false && data.status !== "error";
-      const suffix = ok ? "" : "未成功";
-      let item = null;
-      if (data.name === "search_notes") {
-        currentProcess.searched += 1;
-        currentProcess.clueCount += Number(output.result_count || 0);
-        item = ["找到相关笔记线索", `${Number(output.result_count || 0)} 条线索${sourcePathSummary(output.source_paths)}`];
-      } else if (data.name === "grep_vault") {
-        currentProcess.checked += 1;
-        currentProcess.matchCount += Number(output.result_count || 0);
-        item = ["核对关键词出现位置", `${Number(output.result_count || 0)} 处匹配${sourcePathSummary(output.source_paths)}`];
-      } else if (data.name === "list_notes") {
-        currentProcess.listed += 1;
-        item = ["浏览可用笔记", `${Number(output.result_count || 0)} 篇候选${output.truncated ? "，已截断" : ""}`];
-      } else if (data.name === "read_note") {
-        const path = String(output.path || "").trim();
-        if (path) currentProcess.readPaths.add(path);
-        const mode = String(output.mode || "").trim();
-        const sectionLabel = output.heading_path && output.heading_path.length
-          ? ` · ${output.heading_path.join(" > ")}`
-          : (output.heading ? ` · ${output.heading}` : "");
-        const modeLabel = mode === "outline" ? "，返回目录" : (mode === "section" ? "，读取章节" : "");
-        item = ["阅读笔记", `${path || "指定笔记"}${output.reason ? `：${output.reason}` : ""}${sectionLabel}${modeLabel}${output.truncated ? "，内容较长已截断" : ""}`];
-      } else if (data.name === "inspect_note") {
-        const path = String(output.path || "").trim();
-        item = ["查看笔记结构", `${path || "指定笔记"}${output.reason ? `：${output.reason}` : ""} · ${Number(output.heading_count || 0)} 个章节`];
-      } else if (data.name === "online_search") {
-        currentProcess.online += 1;
-        currentProcess.clueCount += Number(output.result_count || 0);
-        item = ["查找公开资料", `${Number(output.result_count || 0)} 条结果`];
-      } else if (!ok) {
-        item = ["调整查阅方式", suffix || "工具调用未成功"];
-      } else {
-        return;
-      }
-      finishActiveProcessItem(data.name, item[0], item[1]);
+      const run = toolResultToActionRun(data);
+      if (!run) return;
+      upsertActionRun(run);
+      applyActionRunStats(run);
+      finishActiveProcessItem(data.name, run.label, run.detail, run.status === "error" ? "error" : "done", run.id);
+      if ($("chatMode").value !== "interview") currentProcess.phase = "analyzing";
       renderAgentProcess();
+    }
+
+    function upsertActionRun(run) {
+      const index = currentProcess.actionRuns.findIndex((item) => item.id === run.id);
+      if (index >= 0) currentProcess.actionRuns[index] = {...currentProcess.actionRuns[index], ...run};
+      else currentProcess.actionRuns.push(run);
+    }
+
+    function applyActionRunStats(run) {
+      const tool = String(run.tool || run.kind || "");
+      const status = String(run.status || "");
+      const stats = run.stats && typeof run.stats === "object" ? run.stats : {};
+      const sourcePaths = Array.isArray(run.source_paths) ? run.source_paths : [];
+      if (tool === "search_notes") {
+        currentProcess.searched += status === "running" ? 0 : 1;
+        currentProcess.clueCount += Number(stats.hit_count || 0);
+      } else if (tool === "grep_vault") {
+        currentProcess.checked += status === "running" ? 0 : 1;
+        currentProcess.matchCount += Number(stats.hit_count || 0);
+      } else if (tool === "list_notes") {
+        currentProcess.listed += status === "running" ? 0 : 1;
+      } else if (tool === "online_search") {
+        currentProcess.online += status === "running" ? 0 : 1;
+        currentProcess.clueCount += Number(stats.hit_count || 0);
+      } else if (tool === "read_note") {
+        sourcePaths.forEach((path) => {
+          if (path) currentProcess.readPaths.add(String(path));
+        });
+      }
     }
 
     function collapseProcessForAnswer() {
       if (!currentProcess.visible || currentProcess.collapsed) return;
       currentProcess.collapsed = true;
-      addProcessItem("整理回答", "正在把查阅到的材料组织成回复", "active");
+      if ($("chatMode").value === "interview") {
+        renderAgentProcess();
+      } else {
+        currentProcess.phase = "generating";
+        addProcessItem("整理回答", "正在把查阅到的材料组织成回复", "active");
+      }
       renderAgentProcess();
     }
 
@@ -5482,6 +5498,7 @@ CHAT_HTML = r"""<!doctype html>
       if (!currentProcess.visible) return;
       currentProcess.done = true;
       currentProcess.collapsed = true;
+      currentProcess.phase = "done";
       currentProcess.items = currentProcess.items.map((item) => item.status === "active" ? {...item, status: "done"} : item);
       currentProcess.active = null;
       const metrics = data?.telemetry?.derived_metrics || {};
@@ -5501,14 +5518,122 @@ CHAT_HTML = r"""<!doctype html>
       return currentProcess.items.length - 1;
     }
 
-    function finishActiveProcessItem(toolName, title, detail) {
+    function finishActiveProcessItem(toolName, title, detail, status = "done", actionId = "") {
       const active = currentProcess.active;
-      if (active && active.name === toolName && currentProcess.items[active.index]) {
-        currentProcess.items[active.index] = {title, detail, status: "done"};
+      if (active && active.name === toolName && (!actionId || !active.actionId || active.actionId === actionId) && currentProcess.items[active.index]) {
+        currentProcess.items[active.index] = {title, detail, status};
         currentProcess.active = null;
         return;
       }
-      addProcessItem(title, detail, "done");
+      addProcessItem(title, detail, status);
+    }
+
+    function toolCallToActionRun(call) {
+      const name = String(call?.name || "").trim();
+      if (!name || isHiddenTool(name)) return null;
+      const args = call.arguments && typeof call.arguments === "object" ? call.arguments : {};
+      return {
+        id: String(call.id || `${name}-${Date.now()}`),
+        kind: name,
+        tool: name,
+        label: toolLabel(name),
+        detail: toolCallDetail(name, args),
+        status: "running",
+        stats: {},
+        latency_ms: null,
+        source_paths: []
+      };
+    }
+
+    function toolResultToActionRun(result) {
+      const name = String(result?.name || "").trim();
+      if (!name || isHiddenTool(name)) return null;
+      const output = result.output && typeof result.output === "object" ? result.output : {};
+      const stats = result.stats && typeof result.stats === "object" ? result.stats : deriveToolStats(name, output);
+      const sourcePaths = Array.isArray(stats.source_paths)
+        ? stats.source_paths
+        : sourcePathsFromOutput(output);
+      const ok = result.ok !== false && result.status !== "error";
+      return {
+        id: String(result.call_id || `${name}-${Date.now()}`),
+        kind: name,
+        tool: name,
+        label: toolLabel(name),
+        detail: toolResultDetail(name, output, stats, ok, String(result.error || "")),
+        status: ok ? "success" : "error",
+        stats,
+        latency_ms: Number(result.latency_ms || 0),
+        source_paths: sourcePaths
+      };
+    }
+
+    function isHiddenTool(name) {
+      return ["get_interview_state", "list_plan_topics", "inspect_state"].includes(name);
+    }
+
+    function toolLabel(name) {
+      const labels = {
+        search_notes: "查找相关笔记",
+        read_note: "阅读参考笔记",
+        grep_vault: "核对关键词",
+        list_notes: "浏览可用笔记",
+        recall_profile: "回顾你的薄弱点",
+        advance_layer: "推进追问层次",
+        select_topic: "切换面试主题",
+        online_search: "查找公开资料"
+      };
+      return labels[name] || "执行辅助动作";
+    }
+
+    function toolCallDetail(name, args) {
+      if (["search_notes", "grep_vault", "online_search"].includes(name)) return queryDetail(args.query);
+      if (name === "read_note") return [String(args.path || "指定笔记"), String(args.section_id || args.heading || "")].filter(Boolean).join(" · ");
+      if (name === "list_notes") return args.filter ? `筛选：${args.filter}` : "查看当前范围内可用笔记";
+      if (name === "recall_profile") return [String(args.topic || "当前主题"), String(args.planned_layer || "")].filter(Boolean).join(" · ");
+      if (name === "advance_layer") return String(args.reason || "进入下一层追问");
+      if (name === "select_topic") return [String(args.name || args.topic || "新主题"), String(args.reason || "")].filter(Boolean).join(" · ");
+      return "";
+    }
+
+    function toolResultDetail(name, output, stats, ok, error) {
+      if (!ok) return error || "工具调用未成功";
+      if (name === "search_notes") return `${Number(stats.hit_count || 0)} 条线索${sourcePathSummary(stats.source_paths || output.source_paths)}`;
+      if (name === "grep_vault") return `${Number(stats.hit_count || 0)} 处匹配${sourcePathSummary(stats.source_paths || output.source_paths)}`;
+      if (name === "list_notes") return `${Number(stats.hit_count || output.result_count || 0)} 篇候选${output.truncated ? "，已截断" : ""}`;
+      if (name === "read_note") {
+        const path = String(output.path || "指定笔记");
+        const headingPath = Array.isArray(output.heading_path) ? output.heading_path.join(" > ") : String(output.heading || "");
+        const offsetLabel = Number(output.offset || 0) > 0 ? ` · offset ${output.offset}` : "";
+        return `${path}${headingPath ? ` · ${headingPath}` : ""}${offsetLabel}${output.truncated ? "，内容较长已截断" : ""}`;
+      }
+      if (name === "recall_profile") {
+        const weak = Number(stats.hit_count || output.matching_weak_count || output.weak_points_count || 0);
+        const due = Number(output.due_review_count || output.due_reviews_count || 0);
+        return [weak ? `${weak} 条相关弱项` : "", due ? `${due} 条到期复习` : ""].filter(Boolean).join("，") || "已读取相关画像提示";
+      }
+      if (name === "advance_layer") return String(output.current_layer_name || output.target_layer || output.summary || "追问层次已更新");
+      if (name === "select_topic") return String(output.current_topic || output.topic || output.summary || "主题已更新");
+      if (name === "online_search") return `${Number(stats.hit_count || output.result_count || 0)} 条结果`;
+      return String(output.summary || "动作已完成");
+    }
+
+    function deriveToolStats(name, output) {
+      const stats = {};
+      const resultCount = Number(output.result_count ?? output.count ?? output.match_count ?? output.note_count ?? 0);
+      if (resultCount) stats.hit_count = resultCount;
+      const paths = sourcePathsFromOutput(output);
+      if (paths.length) {
+        stats.source_paths = paths;
+        stats.source_count = paths.length;
+        if (["search_notes", "grep_vault", "list_notes", "read_note"].includes(name)) stats.note_count = paths.length;
+      }
+      if (name === "read_note" && output.truncated !== undefined) stats.truncated = Boolean(output.truncated);
+      return stats;
+    }
+
+    function sourcePathsFromOutput(output) {
+      const paths = Array.isArray(output.source_paths) ? output.source_paths : (output.path ? [output.path] : []);
+      return Array.from(new Set(paths.map((path) => String(path || "").trim()).filter(Boolean)));
     }
 
     function renderAgentProcess() {
@@ -5523,21 +5648,44 @@ CHAT_HTML = r"""<!doctype html>
       node.open = !currentProcess.collapsed;
       node.classList.toggle("done", Boolean(currentProcess.done));
       const summary = processSummary();
+      const processTitle = agentProcessTitle();
       node.innerHTML = `
+        ${$("chatMode").value === "answer" ? `<div class="agent-process-progress"><div class="agent-process-progress-bar" style="width:${processProgress()}%"></div></div>` : ""}
         <summary>
-          <span class="agent-process-title"><span class="agent-process-dot"></span><span>${currentProcess.done ? "已完成资料查阅" : "正在查阅资料"}</span></span>
+          <span class="agent-process-title"><span class="agent-process-dot"></span><span>${escapeHtml(processTitle)}</span></span>
           <span class="agent-process-summary">${escapeHtml(summary)}</span>
         </summary>
         <div class="agent-process-body">
           ${currentProcess.items.map((item) => `
-            <div class="agent-process-item ${item.status === "active" ? "active" : ""}">
-              <span class="agent-process-icon">${item.status === "active" ? "•" : "✓"}</span>
+            <div class="agent-process-item ${item.status === "active" ? "active" : ""} ${item.status === "error" ? "error" : ""}">
+              <span class="agent-process-icon">${processItemIcon(item.status)}</span>
               <span>${escapeHtml(item.title)}${item.detail ? `<small>${escapeHtml(item.detail)}</small>` : ""}</span>
             </div>
           `).join("")}
         </div>
       `;
       applyStoppedProcessTitle(node);
+    }
+
+    function agentProcessTitle() {
+      if (currentProcess.stopped) return "已停止继续查阅";
+      const mode = $("chatMode").value;
+      if (mode === "interview") return currentProcess.done ? "已完成辅助动作" : "正在执行辅助动作";
+      return currentProcess.done ? "已完成资料查阅" : "正在查阅资料";
+    }
+
+    function processItemIcon(status) {
+      if (status === "active") return "•";
+      if (status === "error") return "!";
+      return "✓";
+    }
+
+    function processProgress() {
+      if (currentProcess.done) return 100;
+      if (currentProcess.phase === "generating") return 92;
+      if (currentProcess.phase === "analyzing") return 78;
+      if (currentProcess.phase === "tool_running") return 45;
+      return 18;
     }
 
     function applyStoppedProcessTitle(node) {
@@ -5554,7 +5702,7 @@ CHAT_HTML = r"""<!doctype html>
       if (evidenceCount) parts.push(`找到 ${evidenceCount} 条线索`);
       if (currentProcess.readPaths.size) parts.push(`已阅读 ${currentProcess.readPaths.size} 篇笔记`);
       if (currentProcess.online) parts.push("包含公开资料");
-      if (!parts.length && currentProcess.active) return "正在查阅";
+      if (!parts.length && currentProcess.active) return $("chatMode").value === "interview" ? "正在准备" : "正在查阅";
       return parts.length ? parts.join("，") : "准备中";
     }
 
@@ -5570,8 +5718,7 @@ CHAT_HTML = r"""<!doctype html>
       if (name === "search_notes") return ["查找相关笔记", queryDetail(args.query)];
       if (name === "grep_vault") return ["核对关键词出现位置", queryDetail(args.query)];
       if (name === "list_notes") return ["浏览可用笔记", args.filter ? `筛选：${args.filter}` : "查看当前范围内可用笔记"];
-      if (name === "read_note") return ["阅读笔记", `${String(args.path || "指定笔记")}${args.reason ? `：${args.reason}` : ""}${args.heading ? ` · ${args.heading}` : ""}`];
-      if (name === "inspect_note") return ["查看笔记结构", `${String(args.path || "指定笔记")}${args.reason ? `：${args.reason}` : ""}`];
+      if (name === "read_note") return ["阅读笔记", `${String(args.path || "指定笔记")}${args.reason ? `：${args.reason}` : ""}${args.section_id ? ` · ${args.section_id}` : args.heading ? ` · ${args.heading}` : ""}${args.offset ? ` · offset ${args.offset}` : ""}`];
       if (name === "online_search") return ["查找公开资料", queryDetail(args.query)];
       return null;
     }
@@ -5608,6 +5755,12 @@ CHAT_HTML = r"""<!doctype html>
           await selectInterviewTopic(button.dataset.topic || "");
         });
       });
+    }
+
+    function shouldRenderInterviewPlanForCurrentTurn() {
+      if ($("chatMode").value !== "interview") return false;
+      if (!currentInterviewState) return true;
+      return currentInterviewState.topic_phase === "awaiting_selection" || !currentInterviewState.current_topic;
     }
 
     async function selectInterviewTopic(topic) {
@@ -6030,11 +6183,13 @@ CHAT_HTML = r"""<!doctype html>
 
     async function completeInterviewTurn(turnIds, assistantContent) {
       if (!turnIds || !currentInterviewSessionId) return null;
+      const agentActions = currentProcess.actionRuns.length ? currentProcess.actionRuns : (currentPayload?.done?.agent_actions || currentPayload?.done?.telemetry?.agent_actions || []);
       const response = await fetch(`/api/interview/sessions/${encodeURIComponent(currentInterviewSessionId)}/messages/${encodeURIComponent(turnIds.assistant.id)}/complete`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
         assistant_content: assistantContent,
         interview_plan: currentInterviewPlan,
         interview_state: currentInterviewState,
-        source_note_paths: sourceNotePaths()
+        source_note_paths: sourceNotePaths(),
+        agent_actions: agentActions
       })});
       if (!response.ok) return null;
       const data = await response.json();
@@ -6071,12 +6226,14 @@ CHAT_HTML = r"""<!doctype html>
 
     async function persistInterviewTurn(userContent, assistantContent) {
       const sessionId = await ensureInterviewSession();
+      const agentActions = currentProcess.actionRuns.length ? currentProcess.actionRuns : (currentPayload?.done?.agent_actions || currentPayload?.done?.telemetry?.agent_actions || []);
       const response = await fetch(`/api/interview/sessions/${encodeURIComponent(sessionId)}/turns`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
         user_content: userContent,
         assistant_content: assistantContent,
         interview_plan: currentInterviewPlan,
         interview_state: currentInterviewState,
-        source_note_paths: sourceNotePaths()
+        source_note_paths: sourceNotePaths(),
+        agent_actions: agentActions
       })});
       if (!response.ok) return null;
       const data = await response.json();
@@ -6513,6 +6670,3 @@ CHAT_HTML = r"""<!doctype html>
 </body>
 </html>
 """
-
-
-
