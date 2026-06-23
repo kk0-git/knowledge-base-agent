@@ -224,6 +224,7 @@ class InterviewSessionStore:
         interview_state: dict[str, Any] | None = None,
         source_note_paths: list[str] | tuple[str, ...] | None = None,
         agent_actions: list[dict[str, Any]] | None = None,
+        citations: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         session = self.load_session(session_id)
         if session.get("status") not in {"active", "end_failed"}:
@@ -245,6 +246,8 @@ class InterviewSessionStore:
         }
         if agent_actions is not None:
             assistant_message["agent_actions"] = list(agent_actions)
+        if citations is not None:
+            assistant_message["citations"] = list(citations)
         messages.extend([user_message, assistant_message])
 
         if interview_plan is not None:
@@ -274,6 +277,7 @@ class InterviewSessionStore:
                 "assistant_message_id": assistant_message["id"],
                 "assistant_output_chars": len(assistant_content or ""),
                 "agent_action_count": len(agent_actions or []),
+                "citation_count": len(citations or []),
                 "state_phase": "pre_agent_commit",
                 "interview_state": interview_state or {},
                 **interview_state_trace_summary(interview_state),
@@ -350,6 +354,7 @@ class InterviewSessionStore:
         interview_state: dict[str, Any] | None = None,
         source_note_paths: list[str] | tuple[str, ...] | None = None,
         agent_actions: list[dict[str, Any]] | None = None,
+        citations: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         session = self.load_session(session_id)
         message = self._find_message(session, assistant_message_id, role="assistant")
@@ -361,6 +366,8 @@ class InterviewSessionStore:
         message["retryable"] = False
         if agent_actions is not None:
             message["agent_actions"] = list(agent_actions)
+        if citations is not None:
+            message["citations"] = list(citations)
         message["updated_at"] = now
         self._update_session_context(
             session,
@@ -380,6 +387,7 @@ class InterviewSessionStore:
                 "assistant_message_id": assistant_message_id,
                 "output_chars": len(assistant_content or ""),
                 "agent_action_count": len(agent_actions or []),
+                "citation_count": len(citations or []),
                 "interview_state": interview_state or {},
             },
         )

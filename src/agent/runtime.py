@@ -455,6 +455,11 @@ def effective_allowed_tools(*, skill: LoadedSkill, config: AgentRunConfig) -> li
     return sorted(allowed.difference(disabled))
 
 
+STATE_SENSITIVE_TOOL_NAMES = frozenset({"get_interview_state", "inspect_state"})
+STATE_WRITE_TOOL_NAMES = frozenset({"advance_layer", "select_topic", "record_signal", "write_observation_draft"})
+NON_CACHEABLE_TOOL_NAMES = STATE_SENSITIVE_TOOL_NAMES | STATE_WRITE_TOOL_NAMES
+
+
 def execute_with_run_cache(
     *,
     call: ToolCall,
@@ -464,7 +469,10 @@ def execute_with_run_cache(
 ) -> ToolResult:
     spec = registry.get(call.name)
     if not is_cacheable_tool(spec):
-        return executor.execute(call)
+        result = executor.execute(call)
+        if result.ok and call.name in STATE_WRITE_TOOL_NAMES:
+            invalidate_state_sensitive_cache(cache)
+        return result
     key = tool_cache_key(call)
     cached = cache.get(key)
     if cached is not None:
@@ -472,13 +480,20 @@ def execute_with_run_cache(
     result = executor.execute(call)
     if result.ok:
         cache[key] = result
+        if call.name in STATE_WRITE_TOOL_NAMES:
+            invalidate_state_sensitive_cache(cache)
     return result
 
 
 def is_cacheable_tool(spec: ToolSpec) -> bool:
     if spec.side_effect != "none" or spec.requires_confirmation:
         return False
-    return spec.name not in {"advance_layer", "select_topic", "record_signal", "write_observation_draft"}
+    return spec.name not in NON_CACHEABLE_TOOL_NAMES
+
+
+def invalidate_state_sensitive_cache(cache: dict[tuple[str, str], ToolResult]) -> None:
+    for key in [item for item in cache if item[0] in STATE_SENSITIVE_TOOL_NAMES]:
+        cache.pop(key, None)
 
 
 def tool_cache_key(call: ToolCall) -> tuple[str, str]:

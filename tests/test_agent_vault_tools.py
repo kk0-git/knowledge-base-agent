@@ -14,7 +14,7 @@ from agent.schema import ToolCall, WorkingMemory
 from agent.tool_executor import ToolExecutionContext, ToolExecutor
 from agent.tool_registry import ToolRegistry
 from agent.tools.vault import register_vault_tools
-from agent.tools.vault.guards import VaultPathError, normalize_relative_path
+from agent.tools.vault.guards import VaultPathError, filter_items_by_scope, normalize_relative_path
 from services.rag.schema import SearchResult, TextChunk
 
 
@@ -45,6 +45,21 @@ class VaultToolTests(unittest.TestCase):
         for path in ["../note.md", "/tmp/note.md", "folder/note.txt"]:
             with self.assertRaises(VaultPathError):
                 normalize_relative_path(path)
+
+    def test_filter_items_by_scope_fail_closed_for_restricted_scope(self) -> None:
+        items = ["allowed/a.md", "outside/b.md"]
+        self.assertEqual(
+            filter_items_by_scope(items, (), lambda path: path, scope_type="folder"),
+            [],
+        )
+        self.assertEqual(
+            filter_items_by_scope(items, ("allowed/a.md",), lambda path: path, scope_type="folder"),
+            ["allowed/a.md"],
+        )
+        self.assertEqual(
+            filter_items_by_scope(items, (), lambda path: path, scope_type="all_vault"),
+            items,
+        )
 
     def test_search_notes_filters_to_scope(self) -> None:
         registry = ToolRegistry()

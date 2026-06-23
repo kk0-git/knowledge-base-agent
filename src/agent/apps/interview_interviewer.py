@@ -76,6 +76,7 @@ class InterviewInterviewerApp:
             interview_plan=request.interview_plan,
             interview_state=state_before,
             state_machine=machine,
+            metadata={"collect_citations": True},
             turn_context={"runtime_context": runtime_context},
         )
         result = self.runtime.run(
@@ -100,6 +101,7 @@ class InterviewInterviewerApp:
         result.state.working.extra["interview_state_after"] = state_after
         result.state.working.extra["state_transitions"] = state_after.get("transition_history", [])
         result.state.working.extra["runtime_context"] = runtime_context
+        result.state.working.extra["citations"] = list(tool_context.citations)
         result.state.working.extra["derived_metrics"] = derive_interview_metrics(result=result, state_before=state_before, state_after=state_after)
         sync_working_from_snapshot(result.state.working, state_after)
         rewrite_trace_interview_metadata(
@@ -157,6 +159,7 @@ class InterviewInterviewerApp:
                     "agent_v2": True,
                     "interview_state": machine.snapshot(),
                     "derived_metrics": result.state.working.extra.get("derived_metrics", {}),
+                    "citations": result.state.working.extra.get("citations", []),
                     "total_ms": result.total_ms,
                 },
             },

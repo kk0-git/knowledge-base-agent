@@ -11,7 +11,7 @@ if str(PROJECT_SRC) not in sys.path:
     sys.path.insert(0, str(PROJECT_SRC))
 
 from agent.schema import ToolCall, ToolSpec, WorkingMemory
-from agent.tool_executor import ToolExecutionContext, ToolExecutor, build_success_result
+from agent.tool_executor import ToolExecutionContext, ToolExecutor, build_success_result, build_tool_citations
 from agent.tool_registry import ToolRegistry
 from services.workflows.interview_sessions import InterviewSessionStore
 
@@ -111,6 +111,7 @@ class AgentActionRunTests(unittest.TestCase):
                 {
                     "source_type": "note",
                     "path": "memory.md",
+                    "title": "memory",
                     "heading_path": ["Memory"],
                     "line_start": 3,
                     "line_end": 8,
@@ -118,6 +119,28 @@ class AgentActionRunTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_build_tool_citations_includes_search_title_and_score(self) -> None:
+        citations = build_tool_citations(
+            "search_notes",
+            {
+                "hits": [
+                    {
+                        "path": "个人/面试/MCP.md",
+                        "title": "MCP",
+                        "heading": "调用链路 > 传输方式",
+                        "lines": "42-78",
+                        "score": 0.9234,
+                    }
+                ]
+            },
+        )
+        self.assertEqual(len(citations), 1)
+        self.assertEqual(citations[0]["title"], "MCP")
+        self.assertEqual(citations[0]["score"], 0.9234)
+        self.assertEqual(citations[0]["heading_path"], ["调用链路", "传输方式"])
+        self.assertEqual(citations[0]["line_start"], 42)
+        self.assertEqual(citations[0]["line_end"], 78)
 
     def test_tool_executor_does_not_collect_citations_by_default(self) -> None:
         registry = ToolRegistry()

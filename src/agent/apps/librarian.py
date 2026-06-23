@@ -150,7 +150,7 @@ class LibrarianApp:
 
 
 def build_librarian_degraded_fallback(result: Any) -> dict[str, Any]:
-    if result.final_answer or result.stopped_reason != "max_steps":
+    if result.final_answer or result.stopped_reason == "final":
         return {}
 
     successful_results = [
@@ -160,7 +160,8 @@ def build_librarian_degraded_fallback(result: Any) -> dict[str, Any]:
         if tool_result.ok
     ]
     source_paths = collect_librarian_source_paths(result)
-    fallback_reason = str(result.metadata.get("fallback_reason") or result.error_type or "max_steps")
+    stopped_reason = str(result.stopped_reason or "llm_error")
+    fallback_reason = str(result.metadata.get("fallback_reason") or result.error_type or stopped_reason)
 
     if successful_results:
         evidence_summary = summarize_librarian_observations(successful_results)
@@ -174,6 +175,11 @@ def build_librarian_degraded_fallback(result: Any) -> dict[str, Any]:
             "我先基于已完成的资料查阅给出阶段性结果；你可以继续追问，我会接着当前问题收敛。"
             f"{source_line}{evidence_summary}"
         )
+    elif stopped_reason == "llm_error":
+        message = (
+            "模型调用失败，本轮没有生成回答。"
+            "请检查模型服务、API Key 或账户余额后重试。"
+        )
     else:
         message = (
             "本轮查阅已触达运行边界，且没有获得可用资料结果。"
@@ -183,7 +189,7 @@ def build_librarian_degraded_fallback(result: Any) -> dict[str, Any]:
     return {
         "answer": message,
         "stopped": {
-            "reason": result.stopped_reason,
+            "reason": stopped_reason,
             "message": message,
             "trace_path": result.trace_path,
             "recoverable": True,

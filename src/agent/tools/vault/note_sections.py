@@ -12,7 +12,7 @@ DEFAULT_READ_MAX_CHARS = 4000
 
 
 def load_scoped_note_text(path: str, ctx: ToolExecutionContext) -> tuple[str, str]:
-    relative = require_scope_allowed(path, ctx.scope_note_paths)
+    relative = require_scope_allowed(path, ctx.scope_note_paths, scope_type=ctx.scope_type)
     relative, full_path = resolve_vault_note_path(ctx.vault_root, relative)
     text = full_path.read_text(encoding="utf-8", errors="replace")
     return relative, text

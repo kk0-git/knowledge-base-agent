@@ -1,0 +1,722 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import date
+from typing import Any
+
+from knowledge_base_agent.llm.schema import LLMMessage, LLMRequest
+from services.workflows.interview_profile import (
+    InterviewProfileStore,
+    mark_weak_point_improved,
+    normalize_category,
+    profile_weak_point_for_agent,
+    split_due_reviews,
+    update_weak_point,
+)
+
+
+QUESTION_TYPES = ("recall", "boundary", "compare", "scenario", "followup")
+AUTO_QUESTION_TYPE = "auto"
+STRATEGY_CATEGORIES = {"answer_structure", "communication", "thinking_pattern"}
+DEFAULT_MAX_STRATEGY_CONSTRAINTS = 2
+
+QUESTION_TYPE_LABELS = {
+    "recall": "\u4e3b\u52a8\u56de\u5fc6",
+    "boundary": "\u804c\u8d23\u8fb9\u754c",
+    "compare": "\u6982\u5ff5\u5bf9\u6bd4",
+    "scenario": "\u573a\u666f\u8bbe\u8ba1",
+    "followup": "\u9762\u8bd5\u8ffd\u95ee",
+}
+
+UNCATEGORIZED = "\u672a\u5206\u7c7b"
+
+RECALL_PROMPT_SYSTEM = """You create one active-recall review question for a Chinese technical interview learner.
+
+Write in Simplified Chinese. Use only the weak point payload and review options.
+Do not answer the question.
+
+Question type meanings:
+- recall: ask for definition, flow, classification, or core mechanism from memory.
+- boundary: ask for responsibilities, ownership, lifecycle, or module boundary.
+- compare: ask the learner to compare two close concepts or tradeoffs.
+- scenario: give a practical engineering scenario and ask for a design.
+- followup: ask like an interviewer, pushing the weak point one layer deeper.
+
+Choose exactly one question type based on the weak point.
+Do not combine multiple question types in one question.
+Ask one primary question only.
+If the weak point contains many concepts, choose the smallest useful focus.
+For recall questions, ask one concept only.
+For boundary/compare questions, compare at most two concepts.
+For scenario questions, use one concrete scenario and one decision point.
+
+Return only JSON:
+{
+  "question_type": "recall|boundary|compare|scenario|followup",
+  "reason": "why this question type fits this weak point",
+  "prompt": "one concrete recall question",
+  "hint": "one short hint, or empty string",
+  "expected_focus": ["one expected answer point"]
+}
+"""
+
+
+def build_review_plan(
+    profile: dict[str, Any],
+    *,
+    topics: list[str] | tuple[str, ...] | None = None,
+    question_types: list[str] | tuple[str, ...] | None = None,
+    limit: int = 12,
+    early_limit: int = 8,
+    allow_cross_topic: bool = True,
+    today: str | None = None,
+) -> dict[str, Any]:
+    today_value = today or date.today().isoformat()
+    selected_topics = normalize_topics(topics)
+    selected_question_types = normalize_question_types(question_types)
+    available_topics = collect_review_topics(profile, today=today_value)
+
+    due, other_due = split_due_reviews(profile, None)
+    due_weak = filter_by_topics([*due, *other_due], selected_topics)
+    due_cards = assign_review_plan(
+        [review_card_payload(weak, due=True) for weak in due_weak],
+        selected_topics=selected_topics,
+        question_types=selected_question_types,
+        limit=limit,
+        allow_cross_topic=allow_cross_topic,
+    )
+
+    early_candidates = [
+        weak
+        for weak in profile.get("weak_points", [])
+        if isinstance(weak, dict)
+        and not weak.get("improved")
+        and topic_matches(weak, selected_topics)
+        and str((weak.get("sr") or {}).get("next_review") or "9999-12-31") > today_value
+    ]
+    early_cards = assign_review_plan(
+        [review_card_payload(weak, due=False, early=True) for weak in sorted(early_candidates, key=early_sort_key)],
+        selected_topics=selected_topics,
+        question_types=selected_question_types,
+        limit=early_limit,
+        allow_cross_topic=allow_cross_topic,
+    )
+
+    topic_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    overdue_count = 0
+    for card in due_cards:
+        topic = str(card.get("topic") or UNCATEGORIZED)
+        topic_counts[topic] = topic_counts.get(topic, 0) + 1
+        qtype = str(card.get("question_type") or AUTO_QUESTION_TYPE)
+        type_counts[qtype] = type_counts.get(qtype, 0) + 1
+        next_review = str((card.get("sr") or {}).get("next_review") or "")
+        if next_review and next_review < today_value:
+            overdue_count += 1
+
+    return {
+        "today": today_value,
+        "selected_topics": selected_topics,
+        "selected_question_types": selected_question_types,
+        "allow_cross_topic": allow_cross_topic,
+        "available_topics": available_topics,
+        "question_types": [{"value": value, "label": QUESTION_TYPE_LABELS[value]} for value in QUESTION_TYPES],
+        "cards": due_cards,
+        "early_candidates": early_cards,
+        "stats": {
+            "due_count": len(due_cards),
+            "overdue_count": overdue_count,
+            "early_count": len(early_cards),
+            "topic_counts": topic_counts,
+            "question_type_counts": type_counts,
+        },
+    }
+
+
+def list_due_reviews(
+    profile: dict[str, Any],
+    *,
+    topics: list[str] | tuple[str, ...] | None = None,
+    question_types: list[str] | tuple[str, ...] | None = None,
+    limit: int = 12,
+    early_limit: int = 8,
+    today: str | None = None,
+) -> dict[str, Any]:
+    return build_review_plan(
+        profile,
+        topics=topics,
+        question_types=question_types,
+        limit=limit,
+        early_limit=early_limit,
+        today=today,
+    )
+
+
+def build_due_review_overview(
+    profile: dict[str, Any],
+    *,
+    limit: int = 50,
+    today: str | None = None,
+    max_strategy_constraints: int = DEFAULT_MAX_STRATEGY_CONSTRAINTS,
+) -> dict[str, Any]:
+    today_value = today or date.today().isoformat()
+    due, other_due = split_due_reviews(profile, None)
+    due_weak_points = [*due, *other_due]
+    strategies = select_strategy_constraints(profile, max_items=max_strategy_constraints, today=today_value)
+    cards = [
+        attach_strategy_constraints(review_card_payload(weak, due=True), strategies)
+        for weak in due_weak_points
+        if is_knowledge_weak_point(weak)
+    ][: max(0, limit)]
+    strategy_due_count = len([weak for weak in due_weak_points if is_strategy_weak_point(weak)])
+    by_topic: dict[str, int] = {}
+    overdue_count = 0
+    for card in cards:
+        topic = str(card.get("topic") or UNCATEGORIZED)
+        by_topic[topic] = by_topic.get(topic, 0) + 1
+        next_review = str((card.get("sr") or {}).get("next_review") or "")
+        if next_review and next_review < today_value:
+            overdue_count += 1
+    topics = [
+        {"topic": topic, "due": count}
+        for topic, count in sorted(by_topic.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    summary = " · ".join(f"{item['topic']} {item['due']} 个弱项到期" for item in topics[:3])
+    if not cards and strategy_due_count:
+        summary = f"当前只有 {strategy_due_count} 个回答策略弱项到期，需进入面试或知识卡中训练。"
+    return {
+        "today": today_value,
+        "due_count": len(cards),
+        "overdue_count": overdue_count,
+        "strategy_due_count": strategy_due_count,
+        "strategy_constraints": strategies,
+        "topics": topics,
+        "cards": cards,
+        "summary": summary,
+    }
+
+
+def review_card_payload(weak: dict[str, Any], *, due: bool, early: bool = False) -> dict[str, Any]:
+    payload = profile_weak_point_for_agent(weak)
+    payload.update(
+        {
+            "id": weak_point_id(weak),
+            "main_weak_point": profile_weak_point_for_agent(weak),
+            "due": due,
+            "early": early,
+            "source_note_paths": list(weak.get("source_note_paths") or []),
+            "last_seen": weak.get("last_seen", ""),
+            "strategy_constraints": [],
+        }
+    )
+    return payload
+
+
+def is_knowledge_weak_point(weak: dict[str, Any]) -> bool:
+    return normalize_category(weak.get("category")) == "knowledge_gap"
+
+
+def is_strategy_weak_point(weak: dict[str, Any]) -> bool:
+    return normalize_category(weak.get("category")) in STRATEGY_CATEGORIES
+
+
+def strategy_constraint_payload(weak: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": weak_point_id(weak),
+        "point": str(weak.get("point") or "").strip(),
+        "category": normalize_category(weak.get("category")),
+        "topic": str(weak.get("topic") or "").strip(),
+        "evidence": str(weak.get("evidence") or "").strip(),
+    }
+
+
+def strategy_constraint_sort_key(weak: dict[str, Any], *, today: str) -> tuple[int, str, float, int, str]:
+    sr = weak.get("sr") or {}
+    next_review = str(sr.get("next_review") or "9999-12-31")
+    overdue_rank = 0 if next_review < today else 1
+    return (
+        overdue_rank,
+        next_review,
+        float(sr.get("ease_factor", 2.5) or 2.5),
+        -int(weak.get("times_seen", 0) or 0),
+        str(weak.get("last_seen") or "0000-00-00"),
+    )
+
+
+def select_strategy_constraints(
+    profile: dict[str, Any],
+    *,
+    max_items: int = DEFAULT_MAX_STRATEGY_CONSTRAINTS,
+    today: str | None = None,
+) -> list[dict[str, Any]]:
+    today_value = today or date.today().isoformat()
+    candidates = [
+        weak
+        for weak in profile.get("weak_points", [])
+        if isinstance(weak, dict)
+        and not weak.get("improved")
+        and is_strategy_weak_point(weak)
+        and str((weak.get("sr") or {}).get("next_review") or "2000-01-01") <= today_value
+    ]
+    ordered = sorted(candidates, key=lambda weak: strategy_constraint_sort_key(weak, today=today_value))
+    return [strategy_constraint_payload(weak) for weak in ordered[: max(0, max_items)]]
+
+
+def attach_strategy_constraints(card: dict[str, Any], constraints: list[dict[str, Any]]) -> dict[str, Any]:
+    enriched = dict(card)
+    enriched["strategy_constraints"] = [dict(item) for item in constraints]
+    return enriched
+
+
+def weak_point_id(weak: dict[str, Any]) -> str:
+    for key in ("id", "weak_id", "uid"):
+        value = str(weak.get(key) or "").strip()
+        if value:
+            return value
+    seed = "|".join(
+        [
+            str(weak.get("topic") or ""),
+            str(weak.get("planned_layer") or ""),
+            str(weak.get("point") or ""),
+            str(weak.get("evidence") or ""),
+        ]
+    )
+    return "weak-" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
+
+
+def collect_review_topics(profile: dict[str, Any], *, today: str | None = None) -> list[dict[str, Any]]:
+    today_value = today or date.today().isoformat()
+    counts: dict[str, dict[str, int]] = {}
+    for weak in profile.get("weak_points", []):
+        if not isinstance(weak, dict) or weak.get("improved"):
+            continue
+        topic = str(weak.get("topic") or UNCATEGORIZED).strip() or UNCATEGORIZED
+        item = counts.setdefault(topic, {"total": 0, "due": 0})
+        item["total"] += 1
+        next_review = str((weak.get("sr") or {}).get("next_review") or "2000-01-01")
+        if next_review <= today_value:
+            item["due"] += 1
+    return [
+        {"topic": topic, "total": values["total"], "due": values["due"]}
+        for topic, values in sorted(counts.items(), key=lambda pair: (-pair[1]["due"], pair[0]))
+    ]
+
+
+def assign_review_plan(
+    cards: list[dict[str, Any]],
+    *,
+    selected_topics: list[str],
+    question_types: list[str],
+    limit: int,
+    allow_cross_topic: bool,
+) -> list[dict[str, Any]]:
+    ordered = interleave_by_topic(cards)
+    planned: list[dict[str, Any]] = []
+    topic_pool = selected_topics or sorted({str(card.get("topic") or "") for card in ordered if str(card.get("topic") or "").strip()})
+    for index, card in enumerate(ordered[: max(0, limit)]):
+        planned_card = dict(card)
+        planned_card["allowed_question_types"] = list(question_types)
+        planned_card["question_type"] = AUTO_QUESTION_TYPE
+        planned_card["question_type_label"] = "\u81ea\u52a8\u9009\u62e9"
+        planned_card["candidate_related_topics"] = related_topics_for_card(
+            planned_card,
+            topic_pool,
+            index=index,
+            allow_cross_topic=allow_cross_topic,
+        )
+        planned_card["related_topics"] = []
+        planned.append(planned_card)
+    return planned
+
+
+def interleave_by_topic(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for card in cards:
+        topic = str(card.get("topic") or UNCATEGORIZED)
+        buckets.setdefault(topic, []).append(card)
+    ordered: list[dict[str, Any]] = []
+    topics = sorted(buckets)
+    while any(buckets.values()):
+        for topic in topics:
+            if buckets[topic]:
+                ordered.append(buckets[topic].pop(0))
+    return ordered
+
+
+def related_topics_for_card(card: dict[str, Any], topics: list[str], *, index: int, allow_cross_topic: bool) -> list[str]:
+    if not allow_cross_topic:
+        return []
+    current = str(card.get("topic") or "").strip()
+    others = [topic for topic in topics if topic and topic != current]
+    if not others:
+        return []
+    return [others[index % len(others)]]
+
+
+def normalize_topics(topics: list[str] | tuple[str, ...] | None) -> list[str]:
+    result: list[str] = []
+    for item in topics or []:
+        for part in str(item or "").split(","):
+            value = part.strip()
+            if value and value not in result:
+                result.append(value)
+    return result
+
+
+def normalize_question_types(question_types: list[str] | tuple[str, ...] | None) -> list[str]:
+    result: list[str] = []
+    for item in question_types or []:
+        for part in str(item or "").split(","):
+            value = part.strip()
+            if value in QUESTION_TYPES and value not in result:
+                result.append(value)
+    return result or ["recall", "boundary", "scenario", "followup"]
+
+
+def filter_by_topics(items: list[dict[str, Any]], selected_topics: list[str]) -> list[dict[str, Any]]:
+    return [item for item in items if topic_matches(item, selected_topics)]
+
+
+def topic_matches(weak: dict[str, Any], selected_topics: list[str]) -> bool:
+    if not selected_topics:
+        return True
+    topic = str(weak.get("topic") or "").strip()
+    return topic in selected_topics
+
+
+def early_sort_key(weak: dict[str, Any]) -> tuple[float, str, str]:
+    sr = weak.get("sr") or {}
+    return (
+        float(sr.get("ease_factor", 2.5) or 2.5),
+        str(sr.get("next_review") or "9999-12-31"),
+        str(weak.get("last_seen") or "0000-00-00"),
+    )
+
+
+def find_weak_point(profile: dict[str, Any], card_id: str) -> dict[str, Any] | None:
+    target = str(card_id or "").strip()
+    for weak in profile.get("weak_points", []):
+        if isinstance(weak, dict) and weak_point_id(weak) == target:
+            return weak
+    return None
+
+
+def build_static_recall_prompt(
+    weak: dict[str, Any],
+    *,
+    question_type: str = AUTO_QUESTION_TYPE,
+    related_topics: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    point = str(weak.get("point") or "\u8fd9\u4e2a\u8584\u5f31\u70b9").strip()
+    topic = str(weak.get("topic") or "").strip()
+    related = [str(item).strip() for item in related_topics or [] if str(item).strip()]
+    qtype = question_type if question_type in QUESTION_TYPES else choose_question_type_for_weak_point(weak)
+    title = topic or "\u8fd9\u4e2a\u4e3b\u9898"
+    if qtype == "boundary":
+        prompt = f"\u56f4\u7ed5\u300c{title}\u300d\uff0c\u8bf7\u8bf4\u660e\u8fd9\u4e2a\u8584\u5f31\u70b9\u6d89\u53ca\u7684\u804c\u8d23\u8fb9\u754c\uff1a{point}"
+    elif qtype == "compare":
+        target = f"\u5e76\u7ed3\u5408\u300c{related[0]}\u300d\u505a\u5bf9\u6bd4" if related else "\u5e76\u548c\u5bb9\u6613\u6df7\u6dc6\u7684\u76f8\u8fd1\u6982\u5ff5\u505a\u5bf9\u6bd4"
+        prompt = f"\u8bf7\u89e3\u91ca\u300c{title}\u300d\u4e2d\u7684\u8584\u5f31\u70b9\uff1a{point}\uff0c{target}\u3002"
+    elif qtype == "scenario":
+        target = f"\uff0c\u540c\u65f6\u8003\u8651\u300c{related[0]}\u300d" if related else ""
+        prompt = f"\u7ed9\u4f60\u4e00\u4e2a\u5de5\u7a0b\u573a\u666f\uff1a\u9700\u8981\u8bbe\u8ba1\u548c\u300c{title}\u300d\u76f8\u5173\u7684\u65b9\u6848{target}\u3002\u8bf7\u4e0d\u7528\u770b\u7b14\u8bb0\uff0c\u8bf4\u660e\u4f60\u4f1a\u5982\u4f55\u5904\u7406\uff1a{point}"
+    elif qtype == "followup":
+        prompt = f"\u9762\u8bd5\u5b98\u7ee7\u7eed\u8ffd\u95ee\uff1a\u4f60\u521a\u624d\u63d0\u5230\u300c{title}\u300d\uff0c\u8bf7\u628a\u8fd9\u4e2a\u70b9\u8bb2\u5177\u4f53\u4e00\u5c42\uff1a{point}"
+    else:
+        prompt = f"\u56f4\u7ed5\u300c{topic or '\u8fd9\u4e2a\u77e5\u8bc6\u70b9'}\u300d\uff0c\u8bf7\u5148\u4e0d\u770b\u7b14\u8bb0\uff0c\u7528\u81ea\u5df1\u7684\u8bdd\u56de\u7b54\uff1a{point}"
+    return {
+        "prompt": prompt,
+        "hint": str(weak.get("planned_layer") or "").strip(),
+        "question_type": qtype,
+        "question_type_label": QUESTION_TYPE_LABELS.get(qtype, qtype),
+        "reason": "fallback rule selected this type from the weak point text",
+        "expected_focus": [],
+        "related_topics": related,
+        "fallback_used": True,
+    }
+
+
+def build_recall_prompt(
+    weak: dict[str, Any],
+    *,
+    question_type: str = AUTO_QUESTION_TYPE,
+    allowed_question_types: list[str] | tuple[str, ...] | None = None,
+    related_topics: list[str] | tuple[str, ...] | None = None,
+    llm_client: Any | None = None,
+    model: str = "",
+    temperature: float = 0.2,
+) -> dict[str, Any]:
+    preferred_type = question_type if question_type in QUESTION_TYPES else AUTO_QUESTION_TYPE
+    allowed_types = normalize_question_types(allowed_question_types) if allowed_question_types else list(QUESTION_TYPES)
+    related = [str(item).strip() for item in related_topics or [] if str(item).strip()]
+    fallback = build_static_recall_prompt(weak, question_type=preferred_type, related_topics=related)
+    if fallback["question_type"] not in allowed_types:
+        fallback = build_static_recall_prompt(weak, question_type=allowed_types[0], related_topics=related)
+    if llm_client is None or not model:
+        return fallback
+    try:
+        payload = {
+            "weak_point": profile_weak_point_for_agent(weak),
+            "preferred_question_type": preferred_type,
+            "allowed_question_types": [
+                {"value": value, "label": QUESTION_TYPE_LABELS.get(value, value)}
+                for value in allowed_types
+            ],
+            "candidate_related_topics": related,
+            "selection_rules": {
+                "choose_exactly_one_type": True,
+                "one_primary_question_only": True,
+                "smallest_useful_focus": True,
+                "max_compare_targets": 2,
+            },
+        }
+        response = llm_client.complete(
+            LLMRequest(
+                model=model,
+                temperature=temperature,
+                messages=[
+                    LLMMessage(role="system", content=RECALL_PROMPT_SYSTEM),
+                    LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False, indent=2)),
+                ],
+            )
+        )
+        parsed = parse_json_object(response.content)
+        selected_type = str(parsed.get("question_type") or "").strip()
+        if selected_type not in allowed_types:
+            selected_type = fallback["question_type"]
+        prompt = str(parsed.get("prompt") or "").strip()
+        if not prompt:
+            raise ValueError("empty prompt")
+        return {
+            "prompt": prompt,
+            "hint": str(parsed.get("hint") or "").strip(),
+            "question_type": selected_type,
+            "question_type_label": QUESTION_TYPE_LABELS.get(selected_type, selected_type),
+            "reason": str(parsed.get("reason") or "").strip(),
+            "expected_focus": list_of_strings(parsed.get("expected_focus")),
+            "related_topics": related if selected_type in {"boundary", "compare", "scenario"} else [],
+            "fallback_used": False,
+        }
+    except Exception as exc:
+        result = dict(fallback)
+        result["error"] = str(exc)
+        return result
+
+
+def choose_question_type_for_weak_point(weak: dict[str, Any]) -> str:
+    text = " ".join(
+        str(weak.get(key) or "")
+        for key in ("point", "evidence", "planned_layer", "topic")
+    ).lower()
+    if any(marker in text for marker in ("boundary", "边界", "职责", "ownership", "lifecycle", "混淆")):
+        return "boundary"
+    if any(marker in text for marker in ("compare", "对比", "区别", "tradeoff", "取舍", " vs ")):
+        return "compare"
+    if any(marker in text for marker in ("scenario", "场景", "设计", "工程", "生产", "方案")):
+        return "scenario"
+    if any(marker in text for marker in ("followup", "追问", "深入", "具体一层")):
+        return "followup"
+    return "recall"
+
+
+def grade_weak_point(profile: dict[str, Any], weak: dict[str, Any], *, outcome: str, today: str | None = None) -> dict[str, Any]:
+    normalized = str(outcome or "").strip().lower()
+    today_value = today or date.today().isoformat()
+    observation = {
+        "planned_layer": weak.get("planned_layer") or "",
+        "evidence": "review practice outcome",
+    }
+    before = json.loads(json.dumps(weak.get("sr") or {}, ensure_ascii=False))
+    if normalized == "pass":
+        mark_weak_point_improved(weak, observation, session_id="review", today=today_value)
+    elif normalized == "fail":
+        update_weak_point(weak, observation, session_id="review", today=today_value)
+    else:
+        raise ValueError("outcome must be pass or fail")
+    after = weak.get("sr") or {}
+    return {
+        "card_id": weak_point_id(weak),
+        "outcome": normalized,
+        "before": before,
+        "after": after,
+        "improved": bool(weak.get("improved")),
+    }
+
+
+def commit_review_outcome(store: InterviewProfileStore, *, card_id: str, outcome: str) -> dict[str, Any]:
+    profile = store.load()
+    weak = find_weak_point(profile, card_id)
+    if weak is None:
+        raise KeyError(f"review card not found: {card_id}")
+    result = grade_weak_point(profile, weak, outcome=outcome)
+    store.save(profile)
+    return result
+
+
+def commit_review_action(store: InterviewProfileStore, *, card_id: str, action: str) -> dict[str, Any]:
+    normalized = str(action or "").strip().lower()
+    if normalized == "improve":
+        return commit_review_outcome(store, card_id=card_id, outcome="pass")
+    if normalized != "retry":
+        raise ValueError("action must be improve or retry")
+    profile = store.load()
+    weak = find_weak_point(profile, card_id)
+    if weak is None:
+        raise KeyError(f"review card not found: {card_id}")
+    today_value = date.today().isoformat()
+    before = json.loads(json.dumps(weak.get("sr") or {}, ensure_ascii=False))
+    weak["last_seen"] = today_value
+    weak["improved"] = False
+    sr = weak.setdefault("sr", {})
+    sr["ease_factor"] = round(float(sr.get("ease_factor", 2.5) or 2.5), 2)
+    sr["repetitions"] = int(sr.get("repetitions", 0) or 0)
+    sr["interval_days"] = 1
+    sr["next_review"] = today_value
+    sr["last_outcome"] = "retry"
+    store.save(profile)
+    return {
+        "card_id": card_id,
+        "action": "retry",
+        "before": before,
+        "after": sr,
+        "improved": False,
+    }
+
+
+def parse_correction_payload(text: str, *, citations: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    try:
+        payload = parse_json_object(text)
+    except Exception:
+        return {
+            "covered": [],
+            "missing": [],
+            "corrections": [str(text or "").strip()] if str(text or "").strip() else [],
+            "feedback": str(text or "").strip(),
+            "suggested_outcome": "fail",
+            "parse_error": True,
+            "citations": list(citations or []),
+        }
+    outcome = str(payload.get("suggested_outcome") or "fail").strip().lower()
+    if outcome not in {"pass", "fail"}:
+        outcome = "fail"
+    return {
+        "covered": list_of_strings(payload.get("covered")),
+        "missing": list_of_strings(payload.get("missing")),
+        "corrections": list_of_strings(payload.get("corrections")),
+        "feedback": str(payload.get("feedback") or "").strip(),
+        "suggested_outcome": outcome,
+        "parse_error": False,
+        "citations": list(citations or []),
+    }
+
+
+def parse_verification_payload(text: str, *, citations: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    try:
+        payload = parse_json_object(text)
+    except Exception:
+        raw = str(text or "").strip()
+        return {
+            "correct": [],
+            "missed": [],
+            "knowledge_correct": False,
+            "strategy_feedback": [],
+            "example": raw,
+            "feedback": raw,
+            "suggested_action": "retry",
+            "parse_error": True,
+            "citations": list(citations or []),
+        }
+    suggested = str(payload.get("suggested_action") or payload.get("suggested_outcome") or "retry").strip().lower()
+    if suggested in {"pass", "improved"}:
+        suggested = "improve"
+    if suggested not in {"improve", "retry"}:
+        suggested = "retry"
+    correct = payload.get("correct", payload.get("covered"))
+    missed = payload.get("missed", payload.get("missing"))
+    example = str(payload.get("example") or payload.get("feedback") or "").strip()
+    return {
+        "correct": list_of_strings(correct),
+        "missed": list_of_strings(missed),
+        "knowledge_correct": bool(payload.get("knowledge_correct", suggested == "improve")),
+        "strategy_feedback": list_of_strings(payload.get("strategy_feedback")),
+        "example": example,
+        "feedback": str(payload.get("feedback") or "").strip(),
+        "suggested_action": suggested,
+        "parse_error": False,
+        "citations": list(citations or []),
+    }
+
+
+def build_correction_query(*, prompt: str, weak: dict[str, Any], answer: str) -> str:
+    return "\n".join(
+        [
+            "\u8bf7\u4f5c\u4e3a\u590d\u4e60\u7ea0\u504f\u52a9\u624b\uff0c\u5bf9\u7167\u6307\u5b9a\u7b14\u8bb0\u68c0\u67e5\u8fd9\u6b21\u4e3b\u52a8\u56de\u5fc6\u4f5c\u7b54\u3002",
+            "\u53ea\u8fd4\u56de JSON\uff0c\u4e0d\u8981\u8f93\u51fa Markdown\u3002",
+            "",
+            "JSON schema:",
+            '{"covered":["\u5df2\u8986\u76d6\u70b9"],"missing":["\u9057\u6f0f\u70b9"],"corrections":["\u7ea0\u504f\u8bf4\u660e"],"feedback":"\u7b80\u77ed\u53cd\u9988","suggested_outcome":"pass|fail"}',
+            "",
+            "\u8584\u5f31\u70b9:",
+            json.dumps(profile_weak_point_for_agent(weak), ensure_ascii=False),
+            "",
+            "\u56de\u5fc6\u9898:",
+            prompt,
+            "",
+            "\u7528\u6237\u4f5c\u7b54:",
+            answer,
+        ]
+    )
+
+
+def build_weak_point_verification_query(
+    *,
+    weak: dict[str, Any],
+    answer: str,
+    prompt: str = "",
+    strategy_constraints: list[dict[str, Any]] | None = None,
+) -> str:
+    return "\n".join(
+        [
+            "\u8bf7\u4f5c\u4e3a\u590d\u4e60\u7ea0\u504f\u52a9\u624b\uff0c\u5bf9\u7167\u6307\u5b9a\u7b14\u8bb0\u68c0\u67e5\u7528\u6237\u5bf9\u8fd9\u4e2a\u8584\u5f31\u70b9\u7684\u81ea\u8ff0\u3002",
+            "\u540c\u65f6\u68c0\u67e5\u7528\u6237\u662f\u5426\u6ee1\u8db3\u672c\u9898\u4f5c\u7b54\u8981\u6c42\uff0c\u4f46\u4e0d\u8981\u628a\u4f5c\u7b54\u8981\u6c42\u5f53\u6210\u4e3b\u77e5\u8bc6\u70b9\u8bc4\u5206\u3002",
+            "\u53ea\u8fd4\u56de JSON\uff0c\u4e0d\u8981\u8f93\u51fa Markdown\u3002",
+            "",
+            "JSON schema:",
+            '{"knowledge_correct":true,"strategy_feedback":["\u4f5c\u7b54\u8981\u6c42\u7684\u8bc4\u4f30"],"correct":["\u65b9\u5411\u6b63\u786e\u7684\u70b9"],"missed":["\u8fd8\u7f3a\u7684\u70b9"],"example":"\u4e00\u6bb5\u53ef\u76f4\u63a5\u5b66\u4e60\u7684\u793a\u4f8b\u8868\u8fbe","feedback":"\u7b80\u77ed\u53cd\u9988","suggested_action":"improve|retry"}',
+            "",
+            "\u4e3b\u77e5\u8bc6\u8584\u5f31\u70b9:",
+            json.dumps(profile_weak_point_for_agent(weak), ensure_ascii=False),
+            "",
+            "\u672c\u9898\u9898\u9762:",
+            str(prompt or "").strip(),
+            "",
+            "\u672c\u9898\u4f5c\u7b54\u8981\u6c42\uff08\u4ec5\u4f5c\u4e3a\u8868\u8fbe\u548c\u601d\u8def\u8bc4\u4f30\uff09:",
+            json.dumps(list(strategy_constraints or []), ensure_ascii=False),
+            "",
+            "\u7528\u6237\u5f53\u524d\u7406\u89e3:",
+            answer,
+        ]
+    )
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.startswith("json"):
+            raw = raw[4:].strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end >= start:
+        raw = raw[start : end + 1]
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("expected JSON object")
+    return payload
+
+
+def list_of_strings(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]

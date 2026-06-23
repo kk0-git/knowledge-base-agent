@@ -32,7 +32,12 @@ def list_notes(arguments: dict[str, Any], ctx: ToolExecutionContext) -> dict[str
     limit = max(1, min(int(arguments.get("limit") or 80), 200))
     filter_text = str(arguments.get("filter") or "").replace("\\", "/").strip().lower()
     paths = candidate_note_paths(ctx.vault_root)
-    scoped_paths = filter_items_by_scope(paths, ctx.scope_note_paths, lambda path: path)
+    scoped_paths = filter_items_by_scope(
+        paths,
+        ctx.scope_note_paths,
+        lambda path: path,
+        scope_type=ctx.scope_type,
+    )
     if filter_text:
         scoped_paths = [path for path in scoped_paths if filter_text in path.lower()]
     total = len(scoped_paths)

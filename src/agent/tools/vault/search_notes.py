@@ -46,6 +46,7 @@ def search_notes(arguments: dict[str, Any], ctx: ToolExecutionContext) -> dict[s
         raw_results,
         ctx.scope_note_paths,
         lambda result: result.chunk.note_path,
+        scope_type=ctx.scope_type,
     )[:top_k]
     hits: list[dict[str, Any]] = []
     truncated = False

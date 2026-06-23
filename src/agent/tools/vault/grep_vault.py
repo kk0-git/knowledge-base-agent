@@ -41,7 +41,12 @@ def grep_vault(arguments: dict[str, Any], ctx: ToolExecutionContext) -> dict[str
         limit=max(limit * 4, limit),
         ignore_case=ignore_case,
     )
-    scoped = filter_items_by_scope(raw_matches, ctx.scope_note_paths, lambda item: item.path)[:limit]
+    scoped = filter_items_by_scope(
+        raw_matches,
+        ctx.scope_note_paths,
+        lambda item: item.path,
+        scope_type=ctx.scope_type,
+    )[:limit]
     matches = [
         {
             "path": item.path,
@@ -50,9 +55,18 @@ def grep_vault(arguments: dict[str, Any], ctx: ToolExecutionContext) -> dict[str
         }
         for item in scoped
     ]
-    return {
+    output = {
         "query": query,
         "result_count": len(matches),
         "matches": matches,
         "source_paths": sorted({item["path"] for item in matches}),
     }
+    ctx.put_stats(
+        {
+            "pattern": query,
+            "requested_limit": limit,
+            "raw_match_count": len(raw_matches),
+            "truncated": len(raw_matches) > len(matches),
+        }
+    )
+    return output

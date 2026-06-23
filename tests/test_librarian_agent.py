@@ -268,6 +268,23 @@ class LibrarianAgentTests(unittest.TestCase):
         self.assertTrue(fallback["stopped"]["recoverable"])
         self.assertIn("没有获得可用资料结果", fallback["answer"])
 
+    def test_librarian_fallback_for_llm_error_without_observations(self) -> None:
+        result = AgentResult(
+            state=AgentState(messages=[], working=WorkingMemory(), skill_name="librarian"),
+            steps=[],
+            final_answer="",
+            total_ms=10,
+            stopped_reason="llm_error",
+            trace_path="trace.json",
+            error="LLM HTTP error 402: Insufficient Balance",
+            error_type="RuntimeError",
+        )
+        fallback = build_librarian_fallback(result)
+        self.assertFalse(fallback["stopped"]["partial"])
+        self.assertTrue(fallback["stopped"]["recoverable"])
+        self.assertEqual(fallback["stopped"]["reason"], "llm_error")
+        self.assertIn("模型调用失败", fallback["answer"])
+
     def test_librarian_runtime_search_read_final_trace_and_working_memory(self) -> None:
         registry = ToolRegistry()
         register_vault_tools(registry)

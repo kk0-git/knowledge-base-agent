@@ -13,8 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from agent.apps import (
@@ -78,6 +78,19 @@ from services.workflows.interview_profile import (
 )
 from services.workflows.interview_memory_commit import commit_interview_memory
 from services.workflows.interview_sessions import InterviewSessionStore
+from services.workflows.review_practice import (
+    build_due_review_overview,
+    build_correction_query,
+    build_weak_point_verification_query,
+    build_recall_prompt,
+    build_review_plan,
+    commit_review_action,
+    commit_review_outcome,
+    find_weak_point,
+    parse_correction_payload,
+    parse_verification_payload,
+    select_strategy_constraints,
+)
 from services.workflows.runner import WorkflowRunner, task_result_to_dict
 from services.workflows.schema import ScopeSpec, WorkflowSpec, WritebackSpec
 from services.workflows.scope_resolver import ScopeResolver
@@ -248,6 +261,7 @@ class InterviewSessionAppendTurnRequest(BaseModel):
     interview_state: dict[str, Any] | None = Field(default=None)
     source_note_paths: list[str] = Field(default_factory=list)
     agent_actions: list[dict[str, Any]] = Field(default_factory=list)
+    citations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class InterviewSessionPendingTurnRequest(BaseModel):
@@ -263,6 +277,7 @@ class InterviewSessionCompleteAssistantRequest(BaseModel):
     interview_state: dict[str, Any] | None = Field(default=None)
     source_note_paths: list[str] = Field(default_factory=list)
     agent_actions: list[dict[str, Any]] = Field(default_factory=list)
+    citations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class InterviewSessionFailAssistantRequest(BaseModel):
@@ -365,6 +380,38 @@ class WorkflowRunRequest(BaseModel):
     context_mode: str | None = Field(default=None)
     writeback: WorkflowWritebackRequest = Field(default_factory=WorkflowWritebackRequest)
     options: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReviewPlanRequest(BaseModel):
+    topics: list[str] = Field(default_factory=list)
+    question_types: list[str] = Field(default_factory=list)
+    limit: int = Field(default=10, ge=1, le=50)
+    allow_cross_topic: bool = Field(default=True)
+
+
+class ReviewPromptRequest(BaseModel):
+    allowed_question_types: list[str] = Field(default_factory=list)
+    related_topics: list[str] = Field(default_factory=list)
+
+
+class ReviewGradeRequest(BaseModel):
+    prompt: str = Field(default="")
+    answer: str = Field(default="")
+
+
+class ReviewCommitRequest(BaseModel):
+    outcome: str = Field(default="")
+
+
+class ReviewVerifyRequest(BaseModel):
+    weak_point_id: str = Field(default="")
+    answer: str = Field(default="")
+    prompt: str = Field(default="")
+
+
+class ReviewActionCommitRequest(BaseModel):
+    weak_point_id: str = Field(default="")
+    action: str = Field(default="")
 
 
 @dataclass
@@ -663,36 +710,47 @@ def create_app(
     rag_prewarm_started = False
 
     @app.get("/", response_class=HTMLResponse)
-    def home() -> str:
-        return CHAT_HTML
+    def home(request: Request):
+        if request.query_params.get("mode") == "study":
+            return RedirectResponse("/review", status_code=307)
+        return render_web_page(CHAT_HTML, "对话")
 
     @app.get("/search", response_class=HTMLResponse)
-    def index() -> str:
-        return INDEX_HTML
+    def index(request: Request) -> str:
+        title = "检索调试" if request.query_params.get("debug") == "true" else "笔记搜索"
+        return render_web_page(INDEX_HTML, title)
 
     @app.get("/chat", response_class=HTMLResponse)
-    def chat() -> str:
-        return CHAT_HTML
+    def chat(request: Request):
+        mode = request.query_params.get("mode")
+        if mode == "study":
+            return RedirectResponse("/review", status_code=307)
+        target_mode = "interview" if mode == "interview" else "answer"
+        return RedirectResponse(f"/?mode={target_mode}", status_code=307)
+
+    @app.get("/review", response_class=HTMLResponse)
+    def review() -> str:
+        return render_web_page(REVIEW_HTML, "复习")
 
     @app.get("/topics", response_class=HTMLResponse)
     def topics() -> str:
-        return TOPICS_HTML
+        return render_web_page(TOPICS_HTML, "知识主题")
 
-    @app.get("/audit", response_class=HTMLResponse)
-    def audit() -> str:
-        return AUDIT_HTML
+    @app.get("/audit")
+    def audit():
+        return RedirectResponse("/organize", status_code=307)
 
     @app.get("/organize", response_class=HTMLResponse)
     def organize() -> str:
-        return AUDIT_HTML
+        return render_web_page(AUDIT_HTML, "整理")
 
     @app.get("/wiki", response_class=HTMLResponse)
     def wiki() -> str:
-        return WIKI_HTML
+        return render_web_page(WIKI_READER_HTML, "Wiki")
 
     @app.get("/admin/wiki", response_class=HTMLResponse)
     def admin_wiki() -> str:
-        return WIKI_HTML
+        return render_web_page(WIKI_HTML, "Wiki Admin")
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -729,7 +787,7 @@ def create_app(
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings() -> str:
-        return SETTINGS_HTML
+        return render_web_page(SETTINGS_HTML, "设置")
 
     @app.get("/api/workspace/config")
     def workspace_config() -> dict[str, Any]:
@@ -738,6 +796,194 @@ def create_app(
             "config_path": str(config_path),
             "validation": validate_workspace_config(runtime_config),
         }
+
+    @app.get("/api/review/due")
+    def review_due(limit: int = 50) -> dict[str, Any]:
+        profile = interview_profile_store.load()
+        return build_due_review_overview(profile, limit=limit)
+
+    @app.post("/api/review/plan")
+    def review_plan(request: ReviewPlanRequest) -> dict[str, Any]:
+        profile = interview_profile_store.load()
+        return build_review_plan(
+            profile,
+            topics=request.topics,
+            question_types=request.question_types,
+            limit=request.limit,
+            allow_cross_topic=request.allow_cross_topic,
+        )
+
+    @app.post("/api/review/card/{card_id}/prompt")
+    def review_card_prompt(card_id: str, request: ReviewPromptRequest) -> dict[str, Any]:
+        profile = interview_profile_store.load()
+        weak = find_weak_point(profile, card_id)
+        if weak is None:
+            raise HTTPException(status_code=404, detail=f"review card not found: {card_id}")
+        try:
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+            prompt = build_recall_prompt(
+                weak,
+                allowed_question_types=request.allowed_question_types,
+                related_topics=request.related_topics,
+                llm_client=llm_client,
+                model=llm_config.model,
+                temperature=min(llm_config.temperature, 0.2),
+            )
+        except Exception as exc:
+            prompt = build_recall_prompt(
+                weak,
+                allowed_question_types=request.allowed_question_types,
+                related_topics=request.related_topics,
+            )
+            prompt["error"] = str(exc)
+        return {"card_id": card_id, **prompt}
+
+    @app.post("/api/review/card/{card_id}/grade")
+    def review_card_grade(card_id: str, request: ReviewGradeRequest) -> dict[str, Any]:
+        if runtime_config.vault_path is None:
+            raise HTTPException(status_code=400, detail="vault path is required for review grading")
+        profile = interview_profile_store.load()
+        weak = find_weak_point(profile, card_id)
+        if weak is None:
+            raise HTTPException(status_code=404, detail=f"review card not found: {card_id}")
+        if not request.answer.strip():
+            raise HTTPException(status_code=400, detail="answer is required")
+        source_paths = tuple(str(path).strip() for path in weak.get("source_note_paths") or [] if str(path).strip())
+        if not source_paths:
+            return {
+                "card_id": card_id,
+                "covered": [],
+                "missing": [],
+                "corrections": ["这个薄弱点没有记录来源笔记，无法对照资料纠偏。"],
+                "feedback": "缺少来源笔记，建议先在面试总结中补齐 source_note_paths。",
+                "suggested_outcome": "fail",
+                "parse_error": True,
+                "citations": [],
+            }
+        try:
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+            app_runner = LibrarianApp(build_interview_agent_runtime(llm_client))
+            result = app_runner.run(
+                LibrarianRequest(
+                    query=build_correction_query(prompt=request.prompt, weak=weak, answer=request.answer),
+                    scope_type="selected_notes",
+                    scope_note_paths=source_paths,
+                    selected_note_paths=source_paths,
+                    vault_root=runtime_config.vault_path,
+                    strict_evidence=True,
+                    model=llm_config.model,
+                    tool_mode="auto",
+                    trace_path=str(project_root / "eval-results" / "agent-debug" / "traces"),
+                    temperature=min(llm_config.temperature, 0.1),
+                    max_tool_calls_per_step=3,
+                )
+            )
+            citations = result.state.working.extra.get("citations", [])
+            return {"card_id": card_id, "trace_path": result.trace_path, **parse_correction_payload(result.final_answer or "", citations=citations)}
+        except Exception as exc:
+            return {
+                "card_id": card_id,
+                "covered": [],
+                "missing": [],
+                "corrections": [f"纠偏失败：{exc}"],
+                "feedback": "本轮纠偏失败，请稍后重试；当前建议按 fail 处理。",
+                "suggested_outcome": "fail",
+                "parse_error": True,
+                "citations": [],
+                "error": str(exc),
+            }
+
+    @app.post("/api/review/verify")
+    def review_verify(request: ReviewVerifyRequest) -> dict[str, Any]:
+        if runtime_config.vault_path is None:
+            raise HTTPException(status_code=400, detail="vault path is required for review verification")
+        card_id = request.weak_point_id.strip()
+        if not card_id:
+            raise HTTPException(status_code=400, detail="weak_point_id is required")
+        if not request.answer.strip():
+            raise HTTPException(status_code=400, detail="answer is required")
+        profile = interview_profile_store.load()
+        weak = find_weak_point(profile, card_id)
+        if weak is None:
+            raise HTTPException(status_code=404, detail=f"review card not found: {card_id}")
+        source_paths = tuple(str(path).strip() for path in weak.get("source_note_paths") or [] if str(path).strip())
+        if not source_paths:
+            return {
+                "weak_point_id": card_id,
+                "correct": [],
+                "missed": ["这个薄弱点没有记录来源笔记，无法对照资料纠偏。"],
+                "example": "建议先完成一次带来源记录的面试复盘，再回到这里复习。",
+                "feedback": "缺少来源笔记。",
+                "suggested_action": "retry",
+                "parse_error": True,
+                "citations": [],
+            }
+        try:
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+            app_runner = LibrarianApp(build_interview_agent_runtime(llm_client))
+            strategy_constraints = select_strategy_constraints(profile)
+            result = app_runner.run(
+                LibrarianRequest(
+                    query=build_weak_point_verification_query(
+                        weak=weak,
+                        answer=request.answer,
+                        prompt=request.prompt,
+                        strategy_constraints=strategy_constraints,
+                    ),
+                    scope_type="selected_notes",
+                    scope_note_paths=source_paths,
+                    selected_note_paths=source_paths,
+                    vault_root=runtime_config.vault_path,
+                    strict_evidence=True,
+                    model=llm_config.model,
+                    tool_mode="auto",
+                    trace_path=str(project_root / "eval-results" / "agent-debug" / "traces"),
+                    temperature=min(llm_config.temperature, 0.1),
+                    max_tool_calls_per_step=3,
+                )
+            )
+            citations = result.state.working.extra.get("citations", [])
+            return {
+                "weak_point_id": card_id,
+                "trace_path": result.trace_path,
+                **parse_verification_payload(result.final_answer or "", citations=citations),
+            }
+        except Exception as exc:
+            return {
+                "weak_point_id": card_id,
+                "correct": [],
+                "missed": [],
+                "example": f"纠偏失败：{exc}",
+                "feedback": "本轮纠偏失败，请稍后重试；当前建议继续练习。",
+                "suggested_action": "retry",
+                "parse_error": True,
+                "citations": [],
+                "error": str(exc),
+            }
+
+    @app.post("/api/review/card/{card_id}/commit")
+    def review_card_commit(card_id: str, request: ReviewCommitRequest) -> dict[str, Any]:
+        try:
+            return commit_review_outcome(interview_profile_store, card_id=card_id, outcome=request.outcome)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/review/commit")
+    def review_commit(request: ReviewActionCommitRequest) -> dict[str, Any]:
+        card_id = request.weak_point_id.strip()
+        if not card_id:
+            raise HTTPException(status_code=400, detail="weak_point_id is required")
+        try:
+            return commit_review_action(interview_profile_store, card_id=card_id, action=request.action)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/workspace/config")
     def save_workspace_config(request: WorkspaceConfigRequest) -> dict[str, Any]:
@@ -907,8 +1153,8 @@ def create_app(
         return value in {"1", "true", "yes", "on"}
 
     def agent_v2_librarian_enabled() -> bool:
-        value = os.getenv("AGENT_V2_LIBRARIAN", "").strip().lower()
-        return value in {"1", "true", "yes", "on"}
+        value = os.getenv("AGENT_V2_LIBRARIAN", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
 
     def librarian_online_enabled(request: AgentRequest) -> bool:
         provider = str(request.online_provider or "").strip().lower()
@@ -1841,6 +2087,7 @@ def create_app(
                 interview_state=request.interview_state,
                 source_note_paths=request.source_note_paths,
                 agent_actions=request.agent_actions,
+                citations=request.citations,
             )
             return {
                 "user_message": result["user_message"],
@@ -1891,6 +2138,7 @@ def create_app(
                 interview_state=request.interview_state,
                 source_note_paths=request.source_note_paths,
                 agent_actions=request.agent_actions,
+                citations=request.citations,
             )
             return {"assistant_message": result["assistant_message"], "session": result["session"]}
         except FileNotFoundError as exc:
@@ -2164,6 +2412,28 @@ def create_app(
 
                 yield sse_event("status", {"stage": "pipeline_ready", "message": "pipeline initialized"})
 
+                scope = None
+                scope_note_paths: tuple[str, ...] = ()
+                scope_metadata: dict[str, Any] = {}
+                if str(request.scope_type or "all_vault") != "all_vault":
+                    scope, scope_note_paths, scope_metadata = resolve_librarian_scope(request)
+                    yield sse_event(
+                        "context",
+                        {
+                            "mode": "answer",
+                            "strict_evidence": bool(request.strict_evidence),
+                            "scope": {
+                                "type": request.scope_type,
+                                "value": request.scope_value,
+                                "paths": request.scope_paths,
+                                "metadata": scope_metadata,
+                                "note_count": len(scope_note_paths),
+                            },
+                            "items": list(scope.notes) if scope is not None else [],
+                            "stats": {"context_items": len(scope_note_paths), "agent_v2": False},
+                        },
+                    )
+
                 manager = service.build_manager(
                     SearchOptions(
                         query=request.query,
@@ -2196,7 +2466,11 @@ def create_app(
                 )
 
                 yield sse_event("status", {"stage": "retrieval_started", "message": "routing and retrieval started"})
-                retrieval = pipeline.retrieve(request.query)
+                retrieval = pipeline.retrieve(
+                    request.query,
+                    scope_note_paths=scope_note_paths,
+                    scope_type=str(request.scope_type or "all_vault"),
+                )
                 payload = agent_retrieval_result_to_dict(retrieval)
                 reference_summary = build_reference_summary(payload)
 
@@ -2369,6 +2643,907 @@ def elapsed_since(started_at: float) -> int:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+SHELL_CSS = r"""
+    .app-shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 236px minmax(0, 1fr);
+      background: var(--bg, #f7f7f4);
+      color: var(--text, #171717);
+    }
+    .app-sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+      border-right: 1px solid var(--line, #d9d9d2);
+      background: rgba(255, 255, 255, 0.92);
+      padding: 18px 14px;
+      z-index: 30;
+    }
+    .app-brand {
+      display: grid;
+      gap: 3px;
+      margin: 0 0 20px;
+      padding: 0 7px;
+    }
+    .app-brand-title {
+      font-size: 17px;
+      font-weight: 850;
+      color: var(--text, #171717);
+      letter-spacing: -0.01em;
+    }
+    .app-brand-subtitle {
+      font-size: 12px;
+      color: var(--muted, #666666);
+      line-height: 1.4;
+    }
+    .app-nav {
+      display: grid;
+      gap: 18px;
+    }
+    .app-nav-section {
+      display: grid;
+      gap: 6px;
+    }
+    .app-nav-title {
+      padding: 0 7px;
+      color: var(--muted, #666666);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+    }
+    .app-nav-link {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 34px;
+      padding: 7px 9px;
+      border-radius: 9px;
+      color: #34423f;
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 700;
+      border: 1px solid transparent;
+    }
+    .app-nav-link:hover {
+      background: rgba(15, 118, 110, 0.07);
+      color: var(--accent-dark, #115e59);
+    }
+    .app-nav-link.active {
+      background: #e7f3f1;
+      border-color: rgba(15, 118, 110, 0.18);
+      color: var(--accent-dark, #115e59);
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+    }
+    .app-nav-icon {
+      width: 20px;
+      text-align: center;
+      font-size: 15px;
+    }
+    .app-main {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    .app-header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      min-height: 68px;
+      padding: 14px 24px;
+      border-bottom: 1px solid var(--line, #d9d9d2);
+      background: rgba(247, 247, 244, 0.86);
+      backdrop-filter: blur(12px);
+    }
+    .app-header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .app-title {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.2;
+      letter-spacing: -0.01em;
+    }
+    .app-sidebar-toggle {
+      display: none;
+      border: 1px solid var(--line, #d9d9d2);
+      background: #fff;
+      color: var(--accent-dark, #115e59);
+      border-radius: 8px;
+      padding: 7px 10px;
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    .app-global-search {
+      width: min(420px, 42vw);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line, #d9d9d2);
+      border-radius: 999px;
+      background: #fff;
+      padding: 7px 12px;
+    }
+    .app-global-search span {
+      color: var(--muted, #666666);
+      font-size: 13px;
+    }
+    .app-global-search input {
+      width: 100%;
+      min-width: 0;
+      border: 0;
+      outline: 0;
+      background: transparent;
+      padding: 2px 0;
+      color: var(--text, #171717);
+      font: inherit;
+      font-size: 14px;
+    }
+    .app-content {
+      min-width: 0;
+    }
+    .app-sidebar-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.26);
+      z-index: 25;
+    }
+    @media (max-width: 768px) {
+      .app-shell {
+        display: block;
+      }
+      .app-sidebar {
+        position: fixed;
+        inset: 0 auto 0 0;
+        width: min(286px, 86vw);
+        transform: translateX(-100%);
+        transition: transform 0.18s ease;
+        box-shadow: 16px 0 36px rgba(15, 23, 42, 0.16);
+      }
+      .app-shell.nav-open .app-sidebar {
+        transform: translateX(0);
+      }
+      .app-shell.nav-open .app-sidebar-overlay {
+        display: block;
+      }
+      .app-sidebar-toggle {
+        display: inline-flex;
+      }
+      .app-header {
+        padding: 12px 14px;
+        align-items: flex-start;
+        flex-wrap: wrap;
+      }
+      .app-global-search {
+        width: 100%;
+        order: 2;
+      }
+    }
+"""
+
+
+SIDEBAR_HTML = r"""
+    <aside class="app-sidebar" aria-label="主导航">
+      <div class="app-brand">
+        <div class="app-brand-title">Knowledge Agent</div>
+        <div class="app-brand-subtitle">个人知识库助手</div>
+      </div>
+      <nav class="app-nav">
+        <section class="app-nav-section">
+          <div class="app-nav-title">对话</div>
+          <a class="app-nav-link" href="/?mode=answer" data-nav-id="chat-answer"><span class="app-nav-icon">💬</span><span>对话</span></a>
+          <a class="app-nav-link" href="/?mode=interview" data-nav-id="chat-interview"><span class="app-nav-icon">🎙</span><span>面试</span></a>
+          <a class="app-nav-link" href="/review" data-nav-id="review"><span class="app-nav-icon">🧠</span><span>复习</span></a>
+        </section>
+        <section class="app-nav-section">
+          <div class="app-nav-title">知识</div>
+          <a class="app-nav-link" href="/topics" data-nav-id="topics"><span class="app-nav-icon">📚</span><span>Topics</span></a>
+          <a class="app-nav-link" href="/wiki" data-nav-id="wiki"><span class="app-nav-icon">📖</span><span>Wiki</span></a>
+        </section>
+        <section class="app-nav-section">
+          <div class="app-nav-title">检索</div>
+          <a class="app-nav-link" href="/search" data-nav-id="search"><span class="app-nav-icon">🔍</span><span>笔记搜索</span></a>
+        </section>
+        <section class="app-nav-section">
+          <div class="app-nav-title">维护</div>
+          <a class="app-nav-link" href="/admin/wiki" data-nav-id="wiki-admin"><span class="app-nav-icon">🛠</span><span>Wiki Admin</span></a>
+          <a class="app-nav-link" href="/search?debug=true" data-nav-id="search-debug"><span class="app-nav-icon">⚙</span><span>Search Debug</span></a>
+          <a class="app-nav-link" href="/settings" data-nav-id="settings"><span class="app-nav-icon">⚙</span><span>设置</span></a>
+          <a class="app-nav-link" href="/organize" data-nav-id="organize"><span class="app-nav-icon">🧹</span><span>笔记整理</span></a>
+        </section>
+      </nav>
+    </aside>
+"""
+
+
+SHELL_SCRIPT = r"""
+    (function () {
+      const shell = document.querySelector(".app-shell");
+      const toggle = document.getElementById("appSidebarToggle");
+      const overlay = document.getElementById("appSidebarOverlay");
+      const globalSearch = document.getElementById("appGlobalSearch");
+
+      function closeNav() {
+        if (shell) shell.classList.remove("nav-open");
+      }
+
+      if (toggle && shell) {
+        toggle.addEventListener("click", () => shell.classList.toggle("nav-open"));
+      }
+      if (overlay) overlay.addEventListener("click", closeNav);
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") closeNav();
+      });
+
+      if (globalSearch) {
+        globalSearch.addEventListener("keydown", (event) => {
+          if (event.key !== "Enter") return;
+          const query = globalSearch.value.trim();
+          if (!query) return;
+          window.location.href = `/search?q=${encodeURIComponent(query)}`;
+        });
+      }
+
+      const params = new URLSearchParams(window.location.search);
+      const path = window.location.pathname;
+      const debug = params.get("debug") === "true";
+      const mode = params.get("mode") || "answer";
+      let active = "";
+      if (debug && path === "/search") active = "search-debug";
+      else if (path === "/admin/wiki") active = "wiki-admin";
+      else if (path === "/topics") active = "topics";
+      else if (path === "/wiki") active = "wiki";
+      else if (path === "/search") active = "search";
+      else if (path === "/settings") active = "settings";
+      else if (path === "/organize" || path === "/audit") active = "organize";
+      else if (path === "/review") active = "review";
+      else if (path === "/" || path === "/chat") active = mode === "interview" ? "chat-interview" : "chat-answer";
+
+      if (active) {
+        document.querySelectorAll(".app-nav-link").forEach((link) => {
+          link.classList.toggle("active", link.dataset.navId === active);
+        });
+      }
+    })();
+"""
+
+
+def extract_html_block(html: str, start: str, end: str) -> str:
+    start_index = html.find(start)
+    if start_index < 0:
+        return ""
+    start_index += len(start)
+    end_index = html.find(end, start_index)
+    if end_index < 0:
+        return ""
+    return html[start_index:end_index]
+
+
+def strip_legacy_navigation(body_html: str) -> str:
+    cleaned = body_html.strip()
+    if cleaned.startswith("<header>"):
+        header_end = cleaned.find("</header>")
+        if header_end >= 0:
+            cleaned = cleaned[header_end + len("</header>") :].lstrip()
+    cleaned = re.sub(
+        r"(<main[^>]*>\s*)<header>.*?</header>\s*",
+        r"\1",
+        cleaned,
+        count=1,
+        flags=re.DOTALL,
+    )
+    cleaned = re.sub(
+        r'(<main[^>]*>\s*)<div class="topbar">.*?</nav>\s*</div>\s*',
+        r"\1",
+        cleaned,
+        count=1,
+        flags=re.DOTALL,
+    )
+    return cleaned
+
+
+def render_web_page(raw_html: str, title: str) -> str:
+    legacy_css = extract_html_block(raw_html, "<style>", "</style>")
+    legacy_body = extract_html_block(raw_html, "<body>", "</body>")
+    content = strip_legacy_navigation(legacy_body or raw_html)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Knowledge Agent - {title}</title>
+  <style>
+{legacy_css}
+{SHELL_CSS}
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+{SIDEBAR_HTML}
+    <div id="appSidebarOverlay" class="app-sidebar-overlay"></div>
+    <section class="app-main">
+      <header class="app-header">
+        <div class="app-header-left">
+          <button id="appSidebarToggle" class="app-sidebar-toggle" type="button" aria-label="打开导航">☰</button>
+          <h1 class="app-title">{title}</h1>
+        </div>
+        <label class="app-global-search" aria-label="全局搜索">
+          <span>搜索</span>
+          <input id="appGlobalSearch" type="search" placeholder="搜索你的笔记..." autocomplete="off" />
+        </label>
+      </header>
+      <div class="app-content">
+{content}
+      </div>
+    </section>
+  </div>
+  <script>
+{SHELL_SCRIPT}
+  </script>
+</body>
+</html>"""
+
+
+WIKI_READER_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wiki</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f7f4;
+      --panel: #ffffff;
+      --text: #171717;
+      --muted: #666666;
+      --line: #d9d9d2;
+      --accent: #0f766e;
+      --accent-dark: #115e59;
+      --danger: #b42318;
+      --chip: #eef2f1;
+      --code: #f2f4f3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(1280px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 22px 0 40px;
+    }
+    .reader-shell {
+      display: grid;
+      grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .sidebar {
+      position: sticky;
+      top: 16px;
+      max-height: calc(100vh - 32px);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .sidebar-head {
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    h2 {
+      margin: 0 0 6px;
+      font-size: 20px;
+      line-height: 1.25;
+    }
+    .subtitle, .meta, .path {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    input[type="search"] {
+      width: 100%;
+      min-height: 38px;
+      margin-top: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+    }
+    .tag-list {
+      overflow: auto;
+      padding: 8px;
+      display: grid;
+      gap: 6px;
+    }
+    .tag-item {
+      width: 100%;
+      text-align: left;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      background: transparent;
+      padding: 10px;
+      cursor: pointer;
+      font: inherit;
+      color: var(--text);
+    }
+    .tag-item:hover {
+      background: #f3f6f5;
+      border-color: var(--line);
+    }
+    .tag-item.active {
+      background: #e7f3f1;
+      border-color: rgba(15, 118, 110, .32);
+    }
+    .tag-title {
+      font-weight: 760;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .tag-preview {
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 7px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 2px 7px;
+      background: var(--chip);
+      color: #3f3f3f;
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: nowrap;
+    }
+    .badge.update {
+      background: #fff1bf;
+      color: #704c00;
+    }
+    .content {
+      min-height: calc(100vh - 44px);
+      overflow: hidden;
+    }
+    .content-head {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: flex-start;
+    }
+    .content-title {
+      margin: 0 0 6px;
+      font-size: 24px;
+      line-height: 1.2;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      flex-shrink: 0;
+    }
+    .action-link, button.secondary {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--accent-dark);
+      padding: 7px 10px;
+      text-decoration: none;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .wiki-body {
+      padding: 20px 24px 32px;
+      line-height: 1.75;
+      overflow-wrap: anywhere;
+    }
+    .wiki-body h2, .wiki-body h3, .wiki-body h4, .wiki-body h5 {
+      margin: 22px 0 8px;
+      line-height: 1.35;
+    }
+    .wiki-body h2 { font-size: 22px; }
+    .wiki-body h3 { font-size: 18px; }
+    .wiki-body p { margin: 0 0 12px; }
+    .wiki-body ul, .wiki-body ol { margin: 8px 0 14px 24px; padding: 0; }
+    .wiki-body li { margin: 4px 0; }
+    .wiki-body code {
+      background: var(--code);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 1px 4px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: .92em;
+    }
+    .wiki-body pre {
+      background: var(--code);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 12px;
+      overflow-x: auto;
+      line-height: 1.55;
+    }
+    .wiki-body pre code {
+      border: 0;
+      background: transparent;
+      padding: 0;
+    }
+    .wiki-body table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 18px;
+      font-size: 14px;
+    }
+    .wiki-body th, .wiki-body td {
+      border: 1px solid var(--line);
+      padding: 7px 9px;
+      vertical-align: top;
+    }
+    .wiki-body th {
+      background: #f3f6f5;
+      text-align: left;
+    }
+    .wiki-body hr {
+      border: 0;
+      border-top: 1px solid var(--line);
+      margin: 18px 0;
+    }
+    .empty, .status {
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 24px;
+      color: var(--muted);
+      text-align: center;
+      background: rgba(255, 255, 255, 0.65);
+    }
+    .status.error {
+      color: var(--danger);
+      border-color: #f3b5ad;
+      background: #fff7f5;
+    }
+    @media (max-width: 860px) {
+      main { width: min(100vw - 20px, 1280px); padding-top: 12px; }
+      .reader-shell { grid-template-columns: 1fr; }
+      .sidebar { position: static; max-height: none; }
+      .tag-list { max-height: 42vh; }
+      .content-head { display: block; }
+      .actions { justify-content: flex-start; margin-top: 12px; }
+      .wiki-body { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="reader-shell">
+      <aside class="panel sidebar">
+        <div class="sidebar-head">
+          <div id="summary" class="subtitle">正在加载 Wiki...</div>
+          <input id="tagSearch" type="search" placeholder="搜索 tag / 路径 / 摘要" autocomplete="off" />
+        </div>
+        <div id="tagList" class="tag-list"></div>
+      </aside>
+      <article class="panel content">
+        <div class="content-head">
+          <div>
+            <h2 id="wikiTitle" class="content-title">选择一个 Wiki</h2>
+            <div id="wikiMeta" class="meta">只读阅读器</div>
+            <div id="wikiPath" class="path"></div>
+          </div>
+          <div id="wikiActions" class="actions"></div>
+        </div>
+        <div id="wikiBody" class="wiki-body">
+          <div class="status">正在加载...</div>
+        </div>
+      </article>
+    </section>
+  </main>
+  <script>
+    let report = null;
+    let rows = [];
+    let activeTag = "";
+    const $ = (id) => document.getElementById(id);
+
+    $("tagSearch").addEventListener("input", renderTagList);
+    window.addEventListener("popstate", () => {
+      const tag = tagFromUrl();
+      if (tag && tag !== activeTag) selectTag(tag, {push: false});
+    });
+    loadReport();
+
+    async function loadReport() {
+      renderBodyStatus("正在加载 Wiki...");
+      try {
+        const response = await fetch("/api/wiki/report");
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Wiki report 加载失败");
+        report = data;
+        rows = (data.tag_rows || [])
+          .filter((row) => row.wiki_exists && row.eligible)
+          .sort((a, b) => String(a.tag || "").localeCompare(String(b.tag || "")));
+        renderSummary();
+        renderTagList();
+        if (!rows.length) {
+          renderEmpty("暂无已生成 Wiki。可以先到 Wiki Admin 维护页生成主题页。");
+          return;
+        }
+        const requested = tagFromUrl();
+        const initial = rows.find((row) => row.tag === requested) || rows[0];
+        await selectTag(initial.tag, {push: false, missingTag: requested && !rows.find((row) => row.tag === requested) ? requested : ""});
+      } catch (error) {
+        renderBodyStatus(error.message || String(error), true);
+        $("summary").textContent = "Wiki 加载失败";
+      }
+    }
+
+    function renderSummary() {
+      const dirty = rows.filter((row) => row.dirty).length;
+      $("summary").textContent = `${rows.length} 个已生成 Wiki${dirty ? ` · ${dirty} 个需要更新` : ""}`;
+    }
+
+    function filteredRows() {
+      const query = $("tagSearch").value.trim().toLowerCase();
+      if (!query) return rows;
+      return rows.filter((row) => {
+        return String(row.tag || "").toLowerCase().includes(query)
+          || String(row.wiki_path || "").toLowerCase().includes(query)
+          || String(row.wiki_preview || "").toLowerCase().includes(query);
+      });
+    }
+
+    function renderTagList() {
+      const container = $("tagList");
+      const visible = filteredRows();
+      if (!visible.length) {
+        container.innerHTML = `<div class="empty">没有匹配的 Wiki。</div>`;
+        return;
+      }
+      container.innerHTML = visible.map((row) => {
+        const active = row.tag === activeTag ? " active" : "";
+        const preview = row.wiki_preview || row.wiki_path || "";
+        return `
+          <button class="tag-item${active}" data-tag="${escapeHtml(row.tag || "")}">
+            <div class="tag-title">${escapeHtml(formatTagTitle(row.tag))}</div>
+            <div class="tag-preview">${escapeHtml(preview)}</div>
+            <div class="badge-row">
+              <span class="badge">${escapeHtml(row.note_count || 0)} 篇笔记</span>
+              ${row.dirty ? `<span class="badge update">需要更新</span>` : ""}
+            </div>
+          </button>
+        `;
+      }).join("");
+      container.querySelectorAll("[data-tag]").forEach((button) => {
+        button.addEventListener("click", () => selectTag(button.dataset.tag || ""));
+      });
+    }
+
+    async function selectTag(tag, options = {}) {
+      const row = rows.find((item) => item.tag === tag);
+      if (!row) {
+        renderBodyStatus(`未找到已生成 Wiki：${tag || options.missingTag || ""}`, true);
+        return;
+      }
+      activeTag = row.tag || "";
+      renderTagList();
+      if (options.push !== false) {
+        const url = new URL(window.location.href);
+        url.searchParams.set("tag", activeTag);
+        history.pushState({}, "", url);
+      }
+      renderHeader(row);
+      if (options.missingTag) {
+        renderBodyStatus(`未找到已生成 Wiki：${options.missingTag}。已打开第一个可读 Wiki。`, true);
+      } else {
+        renderBodyStatus("正在读取 Wiki...");
+      }
+      try {
+        const response = await fetch(`/api/wiki/read?tag=${encodeURIComponent(activeTag)}`);
+        const text = await response.text();
+        if (!response.ok) {
+          let message = text || "Wiki 读取失败";
+          try { message = JSON.parse(text).detail || message; } catch (_error) {}
+          throw new Error(message);
+        }
+        $("wikiBody").innerHTML = renderMarkdown(text || "");
+      } catch (error) {
+        renderBodyStatus(error.message || String(error), true);
+      }
+    }
+
+    function renderHeader(row) {
+      $("wikiTitle").textContent = formatTagTitle(row.tag);
+      $("wikiMeta").textContent = `${row.note_count || 0} 篇来源笔记${row.dirty ? " · 源笔记已变更，建议稍后在维护页更新" : ""}`;
+      $("wikiPath").textContent = row.wiki_path || "";
+      const actions = [];
+      if (row.wiki_path) {
+        actions.push(`<a class="action-link" href="${obsidianUrl(row.wiki_path)}">在 Obsidian 中打开</a>`);
+        actions.push(`<button class="secondary" type="button" id="copyWikiPath">复制路径</button>`);
+      }
+      $("wikiActions").innerHTML = actions.join("");
+      const copyButton = $("copyWikiPath");
+      if (copyButton) {
+        copyButton.addEventListener("click", async () => {
+          try {
+            await navigator.clipboard.writeText(row.wiki_path || "");
+            copyButton.textContent = "已复制";
+            setTimeout(() => { copyButton.textContent = "复制路径"; }, 1200);
+          } catch (_error) {
+            copyButton.textContent = "复制失败";
+            setTimeout(() => { copyButton.textContent = "复制路径"; }, 1200);
+          }
+        });
+      }
+    }
+
+    function renderBodyStatus(message, isError = false) {
+      $("wikiBody").innerHTML = `<div class="status ${isError ? "error" : ""}">${escapeHtml(message)}</div>`;
+    }
+
+    function renderEmpty(message) {
+      $("wikiTitle").textContent = "暂无 Wiki";
+      $("wikiMeta").textContent = "只读阅读器";
+      $("wikiPath").textContent = "";
+      $("wikiActions").innerHTML = "";
+      $("wikiBody").innerHTML = `<div class="empty">${escapeHtml(message)}</div>`;
+    }
+
+    function tagFromUrl() {
+      return new URLSearchParams(window.location.search).get("tag") || "";
+    }
+
+    function obsidianUrl(path) {
+      const vault = report?.obsidian_vault_name || "";
+      return `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(path || "")}`;
+    }
+
+    function formatTagTitle(tag) {
+      return String(tag || "").split("/").filter(Boolean).join(" / ") || "未命名主题";
+    }
+
+    function renderMarkdown(text) {
+      const codeBlocks = [];
+      let source = String(text || "").replace(/```([\s\S]*?)```/g, (_match, code) => {
+        const token = `@@CODE_${codeBlocks.length}@@`;
+        codeBlocks.push(`<pre><code>${escapeHtml(code.trim())}</code></pre>`);
+        return token;
+      });
+      const lines = source.split(/\r?\n/);
+      const html = [];
+      let list = [];
+      let orderedList = [];
+      const flush = () => {
+        if (list.length) { html.push(`<ul>${list.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</ul>`); list = []; }
+        if (orderedList.length) { html.push(`<ol>${orderedList.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</ol>`); orderedList = []; }
+      };
+      for (let i = 0; i < lines.length; i += 1) {
+        const raw = lines[i];
+        const trimmed = raw.trim();
+        if (!trimmed) { flush(); continue; }
+        if (/^@@CODE_\d+@@$/.test(trimmed)) { flush(); html.push(trimmed); continue; }
+        if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) { flush(); html.push("<hr>"); continue; }
+        const heading = /^(#{1,4})\s+(.+)$/.exec(trimmed);
+        if (heading) {
+          flush();
+          const level = Math.min(heading[1].length + 1, 5);
+          html.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`);
+          continue;
+        }
+        if (isTableRow(trimmed) && isTableSeparator(lines[i + 1] ? lines[i + 1].trim() : "")) {
+          flush();
+          const rows = [trimmed];
+          i += 2;
+          while (i < lines.length) {
+            const row = lines[i].trim();
+            if (!row) {
+              const next = lines[i + 1] ? lines[i + 1].trim() : "";
+              if (isTableRow(next)) { i += 1; continue; }
+              break;
+            }
+            if (!isTableRow(row)) { i -= 1; break; }
+            rows.push(row);
+            i += 1;
+          }
+          html.push(renderMarkdownTable(rows));
+          continue;
+        }
+        const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
+        if (bullet) { if (orderedList.length) flush(); list.push(bullet[1]); continue; }
+        const ordered = /^\d+[.)]\s+(.+)$/.exec(trimmed);
+        if (ordered) { if (list.length) flush(); orderedList.push(ordered[1]); continue; }
+        flush();
+        html.push(`<p>${inlineMarkdown(trimmed)}</p>`);
+      }
+      flush();
+      let rendered = html.join("");
+      codeBlocks.forEach((block, index) => { rendered = rendered.replace(`@@CODE_${index}@@`, block); });
+      return rendered || `<div class="empty">这个 Wiki 文件暂无内容。</div>`;
+    }
+
+    function isTableRow(text) {
+      const value = String(text || "").trim();
+      return value.includes("|") && /^\|?.+\|.+\|?$/.test(value);
+    }
+
+    function isTableSeparator(text) {
+      const cells = splitTableRow(text);
+      return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+    }
+
+    function splitTableRow(text) {
+      let value = String(text || "").trim();
+      if (!value.includes("|")) return [];
+      if (value.startsWith("|")) value = value.slice(1);
+      if (value.endsWith("|")) value = value.slice(0, -1);
+      return value.split("|").map((cell) => cell.trim());
+    }
+
+    function renderMarkdownTable(rows) {
+      const header = splitTableRow(rows[0]);
+      const body = rows.slice(1).map(splitTableRow).filter((cells) => cells.length);
+      const headerHtml = header.map((cell) => `<th>${inlineMarkdown(cell)}</th>`).join("");
+      const bodyHtml = body.map((cells) => {
+        const padded = header.length ? cells.concat(Array(Math.max(0, header.length - cells.length)).fill("")) : cells;
+        return `<tr>${padded.slice(0, Math.max(header.length, cells.length)).map((cell) => `<td>${inlineMarkdown(cell)}</td>`).join("")}</tr>`;
+      }).join("");
+      return `<table><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>`;
+    }
+
+    function inlineMarkdown(text) {
+      return escapeHtml(text)
+        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .replace(/\[\[([^\]]+)\]\]/g, '<code>[[$1]]</code>');
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+  </script>
+</body>
+</html>
+"""
 
 
 WIKI_HTML = r"""<!doctype html>
@@ -2644,7 +3819,6 @@ WIKI_HTML = r"""<!doctype html>
 </head>
 <body>
   <header>
-    <h1>Wiki 维护</h1>
     <nav>
       <a href="/chat">对话</a>
       <a href="/topics">知识主题</a>
@@ -2656,7 +3830,6 @@ WIKI_HTML = r"""<!doctype html>
   </header>
   <main>
     <section class="page-intro">
-      <h2>Wiki 维护后台</h2>
       <p>用于同步、整理 tag、调整策略和查看原始状态。日常阅读请使用知识主题页面。</p>
       <div id="topicSummary" class="topic-summary"></div>
     </section>
@@ -3198,13 +4371,30 @@ TOPICS_HTML = r"""<!doctype html>
     .notice {
       margin-top: 14px;
       padding: 10px 12px;
-      border: 1px solid #ead18a;
-      background: var(--warn-bg);
+      border: 1px solid var(--line);
+      background: #fff;
       border-radius: 8px;
-      color: #694900;
-      display: none;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
     }
-    .notice.visible { display: block; }
+    .notice.visible { display: flex; }
+    .stat-pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 4px 9px;
+      background: var(--chip);
+      color: #3f3f3f;
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .stat-pill.update {
+      background: #fff1bf;
+      color: #704c00;
+    }
     .controls {
       display: flex;
       justify-content: space-between;
@@ -3379,7 +4569,6 @@ TOPICS_HTML = r"""<!doctype html>
 </head>
 <body>
   <header>
-    <h1>知识主题</h1>
     <nav>
       <a href="/chat">对话</a>
       <a href="/topics">知识主题</a>
@@ -3391,8 +4580,7 @@ TOPICS_HTML = r"""<!doctype html>
   </header>
   <main>
     <section class="hero">
-      <h2>我的知识主题</h2>
-      <p>这里只展示可以阅读或合成的主题页。完整内容在 Obsidian 中阅读，维护操作放在后台。</p>
+      <p>这里只展示知识主题的状态和阅读入口。合成、同步和策略调整放在 Wiki Admin。</p>
       <div id="notice" class="notice"></div>
     </section>
     <section class="controls">
@@ -3430,7 +4618,7 @@ TOPICS_HTML = r"""<!doctype html>
         const data = await response.json();
         if (!response.ok) throw new Error(data.detail || "知识主题加载失败");
         report = data;
-        renderNotice();
+        renderOverview();
         renderTopics();
         setStatus("");
       } catch (error) {
@@ -3438,20 +4626,19 @@ TOPICS_HTML = r"""<!doctype html>
       }
     }
 
-    function renderNotice() {
+    function renderOverview() {
       const rows = topicRows();
+      const total = rows.length;
+      const generated = rows.filter((row) => row.wiki_exists).length;
       const dirty = rows.filter((row) => row.dirty && row.wiki_exists).length;
       const missing = rows.filter((row) => row.eligible && !row.wiki_exists).length;
       const notice = $("notice");
-      const parts = [];
-      if (dirty) parts.push(`${dirty} 个主题需要更新`);
-      if (missing) parts.push(`${missing} 个主题尚未合成`);
-      if (!parts.length) {
-        notice.className = "notice";
-        notice.textContent = "";
-        return;
-      }
-      notice.textContent = parts.join("；") + "。需要更新表示源笔记已变更，重新合成后 wiki 会刷新。";
+      notice.innerHTML = `
+        <span class="stat-pill">${total} 个知识主题</span>
+        <span class="stat-pill">${generated} 个已生成</span>
+        <span class="stat-pill update">${dirty} 个需要更新</span>
+        <span class="stat-pill">${missing} 个未合成</span>
+      `;
       notice.className = "notice visible";
     }
 
@@ -3470,7 +4657,8 @@ TOPICS_HTML = r"""<!doctype html>
         if (activeFilter === "generated" && !row.wiki_exists) return false;
         if (!query) return true;
         return String(row.tag || "").toLowerCase().includes(query)
-          || String(row.wiki_path || "").toLowerCase().includes(query);
+          || String(row.wiki_path || "").toLowerCase().includes(query)
+          || String(row.wiki_preview || "").toLowerCase().includes(query);
       });
     }
 
@@ -3482,9 +4670,6 @@ TOPICS_HTML = r"""<!doctype html>
         return;
       }
       container.innerHTML = groupedRows(rows).map(renderGroup).join("");
-      container.querySelectorAll("[data-synthesize-tag]").forEach((button) => {
-        button.addEventListener("click", () => synthesizeTag(button.dataset.synthesizeTag));
-      });
     }
 
     function groupedRows(rows) {
@@ -3519,11 +4704,18 @@ TOPICS_HTML = r"""<!doctype html>
       const klass = row.wiki_exists ? (row.dirty ? "needs-update" : "") : "missing";
       const wikiLink = row.wiki_exists
         ? `[[${escapeHtml(row.wiki_path)}]]`
-        : "合成后会生成 Obsidian wiki 文件";
+        : "尚未生成 Wiki 文件";
       const openHref = row.wiki_exists ? obsidianUrl(row.wiki_path) : "";
+      const readHref = row.wiki_exists ? `/wiki?tag=${encodeURIComponent(row.tag || "")}` : "";
       const statusBadge = row.wiki_exists
         ? (row.dirty ? `<span class="badge update">需要更新</span>` : `<span class="badge generated">已生成</span>`)
         : `<span class="badge missing">未合成</span>`;
+      const actions = row.wiki_exists
+        ? `
+            <a class="open-link" href="${readHref}">在 Wiki 中阅读</a>
+            <a class="open-link secondary" href="${openHref}">在 Obsidian 中打开</a>
+          `
+        : "";
       return `
         <article class="topic ${klass}">
           <div>
@@ -3536,65 +4728,9 @@ TOPICS_HTML = r"""<!doctype html>
             </div>
             <div class="wiki-link">${wikiLink}</div>
           </div>
-          <div class="actions">
-            ${row.wiki_exists ? `<a class="open-link" href="${openHref}">在 Obsidian 中打开</a>` : ""}
-            <button class="${row.wiki_exists ? "secondary" : ""}" data-synthesize-tag="${escapeHtml(row.tag)}" ${row.eligible ? "" : "disabled"}>${row.wiki_exists ? "重新合成" : "合成 wiki"}</button>
-          </div>
+          <div class="actions">${actions}</div>
         </article>
       `;
-    }
-
-    async function synthesizeTag(tag) {
-      if (!tag) return;
-      setStatus(`正在合成 ${tag}...`);
-      setButtonsDisabled(true);
-      try {
-        const response = await fetch("/api/wiki/synthesize-tag", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({tag, force: true})
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.detail || "Failed to synthesize topic");
-        const task = await waitForTask(data.task_id, "正在合成 wiki");
-        if (task.status !== "succeeded") {
-          throw new Error(task.error || "Wiki synthesis task failed");
-        }
-        const payload = task.result || {};
-        report = payload.report;
-        renderNotice();
-        renderTopics();
-        const result = payload.result || {};
-        const failedTags = result.failed_tags || [];
-        const retriedTags = result.retried_tags || [];
-        const retryText = retriedTags.length
-          ? `；重试后成功：${retriedTags.map((item) => `${item.tag}(${item.attempts})`).join("，")}`
-          : "";
-        const failureText = failedTags.length
-          ? `；失败：${failedTags.map((item) => `${item.tag}(${item.error_type}, attempts=${item.attempts})`).join("，")}`
-          : "";
-        setStatus(`已更新 ${tag}${retryText}${failureText}`, failedTags.length > 0);
-      } catch (error) {
-        setStatus(error.message || String(error), true);
-      } finally {
-        setButtonsDisabled(false);
-      }
-    }
-
-    async function waitForTask(taskId, label) {
-      if (!taskId) throw new Error("Task id missing");
-      while (true) {
-        const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`);
-        const task = await response.json();
-        if (!response.ok) throw new Error(task.detail || "Task status request failed");
-        const lastEvent = (task.events || []).slice(-1)[0];
-        const step = lastEvent ? lastEvent.event : task.current_step;
-        setStatus(`${label}... ${step || task.status}`);
-        if (["succeeded", "failed", "cancelled"].includes(task.status)) {
-          return task;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
     }
 
     function topicSort(a, b) {
@@ -3616,12 +4752,6 @@ TOPICS_HTML = r"""<!doctype html>
 
     function formatTagTitle(tag) {
       return escapeHtml(String(tag || "").split("/").filter(Boolean).join(" / "));
-    }
-
-    function setButtonsDisabled(disabled) {
-      document.querySelectorAll("button").forEach((button) => {
-        if (!button.classList.contains("tab")) button.disabled = disabled;
-      });
     }
 
     function setStatus(message, isError = false) {
@@ -3831,7 +4961,6 @@ AUDIT_HTML = r"""<!doctype html>
 <body>
   <header>
     <div>
-      <h1>知识整理</h1>
       <p>先做结构检查，再给出整理建议。这个入口会把确定性审计和 LLM 整理结果放到同一份报告里。</p>
     </div>
     <nav>
@@ -4120,7 +5249,6 @@ SETTINGS_HTML = r"""<!doctype html>
   <main>
     <header>
       <div>
-        <h1>工作区设置</h1>
         <p>设置当前笔记库路径和相关状态文件。浏览器不能直接选择本机目录，第一版使用路径输入。</p>
       </div>
       <nav>
@@ -4197,6 +5325,666 @@ SETTINGS_HTML = r"""<!doctype html>
     $("saveBtn").addEventListener("click", () => saveConfig().catch((error) => setStatus(error.message, "error")));
     $("reloadBtn").addEventListener("click", () => loadConfig().catch((error) => setStatus(error.message, "error")));
     loadConfig().catch((error) => setStatus(error.message, "error"));
+  </script>
+</body>
+</html>
+"""
+
+
+REVIEW_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>复习</title>
+  <style>
+    :root { --bg:#f7f7f4; --panel:#fff; --line:#d9d9d2; --text:#171717; --muted:#666; --accent:#0f766e; --accent-dark:#115e59; --danger:#b42318; --chip:#eef2f1; --ok:#0f766e; --warn:#9a5b00; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width:min(900px, calc(100vw - 32px)); margin:0 auto; padding:24px 0 48px; display:grid; gap:14px; }
+    .panel { border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:18px; }
+    h2 { margin:0 0 8px; font-size:25px; }
+    h3 { margin:0 0 10px; font-size:18px; }
+    p { margin:0 0 12px; color:var(--muted); line-height:1.65; }
+    textarea { width:100%; min-height:150px; resize:vertical; border:1px solid var(--line); border-radius:8px; padding:11px 12px; line-height:1.65; font:inherit; color:var(--text); background:#fff; }
+    button { border:1px solid var(--accent); border-radius:7px; background:var(--accent); color:#fff; padding:8px 12px; cursor:pointer; font-weight:800; font:inherit; }
+    button.secondary { background:#fff; color:var(--accent-dark); border-color:var(--line); }
+    button.danger { background:#fff; color:var(--danger); border-color:#f3b5ad; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .status { color:var(--muted); font-size:13px; min-height:20px; }
+    .status.error { color:var(--danger); }
+    .overview { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .topic-chip, .badge { display:inline-flex; align-items:center; border-radius:999px; padding:4px 9px; background:var(--chip); color:#3f3f3f; font-size:12px; font-weight:750; }
+    .card-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:14px; }
+    .nav-row { display:flex; justify-content:space-between; gap:8px; align-items:center; margin-bottom:12px; }
+    .weak-point { border-left:4px solid var(--accent); padding:12px 14px; background:#f5fbfa; border-radius:8px; line-height:1.7; font-size:18px; font-weight:760; }
+    .training-target { margin-top:10px; color:var(--muted); font-size:13px; }
+    .training-target summary { cursor:pointer; color:var(--accent-dark); font-weight:800; }
+    .training-target .target-body { margin-top:8px; display:grid; gap:8px; }
+    .strategy-box { margin-top:12px; border:1px solid #d7e5df; border-radius:8px; background:#f6fbf8; padding:12px 14px; }
+    .strategy-box h3 { font-size:15px; margin-bottom:8px; color:var(--accent-dark); }
+    .strategy-box ul { margin:6px 0 0 20px; padding:0; line-height:1.65; }
+    .evidence { margin-top:10px; color:#38423f; line-height:1.65; }
+    .meta { margin-top:8px; color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+    .source-details { margin-top:10px; color:var(--muted); font-size:13px; }
+    .source-details summary { cursor:pointer; color:var(--accent-dark); font-weight:800; }
+    .source-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+    .source-chip { border:1px solid var(--line); border-radius:999px; padding:3px 8px; background:#f8fbfa; color:#334155; font-size:12px; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+    .result { border-top:1px solid var(--line); margin-top:16px; padding-top:16px; display:grid; gap:12px; }
+    .result-line { border:1px solid var(--line); border-radius:8px; padding:12px; background:#fff; line-height:1.65; }
+    .result-line.ok { border-color:rgba(15,118,110,.28); background:#f3fbf8; }
+    .result-line.warn { border-color:#ead18a; background:#fffaf0; }
+    .result-line h3 { font-size:15px; margin-bottom:6px; }
+    .result-line ul { margin:6px 0 0 20px; padding:0; }
+    .citations { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+    .citation { border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; background:#f8fbfa; color:#334155; }
+    .hidden { display:none !important; }
+    @media (max-width:760px) { .card-head, .nav-row { display:block; } .actions { margin-top:10px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel">
+      <h2>逐条对照</h2>
+      <p>这里不再自动出题。每张卡片直接来自 profile weak point：先写下你现在的理解，再对照笔记纠偏。</p>
+      <div id="status" class="status">正在加载到期弱项...</div>
+      <div id="overview" class="overview"></div>
+    </section>
+    <section id="cardPanel" class="panel hidden"></section>
+    <section id="donePanel" class="panel hidden"></section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = {cards: [], index: 0, verify: null, results: []};
+    loadDue();
+
+    async function loadDue() {
+      setStatus("正在加载到期弱项...");
+      try {
+        const data = await getJson("/api/review/due?limit=80");
+        state.cards = data.cards || [];
+        state.index = 0;
+        state.verify = null;
+        state.results = [];
+        renderOverview(data);
+        if (!state.cards.length) {
+          hide($("cardPanel"));
+          $("donePanel").classList.remove("hidden");
+          const message = data.summary || "可以继续面试或稍后再来。复习不是面试的前置条件。";
+          $("donePanel").innerHTML = `<h3>暂无可独立复习的知识弱项</h3><p>${escapeHtml(message)}</p>`;
+          setStatus(data.summary || "暂无到期弱项。");
+          return;
+        }
+        setStatus("可以先用左右箭头浏览，再选择一条填写理解。");
+        renderCard();
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      }
+    }
+
+    function renderOverview(data) {
+      const topics = data.topics || [];
+      $("overview").innerHTML = topics.length
+        ? topics.slice(0, 6).map((item) => `<span class="topic-chip">${escapeHtml(item.topic)} ${escapeHtml(item.due)} 个到期</span>`).join("")
+        : "";
+    }
+
+    function renderCard() {
+      const card = currentCard();
+      if (!card) return renderDone(false);
+      show($("cardPanel"));
+      hide($("donePanel"));
+      const topicPosition = topicProgress(card);
+      const main = card.main_weak_point || card;
+      const promptPayload = card.review_prompt || null;
+      const promptText = promptPayload?.prompt || "正在生成复习题...";
+      const promptReady = Boolean(promptPayload?.prompt);
+      $("cardPanel").innerHTML = `
+        <div class="nav-row">
+          <button class="secondary" type="button" data-nav="-1">← 上一条</button>
+          <span class="status">${escapeHtml(card.topic || "未分类")} · ${topicPosition}</span>
+          <button class="secondary" type="button" data-nav="1">下一条 →</button>
+        </div>
+        <div class="card-head">
+          <div>
+            <h3>第 ${state.index + 1} / ${state.cards.length} 条</h3>
+            <span class="badge">到期</span>
+          </div>
+          <button id="endReview" class="secondary" type="button">结束复习</button>
+        </div>
+        <div class="weak-point">${escapeHtml(promptText)}</div>
+        ${promptPayload?.hint ? `<div class="meta">提示：${escapeHtml(promptPayload.hint)}</div>` : ""}
+        ${renderTrainingTarget(main, card)}
+        ${renderStrategyConstraints(card.strategy_constraints || [])}
+        ${renderSourceDetails(card.source_note_paths || [])}
+        <label style="display:block;margin-top:14px">
+          <span class="status">回答这道题</span>
+          <textarea id="reviewAnswer" placeholder="例如：我会先说明定义，再区分触发时机和工程边界。"></textarea>
+        </label>
+        <div class="actions">
+          <button id="submitVerify" type="button" ${promptReady ? "" : "disabled"}>提交</button>
+          <button id="reloadDue" class="secondary" type="button">刷新到期弱项</button>
+        </div>
+        <div id="verifyResult" class="result hidden"></div>
+      `;
+      loadCardPrompt(card);
+    }
+
+    function renderVerifyResult(result) {
+      const node = $("verifyResult");
+      node.classList.remove("hidden");
+      node.innerHTML = `
+        <div class="result-line ok">
+          <h3>✅ 方向对了</h3>
+          ${renderList(result.correct || [], "没有明确覆盖点。")}
+        </div>
+        <div class="result-line warn">
+          <h3>⚠️ 还缺什么</h3>
+          ${renderList(result.missed || [], "没有明显遗漏。")}
+        </div>
+        <div class="result-line">
+          <h3>示例</h3>
+          <p>${escapeHtml(result.example || result.feedback || "暂无示例。")}</p>
+          ${renderCitations(result.citations || [])}
+        </div>
+        ${renderStrategyFeedback(result.strategy_feedback || [])}
+        <div class="actions">
+          <button type="button" data-action="improve">确认改善</button>
+          <button type="button" class="danger" data-action="retry">还要再练</button>
+        </div>
+      `;
+    }
+
+    document.addEventListener("click", async (event) => {
+      if (event.target.dataset.nav) move(Number(event.target.dataset.nav));
+      if (event.target.id === "submitVerify") await submitVerify();
+      if (event.target.dataset.action) await commitAction(event.target.dataset.action);
+      if (event.target.id === "endReview") renderDone(true);
+      if (event.target.id === "reloadDue") await loadDue();
+      if (event.target.id === "newReview") await loadDue();
+    });
+
+    function move(delta) {
+      if (!state.cards.length) return;
+      state.index = (state.index + delta + state.cards.length) % state.cards.length;
+      state.verify = null;
+      renderCard();
+    }
+
+    async function submitVerify() {
+      const card = currentCard();
+      const answer = $("reviewAnswer").value.trim();
+      if (!answer) { setStatus("请先写下你的理解。", true); return; }
+      setBusy(true, "正在对照笔记纠偏...");
+      try {
+        const prompt = card.review_prompt?.prompt || card.point || "";
+        const result = await postJson("/api/review/verify", {weak_point_id: card.id, answer, prompt});
+        state.verify = result;
+        renderVerifyResult(result);
+        setStatus("纠偏完成。确认改善或继续练习后会进入下一条。");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function commitAction(action) {
+      const card = currentCard();
+      setBusy(true, "正在保存复习结果...");
+      try {
+        const result = await postJson("/api/review/commit", {weak_point_id: card.id, action});
+        state.results.push({card, action, result});
+        state.cards.splice(state.index, 1);
+        if (state.index >= state.cards.length) state.index = 0;
+        if (!state.cards.length) renderDone(false);
+        else renderCard();
+        setStatus(action === "improve" ? "已标记改善。" : "已标记继续练习。");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function renderDone(ended) {
+      hide($("cardPanel"));
+      show($("donePanel"));
+      const improved = state.results.filter((item) => item.action === "improve").length;
+      const retry = state.results.filter((item) => item.action === "retry").length;
+      $("donePanel").innerHTML = `
+        <h3>${ended ? "已结束复习" : "本轮复习完成"}</h3>
+        <p>本轮处理 ${state.results.length} 条。确认改善 ${improved} 条，还要再练 ${retry} 条。</p>
+        <p>未复习或还要再练的弱项仍会在后续面试中注入，复习只是加速器。</p>
+        <div class="actions"><button id="newReview" type="button">重新加载复习</button></div>
+      `;
+    }
+
+    function topicProgress(card) {
+      const same = state.cards.filter((item) => item.topic === card.topic);
+      const pos = same.findIndex((item) => item.id === card.id) + 1;
+      return `${pos}/${same.length}`;
+    }
+
+    function currentCard() { return state.cards[state.index] || null; }
+    async function loadCardPrompt(card) {
+      if (!card || card.review_prompt || card.prompt_loading) return;
+      card.prompt_loading = true;
+      try {
+        const prompt = await postJson(`/api/review/card/${encodeURIComponent(card.id)}/prompt`, {
+          allowed_question_types: ["recall", "boundary", "compare", "scenario", "followup"],
+          related_topics: [],
+        });
+        card.review_prompt = prompt;
+      } catch (error) {
+        card.review_prompt = {
+          prompt: card.point || "请围绕这个知识弱点，用自己的话完整回答。",
+          fallback_used: true,
+          error: error.message || String(error),
+        };
+      } finally {
+        card.prompt_loading = false;
+        if (currentCard()?.id === card.id) renderCard();
+      }
+    }
+    function renderTrainingTarget(main, card) {
+      const point = main.point || card.point || "";
+      const evidence = main.evidence || card.evidence || "";
+      if (!point && !evidence) return "";
+      return `
+        <details class="training-target">
+          <summary>训练目标</summary>
+          <div class="target-body">
+            ${point ? `<div>${escapeHtml(point)}</div>` : ""}
+            ${evidence ? `<div>上次暴露：${escapeHtml(evidence)}</div>` : ""}
+          </div>
+        </details>
+      `;
+    }
+    function renderStrategyConstraints(items) {
+      const constraints = Array.isArray(items) ? items.filter((item) => item && item.point) : [];
+      if (!constraints.length) return "";
+      return `
+        <div class="strategy-box">
+          <h3>本题作答要求</h3>
+          <ul>${constraints.map((item) => `<li>${escapeHtml(item.point)}</li>`).join("")}</ul>
+        </div>
+      `;
+    }
+    function renderStrategyFeedback(items) {
+      const values = Array.isArray(items) ? items.filter(Boolean) : [];
+      if (!values.length) return "";
+      return `
+        <div class="result-line">
+          <h3>作答要求反馈</h3>
+          ${renderList(values, "暂无作答要求反馈。")}
+        </div>
+      `;
+    }
+    function renderSourceDetails(paths) {
+      const values = Array.isArray(paths) ? paths.filter(Boolean) : [];
+      if (!values.length) return `<details class="source-details"><summary>来源</summary><div class="meta">未记录来源笔记</div></details>`;
+      const visible = values.slice(0, 3);
+      const extra = values.length - visible.length;
+      return `
+        <details class="source-details">
+          <summary>来源 (${values.length})</summary>
+          <div class="source-chips">
+            ${visible.map((path) => `<span class="source-chip" title="${escapeHtml(path)}">${escapeHtml(fileName(path))}</span>`).join("")}
+            ${extra > 0 ? `<span class="source-chip" title="${escapeHtml(values.slice(3).join("，"))}">+${extra}</span>` : ""}
+          </div>
+        </details>
+      `;
+    }
+    function fileName(path) {
+      const normalized = String(path || "").replaceAll("\\", "/");
+      return normalized.split("/").filter(Boolean).pop() || normalized || "source";
+    }
+    function renderList(items, emptyText) {
+      const values = Array.isArray(items) ? items.filter(Boolean) : [];
+      return values.length ? `<ul>${values.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : `<p>${escapeHtml(emptyText)}</p>`;
+    }
+    function renderCitations(citations) {
+      if (!citations.length) return "";
+      return `<div class="citations">${citations.slice(0, 8).map((item) => `<span class="citation">${escapeHtml(item.path || item.source_path || item.title || "source")}</span>`).join("")}</div>`;
+    }
+    async function getJson(url) {
+      const response = await fetch(url);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || `${response.status} ${response.statusText}`);
+      return data;
+    }
+    async function postJson(url, payload) {
+      const response = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || `${response.status} ${response.statusText}`);
+      return data;
+    }
+    function setBusy(busy, message="") { document.querySelectorAll("button").forEach((button) => button.disabled = busy); if (message) setStatus(message); }
+    function setStatus(message, error=false) { $("status").textContent = message || ""; $("status").className = `status ${error ? "error" : ""}`; }
+    function show(node) { node.classList.remove("hidden"); }
+    function hide(node) { node.classList.add("hidden"); }
+    function escapeHtml(value) { return String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;"); }
+  </script>
+</body>
+</html>
+"""
+
+
+REVIEW_LEGACY_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>复习</title>
+  <style>
+    :root { --bg:#f7f7f4; --panel:#fff; --line:#d9d9d2; --text:#171717; --muted:#666; --accent:#0f766e; --accent-dark:#115e59; --danger:#b42318; --chip:#eef2f1; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width:min(980px, calc(100vw - 32px)); margin:0 auto; padding:24px 0 48px; display:grid; gap:14px; }
+    .panel { border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:18px; }
+    details.panel { padding:0; }
+    details.panel > summary { padding:16px 18px; cursor:pointer; font-weight:850; color:var(--accent-dark); }
+    details.panel > .panel-body { border-top:1px solid var(--line); padding:16px 18px 18px; }
+    h2 { margin:0 0 8px; font-size:25px; }
+    h3 { margin:0 0 10px; font-size:18px; }
+    p { margin:0 0 12px; color:var(--muted); line-height:1.65; }
+    label { display:grid; gap:5px; color:var(--muted); font-size:13px; font-weight:750; }
+    input, select, textarea, button { font:inherit; }
+    input[type="number"], select, textarea { width:100%; border:1px solid var(--line); border-radius:7px; padding:8px 10px; background:#fff; color:var(--text); }
+    textarea { min-height:130px; resize:vertical; line-height:1.6; }
+    button { border:1px solid var(--accent); border-radius:7px; background:var(--accent); color:#fff; padding:8px 12px; cursor:pointer; font-weight:800; }
+    button.secondary { background:#fff; color:var(--accent-dark); border-color:var(--line); }
+    button.danger { background:#fff; color:var(--danger); border-color:#f3b5ad; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .setup-grid { display:grid; grid-template-columns: 1fr 220px 180px; gap:12px; align-items:end; }
+    .chips { display:flex; flex-wrap:wrap; gap:7px; }
+    .chip-check { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); border-radius:999px; padding:6px 10px; background:#fff; color:#34423f; font-size:13px; cursor:pointer; }
+    .chip-check input { margin:0; }
+    .status { color:var(--muted); font-size:13px; min-height:20px; }
+    .status.error { color:var(--danger); }
+    .card-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:12px; }
+    .badge { display:inline-flex; border-radius:999px; padding:3px 8px; background:var(--chip); color:#3f3f3f; font-size:12px; font-weight:750; }
+    .question { border-left:4px solid var(--accent); padding:10px 12px; background:#f5fbfa; border-radius:7px; line-height:1.7; font-size:17px; }
+    .hint { margin-top:8px; color:var(--muted); font-size:13px; }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+    .plan-list { display:grid; gap:6px; margin-top:8px; }
+    .plan-item { display:flex; justify-content:space-between; gap:12px; border:1px solid var(--line); border-radius:7px; padding:8px 10px; color:#34423f; font-size:13px; }
+    .plan-item.active { border-color:rgba(15,118,110,.35); background:#e7f3f1; }
+    .feedback-grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:12px; }
+    .feedback-box { border:1px solid var(--line); border-radius:8px; padding:12px; background:#fff; }
+    .feedback-box ul { margin:6px 0 0 20px; padding:0; }
+    .citations { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+    .citation { border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; background:#f8fbfa; color:#334155; }
+    .hidden { display:none !important; }
+    @media (max-width:760px) { .setup-grid, .feedback-grid { grid-template-columns:1fr; } .card-head { display:block; } }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel">
+      <p>选择要复习的主题和本轮题数，系统会逐题出题、纠偏，并在你确认 pass/fail 后自动进入下一题。</p>
+      <div id="status" class="status">正在加载复习主题...</div>
+    </section>
+
+    <details id="setupPanel" class="panel" open>
+      <summary>复习设置</summary>
+      <div class="panel-body">
+        <div class="setup-grid">
+          <label>本轮题数<input id="limit" type="number" min="1" max="50" value="10" /></label>
+          <label>允许交叉题<select id="allowCross"><option value="true" selected>允许</option><option value="false">不允许</option></select></label>
+          <div class="actions" style="margin:0">
+            <button id="startBtn" type="button">开始复习</button>
+            <button id="newBtn" class="secondary" type="button">新建复习</button>
+          </div>
+        </div>
+        <h3 style="margin-top:16px">主题</h3>
+        <div id="topicFilters" class="chips"></div>
+        <h3 style="margin-top:16px">允许题型</h3>
+        <div id="typeFilters" class="chips"></div>
+      </div>
+    </details>
+
+    <details id="planPanel" class="panel hidden">
+      <summary>本轮计划</summary>
+      <div class="panel-body"><div id="planList" class="plan-list"></div></div>
+    </details>
+
+    <section id="questionPanel" class="panel hidden"></section>
+    <section id="reviewPanel" class="panel hidden"></section>
+    <section id="donePanel" class="panel hidden"></section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = {cards: [], index: 0, prompt: null, grade: null, results: []};
+    const questionTypeLabels = {recall:"主动回忆", boundary:"职责边界", compare:"概念对比", scenario:"场景设计", followup:"面试追问"};
+
+    $("startBtn").addEventListener("click", startReview);
+    $("newBtn").addEventListener("click", newReview);
+    loadInitialPlan();
+
+    async function loadInitialPlan() {
+      try {
+        const data = await postJson("/api/review/plan", {topics: [], question_types: [], limit: 10, allow_cross_topic: true});
+        renderSetup(data);
+        setStatus("选择主题后开始复习。未选择主题时会使用全部到期薄弱点。");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      }
+    }
+
+    function renderSetup(data) {
+      const topics = data.available_topics || [];
+      $("topicFilters").innerHTML = topics.length ? topics.map((item) => `
+        <label class="chip-check"><input type="checkbox" value="${escapeHtml(item.topic)}" />${escapeHtml(item.topic)} · ${item.due}/${item.total}</label>
+      `).join("") : `<span class="status">暂无 profile weak point。先完成一次面试并结束 session 后再复习。</span>`;
+      const types = data.question_types || [];
+      $("typeFilters").innerHTML = types.map((item) => `
+        <label class="chip-check"><input type="checkbox" value="${escapeHtml(item.value)}" checked />${escapeHtml(item.label)}</label>
+      `).join("");
+    }
+
+    async function startReview() {
+      setBusy(true, "正在生成复习计划...");
+      try {
+        const payload = {
+          topics: checkedValues("topicFilters"),
+          question_types: checkedValues("typeFilters"),
+          limit: Number($("limit").value || 10),
+          allow_cross_topic: $("allowCross").value === "true"
+        };
+        const plan = await postJson("/api/review/plan", payload);
+        state.cards = plan.cards || [];
+        state.index = 0;
+        state.results = [];
+        if (!state.cards.length) {
+          setStatus("当前没有到期复习卡片。可以换主题，或先完成一次面试生成 weak points。", true);
+          $("setupPanel").open = true;
+          return;
+        }
+        $("setupPanel").open = false;
+        $("planPanel").classList.remove("hidden");
+        renderPlan();
+        await loadQuestion();
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function loadQuestion() {
+      const card = currentCard();
+      if (!card) return renderDone();
+      hide($("reviewPanel"));
+      hide($("donePanel"));
+      show($("questionPanel"));
+      $("questionPanel").innerHTML = renderQuestionShell(card, "正在出题...");
+      renderPlan();
+      setBusy(true, "正在出题...");
+      try {
+        state.prompt = await postJson(`/api/review/card/${encodeURIComponent(card.id)}/prompt`, {
+          allowed_question_types: card.allowed_question_types || [],
+          related_topics: card.candidate_related_topics || []
+        });
+        $("questionPanel").innerHTML = renderQuestion(card, state.prompt);
+        $("answer").focus();
+      } catch (error) {
+        $("questionPanel").innerHTML = renderQuestionShell(card, error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function renderQuestion(card, prompt) {
+      const qtype = prompt.question_type || card.question_type || "auto";
+      return `
+        <div class="card-head">
+          <div>
+            <h3>第 ${state.index + 1} / ${state.cards.length} 题</h3>
+            <div class="status">${escapeHtml(card.topic || "未分类")} · ${escapeHtml(questionTypeLabels[qtype] || qtype)}</div>
+          </div>
+          <span class="badge">${card.due ? "到期" : "提前"}</span>
+        </div>
+        <div class="question">${escapeHtml(prompt.prompt || "")}</div>
+        ${prompt.hint ? `<div class="hint">提示：${escapeHtml(prompt.hint)}</div>` : ""}
+        ${prompt.reason ? `<div class="hint">题型选择：${escapeHtml(prompt.reason)}</div>` : ""}
+        <label style="margin-top:14px">你的回答<textarea id="answer" placeholder="先凭记忆回答，不要看笔记。"></textarea></label>
+        <div class="actions">
+          <button id="submitAnswer" type="button">提交并纠偏</button>
+          <button id="endBtn" class="secondary" type="button">结束复习</button>
+        </div>
+      `;
+    }
+
+    function renderQuestionShell(card, message, error=false) {
+      return `
+        <div class="card-head">
+          <div><h3>第 ${state.index + 1} / ${state.cards.length} 题</h3><div class="status">${escapeHtml(card.topic || "未分类")}</div></div>
+        </div>
+        <div class="status ${error ? "error" : ""}">${escapeHtml(message)}</div>
+      `;
+    }
+
+    document.addEventListener("click", async (event) => {
+      if (event.target.id === "submitAnswer") await submitAnswer();
+      if (event.target.id === "endBtn") renderDone(true);
+      if (event.target.dataset.outcome) await commitOutcome(event.target.dataset.outcome);
+    });
+
+    async function submitAnswer() {
+      const answer = $("answer").value.trim();
+      if (!answer) { setStatus("请先填写回答。", true); return; }
+      const card = currentCard();
+      setBusy(true, "正在对照笔记纠偏...");
+      try {
+        state.grade = await postJson(`/api/review/card/${encodeURIComponent(card.id)}/grade`, {
+          prompt: state.prompt?.prompt || "",
+          answer
+        });
+        renderReview(card, state.grade);
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function renderReview(card, grade) {
+      hide($("questionPanel"));
+      show($("reviewPanel"));
+      const suggested = grade.suggested_outcome || "fail";
+      $("reviewPanel").innerHTML = `
+        <div class="card-head">
+          <div><h3>纠偏结果</h3><div class="status">${escapeHtml(card.topic || "未分类")} · 建议 ${escapeHtml(suggested)}</div></div>
+          <span class="badge">${escapeHtml(suggested)}</span>
+        </div>
+        <div class="feedback-grid">
+          ${feedbackBox("已覆盖", grade.covered)}
+          ${feedbackBox("遗漏点", grade.missing)}
+          ${feedbackBox("纠偏", grade.corrections)}
+          <div class="feedback-box"><h3>反馈</h3><p>${escapeHtml(grade.feedback || "无额外反馈。")}</p>${renderCitations(grade.citations || [])}</div>
+        </div>
+        <div class="actions">
+          <button data-outcome="pass" type="button">Pass</button>
+          <button data-outcome="fail" class="danger" type="button">Fail</button>
+          <button id="endBtn" class="secondary" type="button">结束复习</button>
+        </div>
+      `;
+    }
+
+    function feedbackBox(title, items) {
+      const values = Array.isArray(items) ? items : [];
+      return `<div class="feedback-box"><h3>${escapeHtml(title)}</h3>${values.length ? `<ul>${values.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : "<p>无</p>"}</div>`;
+    }
+
+    function renderCitations(citations) {
+      if (!citations.length) return "";
+      return `<div class="citations">${citations.slice(0, 8).map((item) => `<span class="citation">${escapeHtml(item.path || item.source_path || item.title || "source")}</span>`).join("")}</div>`;
+    }
+
+    async function commitOutcome(outcome) {
+      const card = currentCard();
+      setBusy(true, "正在保存复习结果...");
+      try {
+        const result = await postJson(`/api/review/card/${encodeURIComponent(card.id)}/commit`, {outcome});
+        state.results.push({card, outcome, result});
+        state.index += 1;
+        if (state.index >= state.cards.length) renderDone();
+        else await loadQuestion();
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function renderDone(ended=false) {
+      hide($("questionPanel"));
+      hide($("reviewPanel"));
+      show($("donePanel"));
+      const pass = state.results.filter((item) => item.outcome === "pass").length;
+      const fail = state.results.filter((item) => item.outcome === "fail").length;
+      $("donePanel").innerHTML = `
+        <h3>${ended ? "已结束复习" : "本轮复习完成"}</h3>
+        <p>已完成 ${state.results.length} / ${state.cards.length} 题。Pass ${pass}，Fail ${fail}。</p>
+        <div class="actions"><button id="newBtnInline" type="button">新建复习</button></div>
+      `;
+      $("newBtnInline").addEventListener("click", newReview);
+    }
+
+    function newReview() {
+      state.cards = []; state.index = 0; state.prompt = null; state.grade = null; state.results = [];
+      document.querySelectorAll("#topicFilters input, #typeFilters input").forEach((node) => { node.checked = node.closest("#typeFilters") !== null; });
+      $("allowCross").value = "true";
+      $("setupPanel").open = true;
+      hide($("planPanel")); hide($("questionPanel")); hide($("reviewPanel")); hide($("donePanel"));
+      setStatus("重新选择主题后开始复习。");
+    }
+
+    function renderPlan() {
+      $("planList").innerHTML = state.cards.map((card, index) => `
+        <div class="plan-item ${index === state.index ? "active" : ""}">
+          <span>${index + 1}. ${escapeHtml(card.topic || "未分类")}</span>
+          <span>${escapeHtml(card.point || "")}</span>
+        </div>
+      `).join("");
+    }
+
+    function currentCard() { return state.cards[state.index] || null; }
+    function checkedValues(id) { return Array.from(document.querySelectorAll(`#${id} input:checked`)).map((node) => node.value); }
+    async function postJson(url, payload) {
+      const response = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || `${response.status} ${response.statusText}`);
+      return data;
+    }
+    function setStatus(message, error=false) { $("status").textContent = message || ""; $("status").className = `status ${error ? "error" : ""}`; }
+    function setBusy(busy, message="") { $("startBtn").disabled = busy; if (message) setStatus(message); }
+    function show(node) { node.classList.remove("hidden"); }
+    function hide(node) { node.classList.add("hidden"); }
+    function escapeHtml(value) { return String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;"); }
   </script>
 </body>
 </html>
@@ -4397,6 +6185,101 @@ INDEX_HTML = r"""<!doctype html>
       gap: 12px;
     }
 
+    .search-columns {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+
+    .search-column {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .column-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+      padding: 0 2px;
+    }
+
+    .column-title strong {
+      color: var(--text);
+      font-size: 15px;
+    }
+
+    .user-result-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      min-width: 0;
+    }
+
+    .user-result-card a {
+      color: var(--accent-dark);
+      text-decoration: none;
+      font-weight: 750;
+    }
+
+    .user-result-card a:hover {
+      text-decoration: underline;
+    }
+
+    .user-result-title {
+      font-size: 15px;
+      font-weight: 750;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .user-result-meta {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+    }
+
+    .user-result-preview {
+      color: #303936;
+      font-size: 13px;
+      line-height: 1.58;
+      margin-top: 8px;
+      white-space: pre-wrap;
+    }
+
+    .empty-column {
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 18px 12px;
+      color: var(--muted);
+      background: rgba(255,255,255,.62);
+      font-size: 13px;
+      text-align: center;
+    }
+
+    .debug-only {
+      display: none;
+    }
+
+    .debug-mode .debug-only {
+      display: grid;
+    }
+
+    .debug-mode .stage-tabs {
+      display: flex;
+    }
+
+    .debug-mode .search-columns {
+      display: none;
+    }
+
     .stage-tabs {
       display: flex;
       flex-wrap: wrap;
@@ -4499,15 +6382,18 @@ INDEX_HTML = r"""<!doctype html>
       .advanced-grid {
         grid-template-columns: 1fr 1fr;
       }
+
+      .search-columns {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
   <main>
+    <div id="status" class="status page-status">就绪</div>
     <div class="topbar">
       <div>
-        <h1>检索调试</h1>
-        <div id="status" class="status">就绪</div>
       </div>
       <nav class="topnav">
         <a href="/chat">对话</a>
@@ -4530,7 +6416,7 @@ INDEX_HTML = r"""<!doctype html>
         <label class="check"><input id="enableRewrite" type="checkbox" /> query rewrite</label>
       </div>
 
-      <details>
+      <details id="advancedOptions">
         <summary>高级选项</summary>
         <div class="advanced-grid">
           <div class="field">
@@ -4583,20 +6469,40 @@ INDEX_HTML = r"""<!doctype html>
     </section>
 
     <section id="meta" class="meta-panel"></section>
-    <section id="stageTabs" class="stage-tabs"></section>
-    <section id="results" class="results"></section>
+    <section id="userResults" class="search-columns"></section>
+    <section id="stageTabs" class="stage-tabs debug-only"></section>
+    <section id="results" class="results debug-only"></section>
   </main>
 
   <script>
     const $ = (id) => document.getElementById(id);
     let currentSearchData = null;
+    let currentWikiReport = null;
     let activeStageKey = "final";
+    const searchParams = new URLSearchParams(window.location.search);
+    const debugMode = searchParams.get("debug") === "true";
 
     $("searchBtn").addEventListener("click", runSearch);
     $("rerankerType").addEventListener("change", updateRerankerModelDefault);
     $("query").addEventListener("keydown", (event) => {
       if (event.key === "Enter") runSearch();
     });
+    initializeSearchPage();
+
+    function initializeSearchPage() {
+      const initialQuery = searchParams.get("q") || "";
+      if (debugMode) {
+        document.body.classList.add("debug-mode");
+        $("advancedOptions").open = true;
+      } else {
+        $("advancedOptions").open = false;
+        $("userResults").innerHTML = renderEmptySearchState();
+      }
+      if (initialQuery) {
+        $("query").value = initialQuery;
+        runSearch();
+      }
+    }
 
     async function runSearch() {
       const query = $("query").value.trim();
@@ -4604,6 +6510,7 @@ INDEX_HTML = r"""<!doctype html>
 
       setBusy(true);
       $("meta").innerHTML = "";
+      $("userResults").innerHTML = "";
       $("stageTabs").innerHTML = "";
       $("results").innerHTML = "";
 
@@ -4620,29 +6527,141 @@ INDEX_HTML = r"""<!doctype html>
         reranker_type: $("rerankerType").value,
         reranker_model: $("rerankerModel").value.trim(),
         rerank_candidates: numberValue("rerankCandidates"),
-        include_debug: true
+        include_debug: debugMode
       };
 
       try {
-        const response = await fetch("/api/search", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify(payload)
-        });
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.detail || "search failed");
-        }
+        const [data, wikiReport] = await Promise.all([
+          fetchSearchResults(payload),
+          debugMode ? Promise.resolve(null) : loadWikiReport()
+        ]);
         currentSearchData = data;
         activeStageKey = "final";
-        renderMeta(data);
-        renderStageTabs(data);
-        renderActiveStage();
+        if (debugMode) {
+          renderMeta(data);
+          renderStageTabs(data);
+          renderActiveStage();
+        } else {
+          renderUserSearchResults(data, wikiReport, query);
+        }
       } catch (error) {
         $("meta").innerHTML = `<div class="meta-box error">${escapeHtml(error.message)}</div>`;
       } finally {
         setBusy(false);
       }
+    }
+
+    async function fetchSearchResults(payload) {
+      const response = await fetch("/api/search", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "search failed");
+      }
+      return data;
+    }
+
+    async function loadWikiReport() {
+      if (currentWikiReport) return currentWikiReport;
+      const response = await fetch("/api/wiki/report");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "wiki report failed");
+      currentWikiReport = data;
+      return data;
+    }
+
+    function renderEmptySearchState() {
+      return `
+        ${renderColumn("笔记片段", "Hybrid 检索结果", [])}
+        ${renderColumn("Wiki 页面", "已生成主题页", [])}
+        ${renderColumn("Tag 匹配", "主题候选", [])}
+      `;
+    }
+
+    function renderUserSearchResults(data, wikiReport, query) {
+      const noteItems = (data.results || []).slice(0, numberValue("topK")).map(renderNoteCard);
+      const rows = wikiRows(wikiReport, query);
+      const wikiItems = rows.filter((row) => row.wiki_exists).slice(0, 8).map(renderWikiCard);
+      const tagItems = rows.slice(0, 12).map(renderTagCard);
+      $("meta").innerHTML = `<div class="meta-box"><strong>搜索完成</strong><span>${data.results.length} 个笔记片段 · ${wikiItems.length} 个 Wiki 页面 · ${tagItems.length} 个 Tag 匹配 · ${data.elapsed_ms} ms</span></div>`;
+      $("userResults").innerHTML = `
+        ${renderColumn("笔记片段", `${noteItems.length} 个结果`, noteItems)}
+        ${renderColumn("Wiki 页面", `${wikiItems.length} 个结果`, wikiItems)}
+        ${renderColumn("Tag 匹配", `${tagItems.length} 个结果`, tagItems)}
+      `;
+    }
+
+    function renderColumn(title, subtitle, items) {
+      const body = items.length ? items.join("") : `<div class="empty-column">输入关键词后显示匹配结果</div>`;
+      return `
+        <section class="search-column">
+          <div class="column-title"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(subtitle)}</span></div>
+          ${body}
+        </section>
+      `;
+    }
+
+    function renderNoteCard(item) {
+      const heading = item.heading ? `<div class="user-result-meta">${escapeHtml(item.heading)}</div>` : "";
+      return `
+        <article class="user-result-card">
+          <div class="user-result-title">${escapeHtml(item.title || item.note_path || "笔记")}</div>
+          <div class="user-result-meta">${escapeHtml(item.note_path || "")}</div>
+          ${heading}
+          <div class="user-result-preview">${escapeHtml(item.preview || item.text || "")}</div>
+        </article>
+      `;
+    }
+
+    function renderWikiCard(row) {
+      const href = `/wiki?tag=${encodeURIComponent(row.tag || "")}`;
+      return `
+        <article class="user-result-card">
+          <a class="user-result-title" href="${href}">${escapeHtml(formatTagTitle(row.tag))}</a>
+          <div class="user-result-meta">${escapeHtml(row.wiki_path || "")}</div>
+          <div class="user-result-preview">${escapeHtml(row.wiki_preview || "已生成 Wiki 页面。")}</div>
+        </article>
+      `;
+    }
+
+    function renderTagCard(row) {
+      const href = row.wiki_exists ? `/wiki?tag=${encodeURIComponent(row.tag || "")}` : "";
+      const title = escapeHtml(formatTagTitle(row.tag));
+      const titleHtml = href ? `<a class="user-result-title" href="${href}">${title}</a>` : `<div class="user-result-title">${title}</div>`;
+      const policy = row.wiki_policy ? ` · ${row.wiki_policy}` : "";
+      const status = row.wiki_exists ? "已生成" : (row.eligible ? "未合成" : "跳过");
+      return `
+        <article class="user-result-card">
+          ${titleHtml}
+          <div class="user-result-meta">${Number(row.note_count || 0)} 篇笔记 · ${status}${escapeHtml(policy)}</div>
+          <div class="user-result-preview">${escapeHtml(row.wiki_preview || row.wiki_path || "匹配到主题候选。")}</div>
+        </article>
+      `;
+    }
+
+    function wikiRows(report, query) {
+      const needle = query.trim().toLowerCase();
+      if (!report || !needle) return [];
+      return (report.tag_rows || [])
+        .filter((row) => rowMatches(row, needle))
+        .sort((a, b) => Number(b.wiki_exists) - Number(a.wiki_exists) || Number(b.note_count || 0) - Number(a.note_count || 0));
+    }
+
+    function rowMatches(row, needle) {
+      const haystack = [
+        row.tag,
+        row.wiki_path,
+        row.wiki_preview,
+        row.wiki_policy
+      ].map((value) => String(value || "").toLowerCase()).join("\n");
+      return haystack.includes(needle);
+    }
+
+    function formatTagTitle(tag) {
+      return String(tag || "").split("/").filter(Boolean).join(" / ") || "未命名主题";
     }
 
     function renderMeta(data) {
@@ -4796,7 +6815,8 @@ INDEX_HTML = r"""<!doctype html>
 
     function setBusy(isBusy) {
       $("searchBtn").disabled = isBusy;
-      $("status").textContent = isBusy ? "检索中" : "就绪";
+      const status = $("status");
+      if (status) status.textContent = isBusy ? "检索中" : "就绪";
     }
 
     function escapeHtml(value) {
@@ -4823,13 +6843,43 @@ CHAT_HTML = r"""<!doctype html>
     :root { color-scheme: light; --bg:#f7f7f4; --panel:#fff; --text:#171717; --muted:#666; --line:#d9d9d2; --accent:#0f766e; --accent-dark:#115e59; --soft:#eef2f1; --danger:#b42318; --code:#f2f4f3; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
-    main { width: min(980px, calc(100vw - 28px)); margin: 0 auto; min-height: 100vh; display: grid; grid-template-rows: auto 1fr auto; gap: 12px; padding: 18px 0; }
+    main.chat-page {
+      width: min(980px, calc(100vw - 28px));
+      margin: 0 auto;
+      height: calc(100dvh - 68px);
+      max-height: calc(100dvh - 68px);
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 12px 0 16px;
+    }
+    .app-main:has(.chat-page) .app-content {
+      min-height: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .chat-scroll {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .chat-dock {
+      flex: 0 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
     .topbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
     .topbar h1 { margin: 0; font-size: 22px; line-height: 1.2; }
     .topnav { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
     .topnav a { color: var(--accent-dark); text-decoration: none; font-size: 14px; font-weight: 600; }
     .status { color: var(--muted); font-size: 13px; margin-top: 4px; }
-    .messages { overflow-y: auto; display: grid; align-content: start; gap: 12px; padding: 2px; }
+    .messages { flex: 1 0 auto; min-height: 0; overflow: visible; display: grid; align-content: start; gap: 12px; padding: 2px; }
     .message { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 13px; }
     .message.user { margin-left: auto; width: min(760px, 90%); background: #fdfdfb; }
     .message.assistant { margin-right: auto; width: min(860px, 100%); }
@@ -4862,7 +6912,7 @@ CHAT_HTML = r"""<!doctype html>
     .agent-process-item.error .agent-process-icon { color: #b42318; }
     .agent-process-item small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; word-break: break-word; }
     @keyframes processPulse { 0%, 100% { opacity: .42; } 50% { opacity: 1; } }
-    .composer { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px; display: grid; gap: 10px; }
+    .composer { border: 1px solid var(--line); border-radius: 0 0 8px 8px; background: var(--panel); padding: 12px; display: grid; gap: 10px; }
     .controls, .session-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
     input, select, textarea { border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; font: inherit; background: #fff; color: var(--text); }
@@ -4873,8 +6923,118 @@ CHAT_HTML = r"""<!doctype html>
     button.retry-answer { margin-top: 8px; width: 32px; height: 32px; padding: 0; border-radius: 50%; background: #fff; color: var(--accent-dark); border-color: var(--line); }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
     .debug { border-top: 1px solid var(--line); padding-top: 8px; color: var(--muted); font-size: 12px; }
-    .session-context { display: none; }
+    .session-context { display: none; flex: 0 0 auto; min-height: 0; }
     .session-context.has-content { display: block; }
+    .session-context .session-panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+    .session-context .session-panel summary {
+      cursor: pointer;
+      color: var(--accent-dark);
+      font-weight: 800;
+      padding: 10px 12px;
+      list-style: none;
+    }
+    .session-context .session-panel summary::-webkit-details-marker { display: none; }
+    .session-context .session-panel-body {
+      max-height: min(32vh, 280px);
+      overflow-x: hidden;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      -webkit-overflow-scrolling: touch;
+      padding: 0 12px 10px;
+    }
+    .review-notice {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border: 1px solid #d7e5df;
+      border-radius: 8px;
+      background: #f4fbf8;
+      padding: 10px 12px;
+      color: #263a35;
+      font-size: 14px;
+    }
+    .review-notice[hidden] { display: none; }
+    .review-notice strong { color: var(--accent-dark); }
+    .review-notice-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .review-notice-actions button { padding: 6px 10px; font-size: 12px; }
+    .interview-direction-bar {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      min-height: 36px;
+      padding: 6px 12px;
+      border: 1px solid var(--line);
+      border-bottom: 0;
+      border-radius: 8px 8px 0 0;
+      background: rgba(255,255,255,.96);
+      font-size: 12px;
+      color: var(--muted);
+      overflow: visible;
+      position: relative;
+      z-index: 6;
+    }
+    .interview-direction-bar.visible { display: flex; }
+    .interview-direction-bar .dir-label {
+      color: var(--accent-dark);
+      font-weight: 800;
+      white-space: nowrap;
+      flex: 0 0 auto;
+    }
+    .interview-direction-bar .dir-value {
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+    .interview-direction-bar .dir-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      flex: 1 1 auto;
+      min-width: 0;
+      scrollbar-width: none;
+    }
+    .interview-direction-bar .dir-actions::-webkit-scrollbar { display: none; }
+    .interview-direction-bar .dir-chip {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+      color: var(--accent-dark);
+      padding: 3px 10px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      white-space: nowrap;
+      flex: 0 0 auto;
+    }
+    .interview-direction-bar .dir-chip:hover { border-color: var(--accent); background: #f8fbfa; }
+    .interview-direction-bar .dir-chip.active {
+      border-color: var(--accent);
+      background: #e7f3f1;
+      color: var(--accent-dark);
+    }
+    .interview-direction-bar .dir-meta {
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+      flex: 0 1 auto;
+      max-width: 42%;
+    }
+    .chat-dock .composer.no-direction-rail {
+      border-radius: 8px;
+      border-top: 1px solid var(--line);
+    }
     .session-panel { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 10px 12px; }
     .session-panel summary { cursor: pointer; color: var(--accent-dark); font-weight: 800; }
     .context-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
@@ -4889,6 +7049,12 @@ CHAT_HTML = r"""<!doctype html>
     .reference .path { color: var(--muted); font-size: 12px; word-break: break-all; margin-top: 3px; }
     .reference pre, .debug-box { white-space: pre-wrap; overflow-x: auto; background: var(--code); border-radius: 6px; padding: 10px; }
     .ref-id, .citation { color: var(--accent-dark); font-weight: 700; }
+    .turn-citations { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+    .turn-citations summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 700; }
+    .turn-citation-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .turn-citation-chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 999px; background: #f8fbfa; padding: 3px 10px; font-size: 12px; color: #334155; max-width: 100%; }
+    .turn-citation-chip .note-name { font-weight: 700; color: var(--accent-dark); }
+    .turn-citation-chip .note-section { color: var(--muted); }
     details.review { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
     details.review summary { cursor: pointer; color: var(--accent-dark); font-weight: 700; }
     .review-section { margin-top: 10px; }
@@ -4906,16 +7072,15 @@ CHAT_HTML = r"""<!doctype html>
     .history-item { display: block; width: 100%; text-align: left; margin-bottom: 8px; border: 1px solid var(--line); background: #fff; color: var(--text); }
     .history-meta { color: var(--muted); font-size: 12px; }
     .error { color: var(--danger); }
-    @media (max-width: 720px) { main { width: min(100vw - 18px, 980px); padding: 10px 0; } .topbar { display: block; } .message.user, .message.assistant { width: 100%; } .controls, .context-grid { display: grid; grid-template-columns: 1fr; } }
+    @media (max-width: 720px) { main.chat-page { width: min(100vw - 18px, 980px); padding: 10px 0 12px; height: calc(100dvh - 60px); max-height: calc(100dvh - 60px); } .topbar { display: block; } .message.user, .message.assistant { width: 100%; } .controls, .context-grid { display: grid; grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
-  <main>
+  <main class="chat-page">
+    <div id="status" class="status page-status">&#23601;&#32490;</div>
     <header>
       <div class="topbar">
         <div>
-          <h1>&#23545;&#35805;</h1>
-          <div id="status" class="status">&#23601;&#32490;</div>
         </div>
         <nav class="topnav">
           <a href="/chat">&#23545;&#35805;</a>
@@ -4928,15 +7093,20 @@ CHAT_HTML = r"""<!doctype html>
       </div>
     </header>
 
-    <section id="sessionContext" class="session-context"></section>
+    <section id="reviewNotice" class="review-notice" hidden></section>
 
-    <section id="messages" class="messages">
-      <article class="message assistant"><div class="role">Assistant</div><div class="answer">已准备。可以选择面试模式并发送消息开始。</div></article>
-    </section>
+    <div class="chat-scroll">
+      <section id="sessionContext" class="session-context"></section>
+      <section id="messages" class="messages">
+        <article class="message assistant"><div class="role">Assistant</div><div class="answer">已准备。可以直接提问，或切换到面试模式开始练习。</div></article>
+      </section>
+    </div>
 
-    <section class="composer">
+    <div class="chat-dock">
+      <div id="interviewDirectionBar" class="interview-direction-bar" hidden aria-live="polite"></div>
+      <section id="composer" class="composer no-direction-rail">
       <div class="controls">
-        <label>模式<select id="chatMode"><option value="interview" selected>面试</option><option value="study">复习</option><option value="answer">问答</option></select></label>
+        <label>模式<select id="chatMode"><option value="answer" selected>问答</option><option value="interview">面试</option></select></label>
         <label>范围<select id="scopeType"><option value="tag">标签</option><option value="folder" selected>文件夹</option><option value="selected_notes">指定笔记</option><option value="search">搜索</option></select></label>
         <label>范围值<input id="scopeValue" value="个人/面试/agent面试" /></label>
         <label><span>仅依据资料</span><input id="strictEvidence" type="checkbox" /></label>
@@ -4963,12 +7133,12 @@ CHAT_HTML = r"""<!doctype html>
         </div>
       </details>
     </section>
+    </div>
   </main>
 
   <div id="historyModal" class="modal-backdrop" aria-hidden="true">
     <aside class="modal" role="dialog" aria-modal="true" aria-label="面试历史">
       <div class="modal-head">
-        <h2 style="margin:0;font-size:18px">面试历史</h2>
         <button id="closeHistory" class="secondary" type="button">关闭</button>
       </div>
       <div id="historyContent" class="history-meta">加载中...</div>
@@ -4981,17 +7151,22 @@ CHAT_HTML = r"""<!doctype html>
     let chatHistory = [];
     let currentAssistant = null;
     let currentAssistantText = "";
+    let currentTurnCitations = [];
     let currentPayload = null;
     let currentInterviewPlan = null;
     let currentInterviewPlanSignature = "";
     let currentInterviewState = null;
     let currentInterviewSessionId = "";
-    let currentConversationSignature = conversationSignature();
+    let currentConversationSignature = "";
     let lastContextItems = [];
     let sessionContextState = {scope: null, stats: null, references: [], interviewPlan: null, profileDebug: null, trace: []};
     let currentTurnTrace = {directorNoteInjected: false};
     let currentProcess = createAgentProcessState();
     const activeInterviewSessionKey = "knowledge_agent.active_interview_session_id";
+    let sessionContextPanelOpen = false;
+
+    applyInitialChatMode();
+    currentConversationSignature = conversationSignature();
 
     $("sendBtn").addEventListener("click", sendMessage);
     $("query").addEventListener("keydown", (event) => {
@@ -5002,8 +7177,43 @@ CHAT_HTML = r"""<!doctype html>
     $("closeHistory").addEventListener("click", closeHistory);
     $("historyModal").addEventListener("click", (event) => { if (event.target === $("historyModal")) closeHistory(); });
     $("endInterview").addEventListener("click", endInterviewSession);
-    ["chatMode", "scopeType", "scopeValue", "strictEvidence"].forEach((id) => $(id).addEventListener("change", resetConversationIfNeeded));
+    $("chatMode").addEventListener("change", handleChatModeChange);
+    ["scopeType", "scopeValue", "strictEvidence"].forEach((id) => $(id).addEventListener("change", resetConversationIfNeeded));
     restoreActiveInterviewSession();
+    loadReviewNotice();
+
+    function applyInitialChatMode() {
+      const params = new URLSearchParams(window.location.search);
+      const mode = params.get("mode") || "answer";
+      if (mode === "study") {
+        window.location.replace("/review");
+        return;
+      }
+      $("chatMode").value = mode === "interview" ? "interview" : "answer";
+      updateChatNavActive();
+    }
+
+    function handleChatModeChange() {
+      const mode = $("chatMode").value;
+      const target = mode === "interview" ? "/?mode=interview" : "/?mode=answer";
+      window.history.replaceState(null, "", target);
+      updateChatNavActive();
+      resetConversationIfNeeded();
+    }
+
+    function updateChatNavActive() {
+      const mode = $("chatMode").value;
+      document.querySelectorAll(".app-nav-link").forEach((link) => {
+        const id = link.dataset.navId || "";
+        if (id === "chat-interview") {
+          link.classList.toggle("active", mode === "interview");
+        } else if (id === "chat-answer") {
+          link.classList.toggle("active", mode !== "interview");
+        } else if (["review", "topics", "wiki", "search", "wiki-admin", "search-debug", "settings", "organize"].includes(id)) {
+          link.classList.remove("active");
+        }
+      });
+    }
 
     function resetConversationIfNeeded() {
       const signature = conversationSignature();
@@ -5015,10 +7225,12 @@ CHAT_HTML = r"""<!doctype html>
       currentInterviewSessionId = "";
       localStorage.removeItem(activeInterviewSessionKey);
       lastContextItems = [];
+      sessionContextPanelOpen = false;
       resetSessionContext();
       currentConversationSignature = signature;
       updateSessionLabel();
       $("starters").innerHTML = "";
+      renderInterviewDirectionBar();
     }
 
     async function sendMessage() {
@@ -5029,6 +7241,7 @@ CHAT_HTML = r"""<!doctype html>
       $("query").value = "";
       currentAssistant = appendAssistantMessage("");
       currentAssistantText = "";
+      currentTurnCitations = [];
       currentPayload = {router: null, retrieval: null, retrievalStatus: null, interviewPlan: null, profileDebug: null, context: null, answer: null, done: null, errors: []};
       currentProcess = createAgentProcessState();
       renderAgentProcess();
@@ -5065,6 +7278,7 @@ CHAT_HTML = r"""<!doctype html>
               turnIds = await persistInterviewTurn(query, answerText);
             }
             recordInterviewStateTrace(stateChange);
+            renderInterviewDirectionBar();
             if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
           }
         }
@@ -5137,7 +7351,7 @@ CHAT_HTML = r"""<!doctype html>
         created_at: new Date().toISOString(),
         ...entry
       }].slice(-50);
-      renderSessionContext();
+      if (sessionContextPanelOpen) renderSessionContext();
     }
 
     async function streamAgentAnswerWithRetry(body) {
@@ -5183,6 +7397,7 @@ CHAT_HTML = r"""<!doctype html>
       if (!turnIds || !assistantNode) return;
       currentAssistant = assistantNode;
       currentAssistantText = "";
+      currentTurnCitations = [];
       currentPayload = {router: null, retrieval: null, retrievalStatus: null, interviewPlan: currentInterviewPlan, profileDebug: null, context: null, answer: null, done: null, errors: []};
       currentProcess = createAgentProcessState();
       assistantNode.querySelectorAll(".retry-answer, .assistant-extra, details.review").forEach((node) => node.remove());
@@ -5210,6 +7425,7 @@ CHAT_HTML = r"""<!doctype html>
         const stateChange = isServerInterviewState() ? null : updateInterviewState(query, answerText);
         await completeInterviewTurn(turnIds, answerText);
         recordInterviewStateTrace(stateChange);
+        renderInterviewDirectionBar();
         if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
         setBusy(false, "灏辩华");
       } catch (error) {
@@ -5281,9 +7497,7 @@ CHAT_HTML = r"""<!doctype html>
         if (data.plan) {
           currentInterviewPlan = data.plan;
           currentInterviewPlanSignature = conversationSignature();
-          if (shouldRenderInterviewPlanForCurrentTurn()) {
-            renderInterviewPlan(data.plan);
-          }
+          renderInterviewDirectionBar();
         }
       }
       if (eventName === "profile_debug") {
@@ -5335,6 +7549,7 @@ CHAT_HTML = r"""<!doctype html>
           details: data || {}
         });
         renderSessionContext();
+        renderInterviewDirectionBar();
       }
       if (eventName === "answer_delta") {
         collapseProcessForAnswer();
@@ -5356,6 +7571,8 @@ CHAT_HTML = r"""<!doctype html>
       }
       if (eventName === "done") {
         currentPayload.done = data;
+        const telemetryCitations = data?.telemetry?.citations;
+        if (Array.isArray(telemetryCitations)) currentTurnCitations = telemetryCitations;
         finishAgentProcess(data);
       }
       if (eventName === "error") {
@@ -5496,6 +7713,23 @@ CHAT_HTML = r"""<!doctype html>
 
     function finishAgentProcess(data) {
       if (!currentProcess.visible) return;
+      const stoppedReason = String(data?.stopped_reason || "");
+      if (stoppedReason && stoppedReason !== "final") {
+        const stoppedPayload = {
+          reason: stoppedReason,
+          message: String(data?.error || stopReasonLabel(stoppedReason) || "Agent stopped"),
+          trace_path: data?.trace_path || "",
+          recoverable: data?.recoverable !== false,
+          partial: Boolean(data?.partial)
+        };
+        if (!currentProcess.stopped) handleAgentStopped(stoppedPayload);
+        currentProcess.done = true;
+        currentProcess.phase = "done";
+        currentProcess.items = currentProcess.items.map((item) => item.status === "active" ? {...item, status: "done"} : item);
+        currentProcess.active = null;
+        renderAgentProcess();
+        return;
+      }
       currentProcess.done = true;
       currentProcess.collapsed = true;
       currentProcess.phase = "done";
@@ -5744,35 +7978,93 @@ CHAT_HTML = r"""<!doctype html>
       return "当前范围";
     }
 
-    function renderInterviewPlan(plan) {
-      const topics = Array.isArray(plan.topics) ? plan.topics : [];
-      if (!topics.length || !currentAssistant) return;
-      currentAssistant.querySelectorAll(".plan").forEach((node) => node.remove());
-      const html = `<div class="plan"><div class="plan-title">面试方向</div><div class="starter-grid">${topics.map((topic) => `<button type="button" data-topic="${escapeHtml(topic.name || "")}">${escapeHtml(topic.name || "Topic")}</button>`).join("")}</div></div>`;
-      currentAssistant.querySelector(".answer").insertAdjacentHTML("beforebegin", html);
-      currentAssistant.querySelectorAll("[data-topic]").forEach((button) => {
-        button.addEventListener("click", async () => {
-          await selectInterviewTopic(button.dataset.topic || "");
+    function bindInterviewDirectionTopicButtons(container) {
+      if (!container) return;
+      container.querySelectorAll("[data-topic]").forEach((button) => {
+        button.addEventListener("click", async (event) => {
+          event.stopPropagation();
+          try {
+            await selectInterviewTopic(button.dataset.topic || "");
+          } catch (error) {
+            setBusy(false, "Error");
+            alert(error.message || "切换主题失败");
+          }
         });
       });
     }
 
-    function shouldRenderInterviewPlanForCurrentTurn() {
-      if ($("chatMode").value !== "interview") return false;
-      if (!currentInterviewState) return true;
-      return currentInterviewState.topic_phase === "awaiting_selection" || !currentInterviewState.current_topic;
+    function syncComposerDirectionRail(visible) {
+      const composer = $("composer");
+      if (!composer) return;
+      composer.classList.toggle("no-direction-rail", !visible);
+    }
+
+    function renderInterviewTopicChips(topics, currentTopic) {
+      return topics.map((topic) => {
+        const name = String(topic.name || "").trim();
+        if (!name) return "";
+        const active = name === currentTopic;
+        return `<button type="button" class="dir-chip${active ? " active" : ""}" data-topic="${escapeHtml(name)}">${escapeHtml(name)}</button>`;
+      }).join("");
+    }
+
+    function interviewDirectionMeta(state) {
+      const snapshot = state || {};
+      const parts = [];
+      if (snapshot.current_layer_name) parts.push(String(snapshot.current_layer_name));
+      if (snapshot.topic_phase === "closing") parts.push("收尾");
+      return parts.join(" · ");
+    }
+
+    function renderInterviewDirectionBar() {
+      const bar = $("interviewDirectionBar");
+      if (!bar) return;
+      if ($("chatMode").value !== "interview") {
+        bar.hidden = true;
+        bar.classList.remove("visible");
+        bar.innerHTML = "";
+        syncComposerDirectionRail(false);
+        return;
+      }
+      const plan = currentInterviewPlan || (sessionContextState.interviewPlan && sessionContextState.interviewPlan.plan) || null;
+      const topics = Array.isArray(plan?.topics) ? plan.topics : [];
+      const state = currentInterviewState || {};
+      const currentTopic = String(state.current_topic || "").trim();
+      const meta = interviewDirectionMeta(state);
+
+      if (topics.length) {
+        bar.hidden = false;
+        bar.classList.add("visible");
+        syncComposerDirectionRail(true);
+        bar.innerHTML = `<span class="dir-label">面试方向</span>${meta ? `<span class="dir-meta">${escapeHtml(meta)}</span>` : ""}<div class="dir-actions">${renderInterviewTopicChips(topics, currentTopic)}</div>`;
+        bindInterviewDirectionTopicButtons(bar);
+        return;
+      }
+
+      bar.hidden = true;
+      bar.classList.remove("visible");
+      bar.innerHTML = "";
+      syncComposerDirectionRail(false);
+    }
+
+    function renderInterviewPlan(plan) {
+      if (plan) currentInterviewPlan = plan;
+      renderInterviewDirectionBar();
     }
 
     async function selectInterviewTopic(topic) {
       const selected = String(topic || "").trim();
       if (!selected) return;
+      const previousTopic = String(currentInterviewState?.current_topic || "").trim();
+      const awaitingSelection = !previousTopic || currentInterviewState?.topic_phase === "awaiting_selection";
+      if (!awaitingSelection && selected === previousTopic) return;
       const sessionId = await ensureInterviewSession();
       const response = await fetch(`/api/interview/sessions/${encodeURIComponent(sessionId)}/select-topic`, {
         method: "POST",
         headers: {"Content-Type":"application/json"},
         body: JSON.stringify({
           topic: selected,
-          reason: "user selected topic from interview plan UI",
+          reason: awaitingSelection ? "user selected topic from interview plan UI" : "user switched topic from interview direction bar",
           source: "ui",
           interview_plan: currentInterviewPlan
         })
@@ -5781,31 +8073,65 @@ CHAT_HTML = r"""<!doctype html>
       if (!response.ok) throw new Error(data.detail || "topic selection failed");
       currentInterviewState = data.interview_state || data.session?.interview_state || currentInterviewState;
       recordSessionTrace("topic_selected", `topic selected: ${selected}`, {interview_state: currentInterviewState});
-      $("query").value = `我想从${selected}开始`;
+      renderInterviewDirectionBar();
+      if (awaitingSelection) {
+        $("query").value = `我想从${selected}开始`;
+      } else if (selected !== previousTopic) {
+        $("query").value = `我想切换到${selected}继续面试`;
+      }
       $("query").focus();
     }
 
     function renderAssistantExtras() {
       if (!currentAssistant) return;
       currentAssistant.querySelectorAll(".assistant-extra").forEach((node) => node.remove());
-      currentAssistant.insertAdjacentHTML(
-        "beforeend",
-        `<div class="assistant-extra">${renderDebug(buildTurnDebug())}</div>`
-      );
+      const parts = [];
+      if ($("chatMode").value === "interview" && currentTurnCitations.length) {
+        parts.push(renderTurnCitations(currentTurnCitations));
+      }
+      parts.push(`<div class="assistant-extra">${renderDebug(buildTurnDebug())}</div>`);
+      currentAssistant.insertAdjacentHTML("beforeend", parts.join(""));
+    }
+
+    function renderTurnCitations(citations) {
+      const items = Array.isArray(citations) ? citations : [];
+      if (!items.length) return "";
+      const chips = items.map(renderTurnCitationChip).join("");
+      return `<details class="turn-citations assistant-extra" open><summary>来源 (${items.length})</summary><div class="turn-citation-list">${chips}</div></details>`;
+    }
+
+    function renderTurnCitationChip(citation) {
+      const path = String(citation?.path || "").trim();
+      const noteName = path ? path.split("/").pop() || path : "笔记";
+      const headingPath = Array.isArray(citation?.heading_path) ? citation.heading_path.filter(Boolean) : [];
+      const section = headingPath.length ? headingPath.join(" › ") : "";
+      const lineStart = citation?.line_start;
+      const lineEnd = citation?.line_end;
+      let lineLabel = "";
+      if (lineStart && lineEnd && lineStart !== lineEnd) lineLabel = `L${lineStart}-${lineEnd}`;
+      else if (lineStart) lineLabel = `L${lineStart}`;
+      const sectionHtml = section ? `<span class="note-section"> · ${escapeHtml(section)}</span>` : "";
+      const lineHtml = lineLabel ? `<span class="note-section"> · ${escapeHtml(lineLabel)}</span>` : "";
+      const title = escapeHtml([path, section, lineLabel].filter(Boolean).join(" · "));
+      return `<span class="turn-citation-chip" title="${title}"><span class="note-name">${escapeHtml(noteName)}</span>${sectionHtml}${lineHtml}</span>`;
     }
 
     function resetSessionContext() {
       sessionContextState = {scope: null, stats: null, references: [], interviewPlan: null, profileDebug: null, trace: []};
       renderSessionContext();
+      renderInterviewDirectionBar();
     }
 
     function renderSessionContext() {
       const node = $("sessionContext");
       if (!node) return;
+      const existingPanel = node.querySelector(".session-panel");
+      if (existingPanel) sessionContextPanelOpen = existingPanel.open;
       const hasContent = sessionContextState.scope || sessionContextState.interviewPlan || sessionContextState.profileDebug || (sessionContextState.references || []).length || (sessionContextState.trace || []).length;
       if (!hasContent) {
         node.className = "session-context";
         node.innerHTML = "";
+        sessionContextPanelOpen = false;
         return;
       }
       node.className = "session-context has-content";
@@ -5815,7 +8141,8 @@ CHAT_HTML = r"""<!doctype html>
       const plan = planPayload.plan || planPayload || {};
       const topics = Array.isArray(plan.topics) ? plan.topics : [];
       const profile = sessionContextState.profileDebug || {};
-      node.innerHTML = `<details class="session-panel" open><summary>Session Context</summary>
+      node.innerHTML = `<details class="session-panel"${sessionContextPanelOpen ? " open" : ""}><summary>Session Context（调试）</summary>
+        <div class="session-panel-body">
         <div class="context-grid">
           <section class="context-section">
             <h3>Scope</h3>
@@ -5842,7 +8169,27 @@ CHAT_HTML = r"""<!doctype html>
             ${renderSessionTrace(sessionContextState.trace || [])}
           </section>
         </div>
+        </div>
       </details>`;
+      const panel = node.querySelector(".session-panel");
+      const panelBody = node.querySelector(".session-panel-body");
+      if (panelBody) {
+        panelBody.addEventListener("wheel", (event) => {
+          if (panelBody.scrollHeight <= panelBody.clientHeight + 1) return;
+          const delta = event.deltaY;
+          const atTop = panelBody.scrollTop <= 0;
+          const atBottom = panelBody.scrollTop + panelBody.clientHeight >= panelBody.scrollHeight - 1;
+          if ((delta < 0 && !atTop) || (delta > 0 && !atBottom)) {
+            event.stopPropagation();
+          }
+        }, {passive: true});
+      }
+      if (panel) {
+        panel.addEventListener("toggle", () => {
+          sessionContextPanelOpen = panel.open;
+          if (panel.open) renderSessionContext();
+        });
+      }
     }
 
     function renderSessionTrace(trace) {
@@ -6062,6 +8409,44 @@ CHAT_HTML = r"""<!doctype html>
       scrollToBottom();
     }
 
+    async function loadReviewNotice() {
+      const node = $("reviewNotice");
+      if (!node) return;
+      const dismissedKey = "knowledge_agent.review_notice_dismissed";
+      if (sessionStorage.getItem(dismissedKey) === "1") return;
+      try {
+        const response = await fetch("/api/review/due?limit=20");
+        if (!response.ok) return;
+        const data = await response.json();
+        const dueCount = Number(data.due_count || 0);
+        if (!dueCount) return;
+        const topics = Array.isArray(data.topics) ? data.topics : [];
+        const topicText = topics.slice(0, 3).map((item) => {
+          const topic = item.topic || "未分组";
+          const count = Number(item.count || 0);
+          return `${escapeHtml(topic)} ${count} 个弱项到期`;
+        }).join(" · ");
+        node.innerHTML = `
+          <div><strong>复习提醒</strong> ${topicText || `${dueCount} 个弱项到期`}</div>
+          <div class="review-notice-actions">
+            <button type="button" data-review-action="cards">逐条对照</button>
+            <button type="button" class="secondary" data-review-action="chat" disabled title="对话复查将在下一阶段接入">对话复查</button>
+            <button type="button" class="secondary" data-review-action="later">稍后提醒</button>
+          </div>
+        `;
+        node.hidden = false;
+        node.querySelector("[data-review-action='cards']").addEventListener("click", () => {
+          window.location.href = "/review";
+        });
+        node.querySelector("[data-review-action='later']").addEventListener("click", () => {
+          sessionStorage.setItem(dismissedKey, "1");
+          node.hidden = true;
+        });
+      } catch {
+        node.hidden = true;
+      }
+    }
+
     async function restoreActiveInterviewSession() {
       const sessionId = localStorage.getItem(activeInterviewSessionKey);
       if (!sessionId) return;
@@ -6086,6 +8471,8 @@ CHAT_HTML = r"""<!doctype html>
     function restoreSessionIntoChat(session, reviews) {
       const context = session.context || {};
       $("chatMode").value = "interview";
+      window.history.replaceState(null, "", "/?mode=interview");
+      updateChatNavActive();
       if (context.source_type) $("scopeType").value = context.source_type;
       if (context.source_type === "selected_notes") {
         $("scopeValue").value = (context.source_paths || []).join("\n");
@@ -6101,6 +8488,7 @@ CHAT_HTML = r"""<!doctype html>
       localStorage.setItem(activeInterviewSessionKey, currentInterviewSessionId);
       sessionContextState = sessionContextFromSession(session);
       renderSessionContext();
+      renderInterviewDirectionBar();
 
       const reviewByAssistant = new Map((reviews || []).map((review) => [review.assistant_message_id, review]));
       const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
@@ -6136,7 +8524,10 @@ CHAT_HTML = r"""<!doctype html>
         reference_answer: review.reference_answer || "",
         profile_signals: review.profile_signals || []
       } : null;
-      return `<article class="message ${cls}"><div class="role">${escapeHtml(message.role || "")}</div><div class="answer">${renderMarkdown(message.content || "")}${errorHtml}${pendingHtml}</div>${retryHtml}${reviewSummary ? renderSessionSummary(reviewSummary) : ""}</article>`;
+      const citationsHtml = message.role === "assistant" && Array.isArray(message.citations) && message.citations.length
+        ? renderTurnCitations(message.citations)
+        : "";
+      return `<article class="message ${cls}"><div class="role">${escapeHtml(message.role || "")}</div><div class="answer">${renderMarkdown(message.content || "")}${errorHtml}${pendingHtml}</div>${citationsHtml}${retryHtml}${reviewSummary ? renderSessionSummary(reviewSummary) : ""}</article>`;
     }
 
     function attachRestoredRetryButtons() {
@@ -6189,7 +8580,8 @@ CHAT_HTML = r"""<!doctype html>
         interview_plan: currentInterviewPlan,
         interview_state: currentInterviewState,
         source_note_paths: sourceNotePaths(),
-        agent_actions: agentActions
+        agent_actions: agentActions,
+        citations: currentTurnCitations
       })});
       if (!response.ok) return null;
       const data = await response.json();
@@ -6233,7 +8625,8 @@ CHAT_HTML = r"""<!doctype html>
         interview_plan: currentInterviewPlan,
         interview_state: currentInterviewState,
         source_note_paths: sourceNotePaths(),
-        agent_actions: agentActions
+        agent_actions: agentActions,
+        citations: currentTurnCitations
       })});
       if (!response.ok) return null;
       const data = await response.json();
@@ -6406,7 +8799,8 @@ CHAT_HTML = r"""<!doctype html>
       const scope = sessionContextState.scope || {};
       const plan = (sessionContextState.interviewPlan && sessionContextState.interviewPlan.plan) || {};
       const topics = Array.isArray(plan.topics) ? plan.topics : [];
-      const html = `<details class="session-panel" open><summary>Session Context</summary>
+      const html = `<details class="session-panel"><summary>Session Context（调试）</summary>
+        <div class="session-panel-body">
         <div class="context-grid">
           <section class="context-section">
             <h3>Scope</h3>
@@ -6426,6 +8820,7 @@ CHAT_HTML = r"""<!doctype html>
             <h3>Session Trace</h3>
             ${renderSessionTrace(sessionContextState.trace || [])}
           </section>
+        </div>
         </div>
       </details>`;
       sessionContextState = previous;
@@ -6658,13 +9053,17 @@ CHAT_HTML = r"""<!doctype html>
 
     function setBusy(isBusy, text) {
       $("sendBtn").disabled = isBusy;
-      $("status").textContent = text || (isBusy ? "处理中..." : "就绪");
+      const status = $("status");
+      if (status) status.textContent = text || (isBusy ? "处理中..." : "就绪");
     }
 
     function numberValue(id) { return Number($(id).value); }
     function scopePaths() { return $("scopeType").value === "selected_notes" ? $("scopeValue").value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) : []; }
     function conversationSignature() { return JSON.stringify({mode:$("chatMode").value, scopeType:$("scopeType").value, scopeValue:$("scopeValue").value.trim(), scopePaths:scopePaths(), strictEvidence:$("strictEvidence").checked}); }
-    function scrollToBottom() { messages.scrollTop = messages.scrollHeight; }
+    function scrollToBottom() {
+      const scrollNode = document.querySelector(".chat-scroll") || messages;
+      scrollNode.scrollTop = scrollNode.scrollHeight;
+    }
     function escapeHtml(value) { return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;"); }
   </script>
 </body>

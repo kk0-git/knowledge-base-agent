@@ -252,7 +252,7 @@ Obsidian Shell Commands 插件配置见：`docs/OBSIDIAN_WORKFLOW.md`。
 前端入口：
 
 ```text
-http://127.0.0.1:8001/audit
+http://127.0.0.1:8001/organize
 ```
 
 ```powershell
@@ -315,23 +315,27 @@ eval-results/organize-tag-学习-全栈.md
 - `workflow_debug.py audit`：只跑确定性审计。
 - `workflow_debug.py review-notes`：只跑 LLM 整理建议。
 
-### 8.4 复习 chat mode
+### 8.4 复习与面试入口
 
-复习不单独生成题库，而是在 `/chat` 中选择模式，再选择 `Tag / 文件夹 / 指定笔记 / 搜索结果` 作为 source notes。
+复习已经从 Chat 模式中拆出，使用独立 `/review` 页面。Chat 只保留问答和模拟面试。
 
-- `模拟面试`：LLM 扮演考官。笔记是私有参考答案，不在正文里讲解；重点是抓住用户回答里的模糊点继续追问。
-- `复习助教`：LLM 扮演助教。笔记是教案；可以指出遗漏、解释概念、引用来源，并用一个小问题确认理解。
+- `/review`：主题复习入口，按主题和题数进入逐题回忆、作答、纠偏、pass/fail。
+- `/?mode=interview`：模拟面试入口。LLM 扮演考官，笔记是私有参考答案，重点是抓住用户回答里的模糊点继续追问。
+- `/wiki`：只读 Wiki 阅读器。
+- `/admin/wiki`：Wiki 同步、合成、策略维护后台。
+- `/organize`：笔记整理与审计入口。
 
 本地测试入口：
 
 ```text
-http://127.0.0.1:8003/chat
+http://127.0.0.1:8003/review
+http://127.0.0.1:8003/?mode=interview
 ```
 
 示例选择：
 
 ```text
-模式：模拟面试
+页面：/?mode=interview
 范围：文件夹
 范围值：个人/面试/agent面试
 输入：开始面试复习，先问我一个问题
@@ -362,7 +366,7 @@ with urllib.request.urlopen(req, timeout=120) as resp:
 '@ | uv run python -
 ```
 
-把 `"chat_mode": "interview"` 改成 `"study"` 可测试复习助教模式。
+复习页面不走 `chat_mode=study`；旧 `mode=study` 页面入口会重定向到 `/review`。
 
 
 

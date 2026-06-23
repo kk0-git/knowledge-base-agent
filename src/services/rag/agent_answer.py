@@ -19,6 +19,7 @@ from services.rag.intent_router import (
 from services.rag.manager import RAGManager
 from services.rag.online_search import OnlineSearchClient, OnlineSearchResponse, online_response_to_dict
 from services.rag.schema import SearchResult
+from agent.tools.vault.guards import filter_items_by_scope
 
 
 ANSWER_SYSTEM_PROMPT = """你是一个个人知识库助手。
@@ -169,7 +170,13 @@ class AgentAnswerPipeline:
             telemetry=telemetry,
         )
 
-    def retrieve(self, query: str) -> AgentRetrievalResult:
+    def retrieve(
+        self,
+        query: str,
+        *,
+        scope_note_paths: tuple[str, ...] = (),
+        scope_type: str = "all_vault",
+    ) -> AgentRetrievalResult:
         started_at = time.perf_counter()
 
         executor = ThreadPoolExecutor(max_workers=4)
@@ -241,6 +248,25 @@ class AgentAnswerPipeline:
             notes_results = timed_future_result_or_empty("notes_search", notes_future, tool_errors, tool_telemetry) if notes_future is not None else []
 
         executor.shutdown(wait=False, cancel_futures=True)
+
+        notes_results = filter_items_by_scope(
+            notes_results,
+            scope_note_paths,
+            lambda result: result.chunk.note_path,
+            scope_type=scope_type,
+        )
+        rg_results = filter_items_by_scope(
+            rg_results,
+            scope_note_paths,
+            lambda match: match.path,
+            scope_type=scope_type,
+        )
+        bm25_results = filter_items_by_scope(
+            bm25_results,
+            scope_note_paths,
+            lambda result: result.chunk.note_path,
+            scope_type=scope_type,
+        )
 
         retrieval_ms = elapsed_ms(retrieval_started_at)
         update_tool_result_count(tool_telemetry["notes_search"], notes_results)

@@ -22,13 +22,14 @@ from agent.llm.tool_calling import (
     parse_json_object,
     parse_fallback_tool_calls,
 )
-from agent.runtime import AgentRuntime
-from agent.schema import AgentRunConfig, ToolCall, ToolSpec, WorkingMemory
+from agent.runtime import AgentRuntime, execute_with_run_cache, is_cacheable_tool
+from agent.schema import AgentRunConfig, ToolCall, ToolResult, ToolExecutionStatus, ToolSpec, WorkingMemory
 from agent.serialization import to_jsonable
 from agent.skill_loader import SkillLoader
 from agent.tool_executor import ToolExecutionContext, ToolExecutor
 from agent.tool_registry import ToolRegistry
-from agent.tools import register_debug_tools
+from agent.tools.debug import register_debug_tools
+from agent.tools.interview.get_interview_state import get_interview_state_spec
 from agent.trace import TraceRecorder
 from knowledge_base_agent.llm.schema import LLMResponse
 
@@ -212,6 +213,86 @@ class AgentRuntimeTests(unittest.TestCase):
         denied = executor.execute(ToolCall(id="4", name="write_debug", arguments={}))
         self.assertFalse(denied.ok)
         self.assertEqual(denied.status, "permission_denied")
+
+    def test_tool_executor_merges_execution_stats_and_isolates_calls(self) -> None:
+        registry = ToolRegistry()
+
+        def counted(args, ctx):
+            ctx.put_stats({"foo": 1, "hit_count": 9})
+            return {"result_count": 1}
+
+        def plain(args, ctx):
+            return {"result_count": 2}
+
+        registry.register(
+            ToolSpec(
+                name="counted",
+                description="counted",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=counted,
+            )
+        )
+        registry.register(
+            ToolSpec(
+                name="plain",
+                description="plain",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=plain,
+            )
+        )
+        ctx = ToolExecutionContext(working=WorkingMemory())
+        executor = ToolExecutor(registry, ctx)
+
+        counted_result = executor.execute(ToolCall(id="call_1", name="counted", arguments={}))
+        self.assertTrue(counted_result.ok)
+        self.assertEqual(counted_result.stats["foo"], 1)
+        self.assertEqual(counted_result.stats["hit_count"], 9)
+        self.assertIsNone(ctx.current_call_id)
+
+        plain_result = executor.execute(ToolCall(id="call_2", name="plain", arguments={}))
+        self.assertTrue(plain_result.ok)
+        self.assertEqual(plain_result.stats["hit_count"], 2)
+        self.assertNotIn("foo", plain_result.stats)
+        self.assertEqual(ctx.stats_holder, {})
+
+    def test_tool_executor_cleans_stats_context_after_handler_error(self) -> None:
+        registry = ToolRegistry()
+
+        def explode(args, ctx):
+            ctx.put_stats({"foo": 1})
+            raise RuntimeError("boom")
+
+        def ok(args, ctx):
+            return {"result_count": 1}
+
+        registry.register(
+            ToolSpec(
+                name="explode",
+                description="explode",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=explode,
+            )
+        )
+        registry.register(
+            ToolSpec(
+                name="ok",
+                description="ok",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=ok,
+            )
+        )
+        ctx = ToolExecutionContext(working=WorkingMemory())
+        executor = ToolExecutor(registry, ctx)
+
+        failed = executor.execute(ToolCall(id="bad", name="explode", arguments={}))
+        self.assertFalse(failed.ok)
+        self.assertEqual(failed.stats, {})
+        self.assertIsNone(ctx.current_call_id)
+        self.assertEqual(ctx.stats_holder, {})
+
+        succeeded = executor.execute(ToolCall(id="good", name="ok", arguments={}))
+        self.assertTrue(succeeded.ok)
+        self.assertEqual(succeeded.stats["hit_count"], 1)
 
     def test_tool_executor_timeout(self) -> None:
         registry = ToolRegistry()
@@ -429,6 +510,86 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(result.steps[0].tool_results[0].output["count"], 1)
             self.assertEqual(result.steps[0].tool_results[1].output["count"], 2)
             self.assertNotIn("cached", result.steps[0].tool_results[1].stats)
+
+    def test_state_snapshot_tools_are_not_cached(self) -> None:
+        self.assertFalse(is_cacheable_tool(get_interview_state_spec()))
+        registry = ToolRegistry()
+        register_debug_tools(registry)
+        self.assertFalse(is_cacheable_tool(registry.get("inspect_state")))
+        calls = {"count": 0}
+
+        def snapshot(args, ctx):
+            calls["count"] += 1
+            return {"count": calls["count"]}
+
+        registry.register(
+            ToolSpec(
+                name="get_interview_state",
+                description="snapshot",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=snapshot,
+                side_effect="none",
+            ),
+            replace=True,
+        )
+        executor = ToolExecutor(registry, ToolExecutionContext(working=WorkingMemory()))
+        cache: dict[tuple[str, str], object] = {}
+        first = execute_with_run_cache(
+            call=ToolCall(id="call-1", name="get_interview_state", arguments={}),
+            registry=registry,
+            executor=executor,
+            cache=cache,
+        )
+        second = execute_with_run_cache(
+            call=ToolCall(id="call-2", name="get_interview_state", arguments={}),
+            registry=registry,
+            executor=executor,
+            cache=cache,
+        )
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(first.output["count"], 1)
+        self.assertEqual(second.output["count"], 2)
+        self.assertNotIn("cached", second.stats)
+
+    def test_state_write_invalidates_state_snapshot_cache(self) -> None:
+        registry = ToolRegistry()
+
+        def advance(args, ctx):
+            return {"advanced": True}
+
+        registry.register(
+            ToolSpec(
+                name="advance_layer",
+                description="advance",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=advance,
+                side_effect="none",
+            )
+        )
+        executor = ToolExecutor(
+            registry,
+            ToolExecutionContext(working=WorkingMemory(), confirmed_tools={"advance_layer"}),
+        )
+        cache = {}
+        cache[("get_interview_state", "{}")] = ToolResult(
+            call_id="seed",
+            name="get_interview_state",
+            ok=True,
+            output={"count": 1},
+            status=ToolExecutionStatus.SUCCESS.value,
+            latency_ms=1,
+            result_size=1,
+            summary="",
+            stats={},
+        )
+        self.assertIn(("get_interview_state", "{}"), cache)
+        execute_with_run_cache(
+            call=ToolCall(id="write", name="advance_layer", arguments={}),
+            registry=registry,
+            executor=executor,
+            cache=cache,
+        )
+        self.assertNotIn(("get_interview_state", "{}"), cache)
 
     def test_runtime_executes_real_json_fallback_adapter_path(self) -> None:
         registry = ToolRegistry()

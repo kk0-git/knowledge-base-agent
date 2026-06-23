@@ -491,6 +491,8 @@ class InterviewerRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(result.stopped_reason, "final")
             self.assertEqual(result.state.working.notes_read_this_turn, ["mcp.md"])
+            citations = result.state.working.extra.get("citations") or []
+            self.assertTrue(any(item.get("path") == "mcp.md" for item in citations))
 
     def test_interviewer_can_recall_profile(self) -> None:
         registry = ToolRegistry()

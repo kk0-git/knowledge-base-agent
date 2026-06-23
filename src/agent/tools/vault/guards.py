@@ -40,6 +40,9 @@ def resolve_vault_note_path(vault_root: Path | None, path: str) -> tuple[str, Pa
     return relative, full_path
 
 
+RESTRICTED_SCOPE_TYPES = frozenset({"folder", "tag", "search", "selected_notes"})
+
+
 def normalize_scope_paths(scope_note_paths: Iterable[str]) -> set[str]:
     paths: set[str] = set()
     for raw in scope_note_paths:
@@ -50,23 +53,45 @@ def normalize_scope_paths(scope_note_paths: Iterable[str]) -> set[str]:
     return paths
 
 
-def is_scope_allowed(path: str, scope_note_paths: Iterable[str]) -> bool:
+def is_restricted_scope_type(scope_type: str | None) -> bool:
+    return str(scope_type or "").strip() in RESTRICTED_SCOPE_TYPES
+
+
+def is_scope_allowed(
+    path: str,
+    scope_note_paths: Iterable[str],
+    *,
+    scope_type: str = "all_vault",
+) -> bool:
     scope = normalize_scope_paths(scope_note_paths)
     if not scope:
-        return True
+        return not is_restricted_scope_type(scope_type)
     return normalize_relative_path(path) in scope
 
 
-def require_scope_allowed(path: str, scope_note_paths: Iterable[str]) -> str:
+def require_scope_allowed(
+    path: str,
+    scope_note_paths: Iterable[str],
+    *,
+    scope_type: str = "all_vault",
+) -> str:
     relative = normalize_relative_path(path)
-    if not is_scope_allowed(relative, scope_note_paths):
+    if not is_scope_allowed(relative, scope_note_paths, scope_type=scope_type):
         raise PermissionError(f"path is outside current scope: {relative}")
     return relative
 
 
-def filter_items_by_scope(items: Iterable[Any], scope_note_paths: Iterable[str], path_getter) -> list[Any]:
+def filter_items_by_scope(
+    items: Iterable[Any],
+    scope_note_paths: Iterable[str],
+    path_getter,
+    *,
+    scope_type: str = "all_vault",
+) -> list[Any]:
     scope = normalize_scope_paths(scope_note_paths)
     if not scope:
+        if is_restricted_scope_type(scope_type):
+            return []
         return list(items)
     filtered: list[Any] = []
     for item in items:

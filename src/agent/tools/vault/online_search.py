@@ -32,8 +32,12 @@ def online_search(arguments: dict[str, Any], ctx: ToolExecutionContext) -> dict[
     query = str(arguments.get("query") or "").strip()
     if not query:
         raise ValueError("query is required")
-    top_k = max(1, min(int(arguments.get("top_k") or 5), 10))
+    options = ctx.metadata.get("retrieval_options") if isinstance(ctx.metadata, dict) else {}
+    if not isinstance(options, dict):
+        options = {}
+    top_k = max(1, min(int(arguments.get("top_k") or options.get("online_top_k") or 5), 10))
     response = client.search(query=query, top_k=top_k)
+    ctx.put_stats({"requested_top_k": top_k, "provider": response.provider})
     return {
         "query": query,
         "enabled": bool(response.enabled),
