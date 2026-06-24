@@ -2,6 +2,39 @@
 
 ## Current Iteration
 
+### 2026-06-24 Phase C: Server Sessions + Chat WorkspaceStore
+
+Implemented disk-backed review runs and answer sessions; chat pointers moved to split WorkspaceStore.
+
+- **ReviewRunStore** (`review-runs/{id}.json`): card + dialogue runs persist cards/status and `workspace` (mode, selection, card/dialogue state). `ReviewRunService` replaces in-memory `review_runs` dict; saves after each card generation update.
+- **API**: `PATCH /api/review/runs/{id}/workspace`, `POST /api/review/dialogue/sessions`; existing `GET/POST /api/review/plan` unchanged externally.
+- **Review frontend**: dialogue creates server run; `syncReviewWorkspace()` debounced PATCH (~400ms); hydrate/resync merges server `workspace` from `GET plan`.
+- **AnswerSessionStore** (`answer-sessions/YYYY-MM/{id}.json`): messages with citations/agent_actions; CRUD under `/api/answer/sessions`.
+- **AgentTurnService**: answer runs write pending/complete/fail when `answer_session_repo` injected + `session_id` provided.
+- **Chat frontend**: `ensureAnswerSession`, server restore/history, pending task reconnect; no full `chatHistory` in localStorage.
+- **WorkspaceStore split**: review → `sessionStorage` `knowledge_agent.workspace.review.v1`; chat → `localStorage` `knowledge_agent.workspace.chat.v1`; `migrateLegacyChat()` one-shot import.
+
+Validation:
+
+- `python -m pytest tests/test_review_run_repository.py tests/test_answer_session_repository.py tests/test_agent_turn_service.py tests/test_review_practice.py -q`
+- Manual smoke: see `commands.md` §8.8
+
+### 2026-06-24 Phase B: Review WorkspaceStore
+
+Implemented frontend workspace persistence for `/review`:
+
+- **WorkspaceStore**: global `KnowledgeAgentWorkspace` (`hydrate/get/patch/replace/clear/persist`) injected via `WORKSPACE_STORE_SCRIPT` in shared shell.
+- **Storage**: `sessionStorage` key `knowledge_agent.workspace.v1`; review slice holds `mode`, `selectionState`, `cardReviewState`, `dialogueReviewState`.
+- **Review page**: `initReviewPage()` hydrates snapshot on load; `syncReviewWorkspace()` on mutations + `beforeunload`.
+- **Card resync**: `resyncCardReviewRun()` merges `GET /api/review/plan/{id}`; 404 marks `runStale` and keeps local cards/results.
+- **Fix**: `WORKSPACE_STORE_SCRIPT` moved to `<head>` so it loads before page inline scripts (review hydrate was no-op).
+- **Card UX**: completed cards stay in list with answer/feedback visible;「重新回答」resets a completed card.
+
+Validation:
+
+- `python -m pytest tests/test_review_practice.py -q --tb=short`
+- Manual smoke: see `commands.md` §8.7
+
 ### 2026-06-24 Phase A: Agent 生成与连接解耦
 
 Implemented decoupled agent runs for interview v2 and librarian v2:
@@ -9,7 +42,9 @@ Implemented decoupled agent runs for interview v2 and librarian v2:
 - **Ports**: `SessionRepository`, `AgentRunRepository` with `FileSessionRepository` + `InMemoryAgentRunRepository` adapters.
 - **Services**: `AgentTurnRunner` + `AgentTurnService` orchestrate pending turn → background task → auto complete/fail (interview).
 - **API**: `POST /api/agent/runs`, `GET /api/tasks/{task_id}/stream` (replay + live SSE).
-- **Frontend**: chat interview/answer use runs + task stream; answer mode stores `active_answer_task_id` in `sessionStorage` for refresh recovery.
+- **Frontend**: chat interview/answer use runs + task stream; answer mode stores `active_answer_task_id` in `sessionStorage` for in-flight refresh recovery; answer workspace + history in `localStorage` (`answer_workspace`, `answer_history`).
+- **Fix (manual test)**: active interview restore no longer hijacks `/?mode=answer` navigation during an ongoing interview.
+- **Fix (manual test)**: answer mode persists in-flight turns (`pendingTurn` + task reconnect/finalize) when navigating away mid-query.
 - **Compat**: `POST /api/agent/stream` retained for non-v2 paths.
 
 Validation:

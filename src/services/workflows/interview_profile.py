@@ -205,6 +205,7 @@ def normalize_weak_point(item: dict[str, Any]) -> dict[str, Any]:
     sr.setdefault("repetitions", 0)
     sr.setdefault("next_review", date.today().isoformat())
     sr.setdefault("last_outcome", "")
+    sr.setdefault("last_reviewed", "")
     weak["sr"] = sr
     return weak
 

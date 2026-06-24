@@ -31,6 +31,10 @@ def get_due_reviews(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         "cards": payload.get("cards", []),
         "topics": payload.get("topics", []),
         "due_count": payload.get("due_count", 0),
+        "candidate_count": payload.get("candidate_count", 0),
+        "recommended_count": payload.get("recommended_count", 0),
+        "never_reviewed_count": payload.get("never_reviewed_count", 0),
+        "recent_count": payload.get("recent_count", 0),
     }
 
 

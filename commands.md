@@ -381,6 +381,45 @@ curl -s -X POST http://127.0.0.1:8003/api/agent/runs -H "Content-Type: applicati
 curl -N http://127.0.0.1:8003/api/tasks/TASK_ID/stream
 ```
 
+### 8.7 Phase B Review WorkspaceStore 手测
+
+```powershell
+python -m pytest tests/test_review_practice.py tests/test_web_workspace.py -q --tb=short
+```
+
+浏览器手测（同 tab）：
+
+1. `/review` 逐条对照做到第 2 题 → 侧边栏去面试 → 回 `/review` → tab、题号、已答 results 恢复
+2. 对话复查 2 轮 → 去问答 → 回 `/review` → 对话 history 恢复
+3. 复习进行中 F5 → 状态恢复
+4. 关闭 tab 再开 `/review` → 工作区清空
+5. 卡片 pending 生成中切页回来 → poll 重启、卡片与 API 对齐
+6. 服务端重启后旧 `reviewRunId` → 本地进度可见 + 「run 已失效」提示
+7. 逐条对照完成 2 题 → 回「复习总览」→ 总览区与 tab 显示「已完成 2 / 共 N」
+
+sessionStorage key: `knowledge_agent.workspace.review.v1`（Phase C 起 review slice 独立 key；旧 `knowledge_agent.workspace.v1` 会在 hydrate 时一次性迁移；无 `version` 的 snapshot 会在 hydrate 时升到 v1）
+
+### 8.8 Phase C Server Sessions + Chat WorkspaceStore 手测
+
+```powershell
+python -m pytest tests/test_review_run_repository.py tests/test_answer_session_repository.py tests/test_agent_turn_service.py tests/test_review_practice.py tests/test_web_workspace.py -q --tb=short
+```
+
+浏览器手测：
+
+1. 卡片复习中重启 uvicorn → 回 `/review` → `GET plan` 成功，无 runStale
+2. 对话复查 2 轮 → 重启服务 → 回 `/review` → history 从 run workspace 恢复
+3. 问答 2 轮 → 清 site data 仅保留 localStorage chat slice → `GET answer session` 恢复消息+citations
+4. 问答历史按钮 → 列表来自 `/api/answer/sessions`
+5. 面试 + 问答指针 → 仅存于 `localStorage` `knowledge_agent.workspace.chat.v1`，无散落旧 key
+
+Storage keys:
+
+- Review workspace: `sessionStorage` `knowledge_agent.workspace.review.v1`
+- Chat workspace: `localStorage` `knowledge_agent.workspace.chat.v1`
+- Review runs: `review-runs/*.json`
+- Answer sessions: `answer-sessions/YYYY-MM/*.json`
+
 ### 8.5 复习页三态重构检查
 
 ```powershell

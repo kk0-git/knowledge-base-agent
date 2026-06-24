@@ -12,7 +12,6 @@ from services.workflows.interview_profile import (
     mark_weak_point_improved,
     normalize_category,
     profile_weak_point_for_agent,
-    split_due_reviews,
     update_weak_point,
 )
 
@@ -21,7 +20,7 @@ QUESTION_TYPES = ("recall", "boundary", "compare", "scenario", "followup")
 AUTO_QUESTION_TYPE = "auto"
 STRATEGY_CATEGORIES = {"answer_structure", "communication", "thinking_pattern"}
 DEFAULT_MAX_STRATEGY_CONSTRAINTS = 2
-REVIEW_PROMPT_VERSION = "review-prompt-v2"
+REVIEW_PROMPT_VERSION = "review-prompt-v3"
 REVIEW_GROUPING_STRATEGY_VERSION = "topic-layer-category-v1"
 
 QUESTION_TYPE_LABELS = {
@@ -80,46 +79,28 @@ def build_review_plan(
     selected_question_types = normalize_question_types(question_types)
     available_topics = collect_review_topics(profile, today=today_value)
 
-    due, other_due = split_due_reviews(profile, None)
-    due_weak = filter_by_topics([*due, *other_due], selected_topics)
+    due_weak = review_candidates(profile, topics=selected_topics, today=today_value)
     due_cards = assign_review_plan(
-        [review_card_payload(weak, due=True) for weak in due_weak],
+        [review_card_payload(weak, due=weak.get("review_state") != "recent") for weak in due_weak],
         selected_topics=selected_topics,
         question_types=selected_question_types,
         limit=limit,
         allow_cross_topic=allow_cross_topic,
     )
 
-    early_candidates = [
-        weak
-        for weak in profile.get("weak_points", [])
-        if isinstance(weak, dict)
-        and not weak.get("improved")
-        and topic_matches(weak, selected_topics)
-        and str((weak.get("sr") or {}).get("next_review") or "9999-12-31") > today_value
-    ]
-    early_cards = assign_review_plan(
-        [review_card_payload(weak, due=False, early=True) for weak in sorted(early_candidates, key=early_sort_key)],
-        selected_topics=selected_topics,
-        question_types=selected_question_types,
-        limit=early_limit,
-        allow_cross_topic=allow_cross_topic,
-    )
+    early_cards: list[dict[str, Any]] = []
 
     topic_counts: dict[str, int] = {}
     type_counts: dict[str, int] = {}
-    overdue_count = 0
     for card in due_cards:
         topic = str(card.get("topic") or UNCATEGORIZED)
         topic_counts[topic] = topic_counts.get(topic, 0) + 1
         qtype = str(card.get("question_type") or AUTO_QUESTION_TYPE)
         type_counts[qtype] = type_counts.get(qtype, 0) + 1
-        next_review = str((card.get("sr") or {}).get("next_review") or "")
-        if next_review and next_review < today_value:
-            overdue_count += 1
 
     return {
         "today": today_value,
+        "prompt_version": REVIEW_PROMPT_VERSION,
         "selected_topics": selected_topics,
         "selected_question_types": selected_question_types,
         "allow_cross_topic": allow_cross_topic,
@@ -129,8 +110,12 @@ def build_review_plan(
         "early_candidates": early_cards,
         "stats": {
             "due_count": len(due_cards),
-            "overdue_count": overdue_count,
-            "early_count": len(early_cards),
+            "candidate_count": len(due_weak),
+            "recommended_count": len([weak for weak in due_weak if weak.get("review_state") == "recommended"]),
+            "never_reviewed_count": len([weak for weak in due_weak if weak.get("review_state") == "never_reviewed"]),
+            "recent_count": len([weak for weak in due_weak if weak.get("review_state") == "recent"]),
+            "overdue_count": 0,
+            "early_count": 0,
             "topic_counts": topic_counts,
             "question_type_counts": type_counts,
         },
@@ -164,37 +149,36 @@ def build_due_review_overview(
     max_strategy_constraints: int = DEFAULT_MAX_STRATEGY_CONSTRAINTS,
 ) -> dict[str, Any]:
     today_value = today or date.today().isoformat()
-    due, other_due = split_due_reviews(profile, None)
-    due_weak_points = [*due, *other_due]
-    strategies = select_strategy_constraints(profile, max_items=max_strategy_constraints, today=today_value)
+    candidates = review_candidates(profile, today=today_value)
+    strategies = select_strategy_constraints(profile, max_items=None, today=today_value)
     cards = [
-        attach_strategy_constraints(review_card_payload(weak, due=True), strategies)
-        for weak in due_weak_points
+        attach_strategy_constraints(
+            review_card_payload(weak, due=weak.get("review_state") != "recent"),
+            strategies,
+            max_items=max_strategy_constraints,
+        )
+        for weak in candidates
         if is_knowledge_weak_point(weak)
     ][: max(0, limit)]
-    strategy_due_count = len([weak for weak in due_weak_points if is_strategy_weak_point(weak)])
-    by_topic: dict[str, int] = {}
-    overdue_count = 0
+    strategy_due_count = len([weak for weak in candidates if is_strategy_weak_point(weak)])
+    topic_stats = review_topic_stats(candidates)
     for card in cards:
-        topic = str(card.get("topic") or UNCATEGORIZED)
-        by_topic[topic] = by_topic.get(topic, 0) + 1
-        next_review = str((card.get("sr") or {}).get("next_review") or "")
-        if next_review and next_review < today_value:
-            overdue_count += 1
-    topics = [
-        {"topic": topic, "due": count}
-        for topic, count in sorted(by_topic.items(), key=lambda item: (-item[1], item[0]))
-    ]
-    summary = " · ".join(f"{item['topic']} {item['due']} 个弱项到期" for item in topics[:3])
+        card["review_state"] = card.get("review_state") or "recommended"
+    summary = " · ".join(f"{item['topic']} {item['candidate_count']} 个可复习" for item in topic_stats[:3])
     if not cards and strategy_due_count:
-        summary = f"当前只有 {strategy_due_count} 个回答策略弱项到期，需进入面试或知识卡中训练。"
+        summary = f"当前只有 {strategy_due_count} 个回答策略弱项建议复查，需进入面试或知识卡中训练。"
     return {
         "today": today_value,
+        "prompt_version": REVIEW_PROMPT_VERSION,
         "due_count": len(cards),
-        "overdue_count": overdue_count,
+        "candidate_count": len(candidates),
+        "recommended_count": len([weak for weak in candidates if weak.get("review_state") == "recommended"]),
+        "never_reviewed_count": len([weak for weak in candidates if weak.get("review_state") == "never_reviewed"]),
+        "recent_count": len([weak for weak in candidates if weak.get("review_state") == "recent"]),
+        "overdue_count": 0,
         "strategy_due_count": strategy_due_count,
-        "strategy_constraints": strategies,
-        "topics": topics,
+        "strategy_constraints": strategies[: max(0, max_strategy_constraints)],
+        "topics": topic_stats,
         "cards": cards,
         "summary": summary,
     }
@@ -210,6 +194,10 @@ def review_card_payload(weak: dict[str, Any], *, due: bool, early: bool = False)
             "early": early,
             "source_note_paths": list(weak.get("source_note_paths") or []),
             "last_seen": weak.get("last_seen", ""),
+            "last_reviewed": weak.get("last_reviewed", ""),
+            "review_state": weak.get("review_state", ""),
+            "review_priority": weak.get("review_priority", 0),
+            "review_age_days": weak.get("review_age_days", 0),
             "strategy_constraints": [],
         }
     )
@@ -230,46 +218,58 @@ def strategy_constraint_payload(weak: dict[str, Any]) -> dict[str, Any]:
         "point": str(weak.get("point") or "").strip(),
         "category": normalize_category(weak.get("category")),
         "topic": str(weak.get("topic") or "").strip(),
+        "planned_layer": str(weak.get("planned_layer") or "").strip(),
         "evidence": str(weak.get("evidence") or "").strip(),
     }
-
-
-def strategy_constraint_sort_key(weak: dict[str, Any], *, today: str) -> tuple[int, str, float, int, str]:
-    sr = weak.get("sr") or {}
-    next_review = str(sr.get("next_review") or "9999-12-31")
-    overdue_rank = 0 if next_review < today else 1
-    return (
-        overdue_rank,
-        next_review,
-        float(sr.get("ease_factor", 2.5) or 2.5),
-        -int(weak.get("times_seen", 0) or 0),
-        str(weak.get("last_seen") or "0000-00-00"),
-    )
 
 
 def select_strategy_constraints(
     profile: dict[str, Any],
     *,
-    max_items: int = DEFAULT_MAX_STRATEGY_CONSTRAINTS,
+    max_items: int | None = DEFAULT_MAX_STRATEGY_CONSTRAINTS,
     today: str | None = None,
 ) -> list[dict[str, Any]]:
     today_value = today or date.today().isoformat()
     candidates = [
         weak
-        for weak in profile.get("weak_points", [])
-        if isinstance(weak, dict)
-        and not weak.get("improved")
-        and is_strategy_weak_point(weak)
-        and str((weak.get("sr") or {}).get("next_review") or "2000-01-01") <= today_value
+        for weak in review_candidates(profile, today=today_value)
+        if is_strategy_weak_point(weak)
     ]
-    ordered = sorted(candidates, key=lambda weak: strategy_constraint_sort_key(weak, today=today_value))
-    return [strategy_constraint_payload(weak) for weak in ordered[: max(0, max_items)]]
+    payloads = [strategy_constraint_payload(weak) for weak in candidates]
+    if max_items is None:
+        return payloads
+    return payloads[: max(0, max_items)]
 
 
-def attach_strategy_constraints(card: dict[str, Any], constraints: list[dict[str, Any]]) -> dict[str, Any]:
+def attach_strategy_constraints(card: dict[str, Any], constraints: list[dict[str, Any]], *, max_items: int | None = None) -> dict[str, Any]:
     enriched = dict(card)
-    enriched["strategy_constraints"] = [dict(item) for item in constraints]
+    enriched["strategy_constraints"] = matching_strategy_constraints_for_card(card, constraints, max_items=max_items)
     return enriched
+
+
+def matching_strategy_constraints_for_card(
+    card: dict[str, Any],
+    constraints: list[dict[str, Any]],
+    *,
+    max_items: int | None = None,
+) -> list[dict[str, Any]]:
+    topic = str(card.get("topic") or "").strip()
+    planned_layer = str(card.get("planned_layer") or "").strip()
+    same_topic = [
+        dict(item)
+        for item in constraints
+        if str(item.get("topic") or "").strip() == topic
+    ]
+    if not planned_layer:
+        matched = same_topic
+        return matched if max_items is None else matched[: max(0, max_items)]
+    same_layer = [
+        item
+        for item in same_topic
+        if str(item.get("planned_layer") or "").strip() == planned_layer
+    ]
+    matched = same_layer or same_topic
+    return matched if max_items is None else matched[: max(0, max_items)]
 
 
 def weak_point_id(weak: dict[str, Any]) -> str:
@@ -374,6 +374,108 @@ def write_review_prompt_cache(cache_dir: Path | str, cache_key: str, payload: di
     save_review_cache(cache_dir, "prompt-cache.json", cache)
 
 
+def review_candidates(
+    profile: dict[str, Any],
+    *,
+    topics: list[str] | tuple[str, ...] | None = None,
+    today: str | None = None,
+) -> list[dict[str, Any]]:
+    today_value = today or date.today().isoformat()
+    selected_topics = normalize_topics(topics)
+    candidates = [
+        enrich_review_candidate(weak, today=today_value)
+        for weak in profile.get("weak_points", [])
+        if isinstance(weak, dict) and not weak.get("improved") and topic_matches(weak, selected_topics)
+    ]
+    return sorted(candidates, key=review_candidate_sort_key)
+
+
+def enrich_review_candidate(weak: dict[str, Any], *, today: str) -> dict[str, Any]:
+    item = dict(weak)
+    sr = dict(item.get("sr") or {})
+    item["sr"] = sr
+    last_reviewed = str(sr.get("last_reviewed") or "").strip()
+    next_review = str(sr.get("next_review") or "2000-01-01").strip()
+    if not last_reviewed:
+        review_state = "never_reviewed"
+    elif next_review <= today:
+        review_state = "recommended"
+    else:
+        review_state = "recent"
+    review_age_days = days_since(last_reviewed or str(item.get("last_seen") or ""), today=today)
+    state_bonus = {"never_reviewed": 3.0, "recommended": 2.0, "recent": 1.0}[review_state]
+    ease = float(sr.get("ease_factor", 2.5) or 2.5)
+    times_seen = int(item.get("times_seen", 0) or 0)
+    item.update(
+        {
+            "review_state": review_state,
+            "review_priority": round(state_bonus + min(review_age_days, 365) / 365 + max(0.0, 3.0 - ease) / 10 + min(times_seen, 20) / 100, 4),
+            "last_reviewed": last_reviewed,
+            "review_age_days": review_age_days,
+        }
+    )
+    return item
+
+
+def review_candidate_sort_key(item: dict[str, Any]) -> tuple[int, str, float, int, str]:
+    state_rank = {"never_reviewed": 0, "recommended": 1, "recent": 2}.get(str(item.get("review_state") or ""), 3)
+    sr = item.get("sr") or {}
+    last_reviewed = str(sr.get("last_reviewed") or item.get("last_seen") or "0000-00-00")
+    return (
+        state_rank,
+        last_reviewed,
+        float(sr.get("ease_factor", 2.5) or 2.5),
+        -int(item.get("times_seen", 0) or 0),
+        weak_point_id(item),
+    )
+
+
+def review_topic_stats(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stats: dict[str, dict[str, Any]] = {}
+    for weak in candidates:
+        topic = str(weak.get("topic") or UNCATEGORIZED).strip() or UNCATEGORIZED
+        item = stats.setdefault(
+            topic,
+            {
+                "topic": topic,
+                "due": 0,
+                "candidate_count": 0,
+                "recommended_count": 0,
+                "never_reviewed_count": 0,
+                "recent_count": 0,
+                "max_review_priority": 0.0,
+            },
+        )
+        item["candidate_count"] += 1
+        item["due"] += 1
+        state = str(weak.get("review_state") or "")
+        if state == "recommended":
+            item["recommended_count"] += 1
+        elif state == "never_reviewed":
+            item["never_reviewed_count"] += 1
+        elif state == "recent":
+            item["recent_count"] += 1
+        item["max_review_priority"] = max(float(item["max_review_priority"]), float(weak.get("review_priority", 0.0) or 0.0))
+    return sorted(
+        stats.values(),
+        key=lambda item: (
+            -float(item.get("max_review_priority") or 0.0),
+            -int(item.get("never_reviewed_count") or 0),
+            -int(item.get("recommended_count") or 0),
+            str(item.get("topic") or ""),
+        ),
+    )
+
+
+def days_since(value: str, *, today: str) -> int:
+    try:
+        current = date.fromisoformat(today)
+        previous = date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return 9999
+    return max(0, (current - previous).days)
+
+
 def grouped_review_cards(
     profile: dict[str, Any],
     *,
@@ -384,13 +486,8 @@ def grouped_review_cards(
 ) -> dict[str, Any]:
     today_value = today or date.today().isoformat()
     selected_topics = normalize_topics(topics)
-    due, other_due = split_due_reviews(profile, None)
-    due_weak_points = [
-        weak
-        for weak in [*due, *other_due]
-        if isinstance(weak, dict) and not weak.get("improved") and topic_matches(weak, selected_topics)
-    ]
-    strategies = select_strategy_constraints(profile, max_items=max_strategy_constraints, today=today_value)
+    due_weak_points = review_candidates(profile, topics=selected_topics, today=today_value)
+    strategies = select_strategy_constraints(profile, max_items=None, today=today_value)
     buckets: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for weak in due_weak_points:
         key = (
@@ -403,31 +500,35 @@ def grouped_review_cards(
     cards: list[dict[str, Any]] = []
     for key in sorted(buckets, key=lambda item: (item[0], item[1], item[2])):
         weak_group = sorted(buckets[key], key=lambda weak: weak_point_id(weak))
-        cards.append(build_grouped_review_card_payload(weak_group, strategies=strategies))
+        card_shell = build_grouped_review_card_payload(weak_group, strategies=[])
+        card_shell["strategy_constraints"] = matching_strategy_constraints_for_card(
+            card_shell,
+            strategies,
+            max_items=max_strategy_constraints,
+        )
+        card_shell["strategy_tips"] = [
+            str(item.get("point") or "").strip()
+            for item in card_shell["strategy_constraints"]
+            if str(item.get("point") or "").strip()
+        ]
+        cards.append(card_shell)
         if len(cards) >= max(0, limit):
             break
 
-    by_topic: dict[str, int] = {}
-    overdue_count = 0
-    for card in cards:
-        topic = str(card.get("topic") or UNCATEGORIZED)
-        by_topic[topic] = by_topic.get(topic, 0) + len(card.get("weak_point_ids") or [])
-        for weak in card.get("weak_points_summary") or []:
-            next_review = str((weak.get("sr") or {}).get("next_review") or "")
-            if next_review and next_review < today_value:
-                overdue_count += 1
-    topics_payload = [
-        {"topic": topic, "due": count}
-        for topic, count in sorted(by_topic.items(), key=lambda item: (-item[1], item[0]))
-    ]
-    summary = "；".join(f"{item['topic']} {item['due']} 个到期弱项" for item in topics_payload[:3])
+    topics_payload = review_topic_stats(due_weak_points)
+    summary = "；".join(f"{item['topic']} {item['candidate_count']} 个可复习" for item in topics_payload[:3])
     return {
         "today": today_value,
+        "prompt_version": REVIEW_PROMPT_VERSION,
         "selected_topics": selected_topics,
         "due_count": sum(len(card.get("weak_point_ids") or []) for card in cards),
+        "candidate_count": len(due_weak_points),
+        "recommended_count": len([weak for weak in due_weak_points if weak.get("review_state") == "recommended"]),
+        "never_reviewed_count": len([weak for weak in due_weak_points if weak.get("review_state") == "never_reviewed"]),
+        "recent_count": len([weak for weak in due_weak_points if weak.get("review_state") == "recent"]),
         "card_count": len(cards),
-        "overdue_count": overdue_count,
-        "strategy_constraints": strategies,
+        "overdue_count": 0,
+        "strategy_constraints": strategies[: max(0, max_strategy_constraints)],
         "topics": topics_payload,
         "cards": cards,
         "summary": summary,
@@ -459,6 +560,10 @@ def build_grouped_review_card_payload(weak_points: list[dict[str, Any]], *, stra
                 "id": weak_point_id(weak),
                 "sr": dict(weak.get("sr") or {}),
                 "source_note_paths": list(weak.get("source_note_paths") or []),
+                "review_state": weak.get("review_state", ""),
+                "review_priority": weak.get("review_priority", 0),
+                "last_reviewed": weak.get("last_reviewed", ""),
+                "review_age_days": weak.get("review_age_days", 0),
             }
         )
         weak_summary.append(summary)
@@ -472,6 +577,8 @@ def build_grouped_review_card_payload(weak_points: list[dict[str, Any]], *, stra
         "weak_point_ids": weak_ids,
         "weak_points_summary": weak_summary,
         "weak_point_count": len(weak_ids),
+        "review_state": str(first.get("review_state") or ""),
+        "review_priority": max(float(weak.get("review_priority", 0) or 0) for weak in weak_points),
         "point": "；".join(str(weak.get("point") or "").strip() for weak in weak_points if str(weak.get("point") or "").strip()),
         "evidence": "\n".join(str(weak.get("evidence") or "").strip() for weak in weak_points if str(weak.get("evidence") or "").strip()),
         "source_note_paths": source_note_paths,
@@ -483,19 +590,18 @@ def build_grouped_review_card_payload(weak_points: list[dict[str, Any]], *, stra
 
 def collect_review_topics(profile: dict[str, Any], *, today: str | None = None) -> list[dict[str, Any]]:
     today_value = today or date.today().isoformat()
-    counts: dict[str, dict[str, int]] = {}
-    for weak in profile.get("weak_points", []):
-        if not isinstance(weak, dict) or weak.get("improved"):
-            continue
-        topic = str(weak.get("topic") or UNCATEGORIZED).strip() or UNCATEGORIZED
-        item = counts.setdefault(topic, {"total": 0, "due": 0})
-        item["total"] += 1
-        next_review = str((weak.get("sr") or {}).get("next_review") or "2000-01-01")
-        if next_review <= today_value:
-            item["due"] += 1
+    topics = review_topic_stats(review_candidates(profile, today=today_value))
     return [
-        {"topic": topic, "total": values["total"], "due": values["due"]}
-        for topic, values in sorted(counts.items(), key=lambda pair: (-pair[1]["due"], pair[0]))
+        {
+            "topic": item["topic"],
+            "total": item["candidate_count"],
+            "due": item["candidate_count"],
+            "candidate_count": item["candidate_count"],
+            "recommended_count": item["recommended_count"],
+            "never_reviewed_count": item["never_reviewed_count"],
+            "recent_count": item["recent_count"],
+        }
+        for item in topics
     ]
 
 
@@ -507,7 +613,7 @@ def assign_review_plan(
     limit: int,
     allow_cross_topic: bool,
 ) -> list[dict[str, Any]]:
-    ordered = interleave_by_topic(cards)
+    ordered = list(cards)
     planned: list[dict[str, Any]] = []
     topic_pool = selected_topics or sorted({str(card.get("topic") or "") for card in ordered if str(card.get("topic") or "").strip()})
     for index, card in enumerate(ordered[: max(0, limit)]):
@@ -718,6 +824,9 @@ def build_grouped_review_prompt(
             "rules": {
                 "write_in_simplified_chinese": True,
                 "one_card_can_cover_multiple_weak_points": True,
+                "question_blocks_must_test_only_weak_points": True,
+                "strategy_constraints_are_expression_guidance_only": True,
+                "do_not_create_question_blocks_from_strategy_constraints": True,
                 "answer_structure_uses_evidence_reconstruction": True,
                 "thinking_pattern_uses_new_scenario": True,
                 "communication_reasks_for_clearer_expression": True,
@@ -733,7 +842,9 @@ def build_grouped_review_prompt(
                         content=(
                             "You generate one grouped review card for a Chinese interview learner. "
                             "Return only JSON with question_blocks, reference_answer, and strategy_tips. "
-                            "Each question block must include type, prompt, and weak_point_ids."
+                            "Each question block must include type, prompt, and weak_point_ids. "
+                            "Generate question_blocks only from weak_points. "
+                            "Never create a separate question block from strategy_constraints; use them only as brief answer-quality tips."
                         ),
                     ),
                     LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False, indent=2)),
@@ -849,12 +960,15 @@ def grade_weak_point(profile: dict[str, Any], weak: dict[str, Any], *, outcome: 
         "evidence": "review practice outcome",
     }
     before = json.loads(json.dumps(weak.get("sr") or {}, ensure_ascii=False))
+    previous_last_seen = weak.get("last_seen", "")
     if normalized == "pass":
         mark_weak_point_improved(weak, observation, session_id="review", today=today_value)
     elif normalized == "fail":
         update_weak_point(weak, observation, session_id="review", today=today_value)
     else:
         raise ValueError("outcome must be pass or fail")
+    weak["last_seen"] = previous_last_seen
+    weak.setdefault("sr", {})["last_reviewed"] = today_value
     after = weak.get("sr") or {}
     return {
         "card_id": weak_point_id(weak),
@@ -887,7 +1001,6 @@ def commit_review_action(store: InterviewProfileStore, *, card_id: str, action: 
         raise KeyError(f"review card not found: {card_id}")
     today_value = date.today().isoformat()
     before = json.loads(json.dumps(weak.get("sr") or {}, ensure_ascii=False))
-    weak["last_seen"] = today_value
     weak["improved"] = False
     sr = weak.setdefault("sr", {})
     sr["ease_factor"] = round(float(sr.get("ease_factor", 2.5) or 2.5), 2)
@@ -895,6 +1008,7 @@ def commit_review_action(store: InterviewProfileStore, *, card_id: str, action: 
     sr["interval_days"] = 1
     sr["next_review"] = today_value
     sr["last_outcome"] = "retry"
+    sr["last_reviewed"] = today_value
     store.save(profile)
     return {
         "card_id": card_id,

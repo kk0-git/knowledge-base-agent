@@ -1,0 +1,13 @@
+from __future__ import annotations
+
+from typing import Any, Protocol
+
+
+class ReviewRunRepository(Protocol):
+    def load_run(self, review_run_id: str) -> dict[str, Any] | None: ...
+
+    def save_run(self, run: dict[str, Any]) -> dict[str, Any]: ...
+
+    def patch_workspace(self, review_run_id: str, workspace: dict[str, Any]) -> dict[str, Any]: ...
+
+    def snapshot(self, review_run_id: str) -> dict[str, Any] | None: ...

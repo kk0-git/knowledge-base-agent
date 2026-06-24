@@ -80,6 +80,9 @@ from services.workflows.interview_profile import (
 )
 from services.workflows.interview_memory_commit import commit_interview_memory
 from services.workflows.interview_sessions import InterviewSessionStore
+from services.workflows.answer_sessions import AnswerSessionStore
+from services.workflows.review_runs import ReviewRunStore
+from services.workflows.review_run_service import ReviewRunService
 from services.workflows.review_practice import (
     build_due_review_overview,
     build_correction_query,
@@ -91,6 +94,7 @@ from services.workflows.review_practice import (
     commit_review_outcome,
     find_weak_point,
     grouped_review_cards,
+    matching_strategy_constraints_for_card,
     parse_correction_payload,
     parse_grouped_verification_payload,
     parse_verification_payload,
@@ -100,10 +104,13 @@ from services.workflows.review_practice import (
     select_strategy_constraints,
     write_review_card_cache,
     write_review_prompt_cache,
+    REVIEW_PROMPT_VERSION,
 )
 from services.workflows.runner import WorkflowRunner, task_result_to_dict
 from services.workflows.schema import ScopeSpec, WorkflowSpec, WritebackSpec
 from services.workflows.scope_resolver import ScopeResolver
+from ports.file_answer_session_repository import FileAnswerSessionRepository
+from ports.file_review_run_repository import FileReviewRunRepository
 from ports.file_session_repository import FileSessionRepository
 from ports.in_memory_agent_run_repository import InMemoryAgentRunRepository
 from services.agent_turns import AgentTurnInput, AgentTurnRunner, AgentTurnRunnerDeps, AgentTurnService
@@ -404,6 +411,7 @@ class ReviewPlanRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=50)
     allow_cross_topic: bool = Field(default=True)
     max_strategy_constraints: int = Field(default=2, ge=0, le=5)
+    force_regenerate: bool = Field(default=False)
 
 
 class ReviewPrepareRequest(BaseModel):
@@ -445,6 +453,25 @@ class ReviewDialogueRequest(BaseModel):
     topics: list[str] = Field(default_factory=list)
     message: str = Field(default="")
     chat_history: list[dict[str, str]] = Field(default_factory=list)
+
+
+class ReviewRunWorkspacePatchRequest(BaseModel):
+    mode: str | None = None
+    selectionState: dict[str, Any] | None = None
+    cardReviewState: dict[str, Any] | None = None
+    dialogueReviewState: dict[str, Any] | None = None
+
+
+class ReviewDialogueSessionRequest(BaseModel):
+    topics: list[str] = Field(default_factory=list)
+
+
+class AnswerSessionCreateRequest(BaseModel):
+    scope_type: str = Field(default="all")
+    scope_value: str | None = None
+    scope_paths: list[str] = Field(default_factory=list)
+    strict_evidence: bool = Field(default=False)
+    extra: dict[str, Any] = Field(default_factory=dict)
 
 
 @dataclass
@@ -600,6 +627,7 @@ def create_app(
         ),
     )
     interview_session_store = InterviewSessionStore(project_root / "interview-sessions")
+    answer_session_store = AnswerSessionStore(project_root / "answer-sessions")
     interview_profile_store = InterviewProfileStore(project_root / "profile" / "interview_profile.json")
     startup_sync_status: dict[str, Any] = {
         "enabled": sync_on_start,
@@ -629,9 +657,16 @@ def create_app(
     rag_prewarm_started = False
     review_prepare_cache: dict[str, dict[str, Any]] = {}
     review_cache_dir = project_root / "review-cache"
-    review_run_lock = threading.Lock()
     review_run_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="review-run")
-    review_runs: dict[str, dict[str, Any]] = {}
+    review_run_store = ReviewRunStore(project_root / "review-runs")
+    review_run_repo = FileReviewRunRepository(review_run_store)
+    review_run_service = ReviewRunService(
+        repository=review_run_repo,
+        profile_store=interview_profile_store,
+        review_cache_dir=review_cache_dir,
+        project_root=project_root,
+        executor=review_run_executor,
+    )
 
     @app.get("/", response_class=HTMLResponse)
     def home(request: Request):
@@ -756,189 +791,9 @@ def create_app(
             prompt["error"] = str(exc)
             return prompt
 
-    def review_run_snapshot(review_run_id: str) -> dict[str, Any] | None:
-        with review_run_lock:
-            run = review_runs.get(review_run_id)
-            if run is None:
-                return None
-            cards = [dict(card) for card in run.get("cards", [])]
-            ready_count = len([card for card in cards if card.get("status") == "ready"])
-            failed_count = len([card for card in cards if card.get("status") == "failed"])
-            pending_count = len([card for card in cards if card.get("status") == "pending"])
-            payload = {
-                key: value
-                for key, value in run.items()
-                if key not in {"cards", "weak_points", "card_weak_points"}
-            }
-            payload["cards"] = cards
-            payload["ready_count"] = ready_count
-            payload["failed_count"] = failed_count
-            payload["pending_count"] = pending_count
-            return payload
-
-    def create_review_run(request: ReviewPlanRequest | ReviewPrepareRequest) -> dict[str, Any]:
-        profile = interview_profile_store.load()
-        max_strategy_constraints = int(getattr(request, "max_strategy_constraints", 2) or 2)
-        grouped = grouped_review_cards(
-            profile,
-            topics=getattr(request, "topics", []),
-            limit=int(getattr(request, "limit", 12) or 12),
-            max_strategy_constraints=max_strategy_constraints,
-        )
-        selected_topics = {str(topic).strip() for topic in grouped.get("selected_topics", []) if str(topic).strip()}
-        limit = int(getattr(request, "limit", 12) or 12)
-        cards: list[dict[str, Any]] = []
-        card_weak_points: dict[str, list[dict[str, Any]]] = {}
-        for card in grouped.get("cards", []):
-            card_id = str(card.get("id") or "")
-            weak_ids = [str(item).strip() for item in card.get("weak_point_ids") or [] if str(item).strip()]
-            weak_group = [find_weak_point(profile, weak_id) for weak_id in weak_ids]
-            weak_group = [weak for weak in weak_group if isinstance(weak, dict)]
-            if not card_id or not weak_group:
-                continue
-            shell = dict(card)
-            shell.pop("review_prompt", None)
-            cache_key = str(shell.get("cache_key") or "")
-            cached = read_review_card_cache(review_cache_dir, cache_key) if cache_key else None
-            if cached:
-                review_prompt = cached.get("review_prompt") or cached
-                shell.update(
-                    {
-                        "status": "ready",
-                        "review_prompt": review_prompt,
-                        "question_blocks": cached.get("question_blocks") or review_prompt.get("question_blocks") or [],
-                        "reference_answer": cached.get("reference_answer") or review_prompt.get("reference_answer") or "",
-                        "strategy_tips": cached.get("strategy_tips") or shell.get("strategy_tips") or [],
-                        "cache_hit": True,
-                    }
-                )
-            else:
-                shell["status"] = "pending"
-                shell["cache_hit"] = False
-            cards.append(shell)
-            card_weak_points[card_id] = json.loads(json.dumps(weak_group, ensure_ascii=False))
-        review_run_id = f"review-{uuid.uuid4().hex[:12]}"
-        ready_count = len([card for card in cards if card.get("status") == "ready"])
-        pending_count = len([card for card in cards if card.get("status") == "pending"])
-        run = dict(grouped)
-        run.update(
-            {
-                "review_run_id": review_run_id,
-                "status": "queued" if pending_count else "done",
-                "cards": cards,
-                "card_weak_points": card_weak_points,
-                "due_count": sum(len(card.get("weak_point_ids") or []) for card in cards),
-                "prepared_count": ready_count,
-                "limit": limit,
-                "selected_topics": sorted(selected_topics),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "finished_at": datetime.now(timezone.utc).isoformat() if not pending_count else "",
-            }
-        )
-        with review_run_lock:
-            review_runs[review_run_id] = run
-        if pending_count:
-            review_run_executor.submit(generate_review_run_cards, review_run_id)
-        snapshot = review_run_snapshot(review_run_id)
-        return snapshot or run
-
-    def generate_review_run_cards(review_run_id: str) -> None:
-        with review_run_lock:
-            run = review_runs.get(review_run_id)
-            if run is None:
-                return
-            run["status"] = "running"
-            run["updated_at"] = datetime.now(timezone.utc).isoformat()
-            card_ids = [str(card.get("id") or "") for card in run.get("cards", []) if card.get("status") == "pending"]
-            card_weak_points = dict(run.get("card_weak_points") or {})
-        llm_config = None
-        llm_client = None
-        try:
-            llm_config = load_llm_config(project_root)
-            llm_client = create_llm_client(llm_config)
-        except Exception:
-            llm_config = None
-            llm_client = None
-        for card_id in card_ids:
-            weak_group = list(card_weak_points.get(card_id) or [])
-            if not weak_group:
-                continue
-            try:
-                strategy_constraints: list[dict[str, Any]] = []
-                cache_key = ""
-                with review_run_lock:
-                    run = review_runs.get(review_run_id)
-                    if run is None:
-                        return
-                    for card in run.get("cards", []):
-                        if str(card.get("id") or "") == card_id:
-                            strategy_constraints = list(card.get("strategy_constraints") or [])
-                            cache_key = str(card.get("cache_key") or "")
-                            break
-                if llm_client is not None and llm_config is not None:
-                    prompt = build_grouped_review_prompt(
-                        weak_group,
-                        strategy_constraints=strategy_constraints,
-                        llm_client=llm_client,
-                        model=llm_config.model,
-                        temperature=min(llm_config.temperature, 0.2),
-                    )
-                else:
-                    prompt = build_grouped_review_prompt(weak_group, strategy_constraints=strategy_constraints)
-                if cache_key:
-                    write_review_card_cache(
-                        review_cache_dir,
-                        cache_key,
-                        {
-                            "review_prompt": prompt,
-                            "question_blocks": prompt.get("question_blocks") or [],
-                            "reference_answer": prompt.get("reference_answer") or "",
-                            "strategy_tips": prompt.get("strategy_tips") or [],
-                            "prompt_version": prompt.get("prompt_version") or "",
-                        },
-                    )
-                with review_run_lock:
-                    run = review_runs.get(review_run_id)
-                    if run is None:
-                        return
-                    for card in run.get("cards", []):
-                        if str(card.get("id") or "") == card_id:
-                            card["review_prompt"] = prompt
-                            card["question_blocks"] = prompt.get("question_blocks") or []
-                            card["reference_answer"] = prompt.get("reference_answer") or ""
-                            card["strategy_tips"] = prompt.get("strategy_tips") or card.get("strategy_tips") or []
-                            card["status"] = "ready"
-                            break
-                    run["prepared_count"] = len([card for card in run.get("cards", []) if card.get("status") == "ready"])
-                    run["updated_at"] = datetime.now(timezone.utc).isoformat()
-            except Exception as exc:
-                with review_run_lock:
-                    run = review_runs.get(review_run_id)
-                    if run is None:
-                        return
-                    for card in run.get("cards", []):
-                        if str(card.get("id") or "") == card_id:
-                            card["status"] = "failed"
-                            card["error"] = str(exc)
-                            card["review_prompt"] = {
-                                "prompt": card.get("point") or "请围绕这个知识弱点，用自己的话完整回答。",
-                                "fallback_used": True,
-                                "error": str(exc),
-                            }
-                            break
-                    run["updated_at"] = datetime.now(timezone.utc).isoformat()
-        with review_run_lock:
-            run = review_runs.get(review_run_id)
-            if run is not None:
-                run["status"] = "done"
-                run["prepared_count"] = len([card for card in run.get("cards", []) if card.get("status") == "ready"])
-                run["finished_at"] = datetime.now(timezone.utc).isoformat()
-                run["updated_at"] = run["finished_at"]
-
     @app.post("/api/review/prepare")
     def review_prepare(request: ReviewPrepareRequest) -> dict[str, Any]:
-        payload = create_review_run(request)
+        payload = review_run_service.create_plan_run(request)
         review_prepare_cache[payload["review_run_id"]] = {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "payload": payload,
@@ -947,7 +802,7 @@ def create_app(
 
     @app.get("/api/review/prepare/{review_run_id}")
     def review_prepared_run(review_run_id: str) -> dict[str, Any]:
-        snapshot = review_run_snapshot(review_run_id)
+        snapshot = review_run_service.snapshot(review_run_id)
         if snapshot is not None:
             return snapshot
         cached = review_prepare_cache.get(review_run_id)
@@ -957,14 +812,46 @@ def create_app(
 
     @app.post("/api/review/plan")
     def review_plan(request: ReviewPlanRequest) -> dict[str, Any]:
-        return create_review_run(request)
+        return review_run_service.create_plan_run(request)
 
     @app.get("/api/review/plan/{review_run_id}")
     def review_plan_run(review_run_id: str) -> dict[str, Any]:
-        snapshot = review_run_snapshot(review_run_id)
+        snapshot = review_run_service.snapshot(review_run_id)
         if snapshot is None:
             raise HTTPException(status_code=404, detail=f"review run not found: {review_run_id}")
         return snapshot
+
+    @app.post("/api/review/plan/{review_run_id}/cards/{card_id}/regenerate")
+    def regenerate_review_card(review_run_id: str, card_id: str) -> dict[str, Any]:
+        try:
+            return review_run_service.regenerate_card(review_run_id, card_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.patch("/api/review/runs/{review_run_id}/workspace")
+    def patch_review_run_workspace(review_run_id: str, request: ReviewRunWorkspacePatchRequest) -> dict[str, Any]:
+        workspace = request.model_dump(exclude_none=True)
+        if not workspace:
+            raise HTTPException(status_code=400, detail="workspace patch is empty")
+        try:
+            return review_run_service.patch_workspace(review_run_id, workspace)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/review/dialogue/sessions")
+    def create_dialogue_review_session(request: ReviewDialogueSessionRequest) -> dict[str, Any]:
+        try:
+            return review_run_service.create_dialogue_run(request.topics)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/review/card/{card_id}/prompt")
     def review_card_prompt(card_id: str, request: ReviewPromptRequest) -> dict[str, Any]:
@@ -1084,7 +971,14 @@ def create_app(
             llm_config = load_llm_config(project_root)
             llm_client = create_llm_client(llm_config)
             app_runner = LibrarianApp(build_interview_agent_runtime(llm_client))
-            strategy_constraints = select_strategy_constraints(profile)
+            strategy_constraints = matching_strategy_constraints_for_card(
+                {
+                    "topic": str(weak_points[0].get("topic") or "").strip(),
+                    "planned_layer": str(weak_points[0].get("planned_layer") or "").strip(),
+                },
+                select_strategy_constraints(profile, max_items=None),
+                max_items=2,
+            )
             result = app_runner.run(
                 LibrarianRequest(
                     query=build_grouped_weak_point_verification_query(
@@ -1450,6 +1344,7 @@ def create_app(
         threading.Thread(target=run, name="interview-rag-prewarm", daemon=True).start()
 
     session_repo = FileSessionRepository(interview_session_store)
+    answer_session_repo = FileAnswerSessionRepository(answer_session_store)
     run_repo = InMemoryAgentRunRepository(task_manager)
 
     def build_agent_turn_runner(llm_client) -> AgentTurnRunner:
@@ -1478,6 +1373,7 @@ def create_app(
 
     agent_turn_service = AgentTurnService(
         session_repo=session_repo,
+        answer_session_repo=answer_session_repo,
         run_repo=run_repo,
         runner_factory=build_agent_turn_runner,
         classify_error=classify_runtime_error,
@@ -2553,6 +2449,46 @@ def create_app(
             except Exception:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/answer/sessions")
+    def create_answer_session(request: AnswerSessionCreateRequest) -> dict[str, Any]:
+        try:
+            session = answer_session_store.create_session(
+                scope_type=request.scope_type,
+                scope_value=request.scope_value,
+                scope_paths=request.scope_paths,
+                strict_evidence=request.strict_evidence,
+                extra=request.extra,
+            )
+            return {"session": session}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/answer/sessions")
+    def list_answer_sessions(limit: int = 50) -> dict[str, Any]:
+        try:
+            return {"sessions": answer_session_store.list_sessions(limit=limit)}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/answer/sessions/{session_id}")
+    def get_answer_session(session_id: str) -> dict[str, Any]:
+        try:
+            return answer_session_store.load_session_bundle(session_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/answer/sessions/{session_id}/archive")
+    def archive_answer_session(session_id: str) -> dict[str, Any]:
+        try:
+            session = answer_session_store.archive_session(session_id)
+            return {"session": session}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/interview/summary")
     def interview_summary(request: InterviewSummaryRequest) -> dict[str, Any]:
         if runtime_config.vault_path is None:
@@ -3144,6 +3080,169 @@ SIDEBAR_HTML = r"""
 """
 
 
+WORKSPACE_STORE_SCRIPT = r"""
+    (function () {
+      const REVIEW_KEY = "knowledge_agent.workspace.review.v1";
+      const CHAT_KEY = "knowledge_agent.workspace.chat.v1";
+      const UI_KEY = "knowledge_agent.workspace.ui.v1";
+      const LEGACY_KEY = "knowledge_agent.workspace.v1";
+      const LEGACY_INTERVIEW_KEY = "knowledge_agent.active_interview_session_id";
+      const LEGACY_ANSWER_WORKSPACE_KEY = "knowledge_agent.answer_workspace";
+      const LEGACY_ANSWER_HISTORY_KEY = "knowledge_agent.answer_history";
+      const LEGACY_ANSWER_TASK_KEY = "knowledge_agent.active_answer_task_id";
+      const REVIEW_SLICE_VERSION = 1;
+      const CHAT_SLICE_VERSION = 1;
+      const slices = {review: null, chat: null, ui: null};
+
+      function migrateReviewSlice(review) {
+        if (!review || typeof review !== "object") return null;
+        let version = Number(review.version) || 0;
+        if (version >= REVIEW_SLICE_VERSION) return review;
+        const next = {...review, version: REVIEW_SLICE_VERSION};
+        if (version < 1) {
+          if (!next.promptVersion && next.cardReviewState && next.cardReviewState.promptVersion) {
+            next.promptVersion = next.cardReviewState.promptVersion;
+          }
+          if (next.cardReviewState && !Array.isArray(next.cardReviewState.cards)) {
+            next.cardReviewState.cards = [];
+          }
+        }
+        return next;
+      }
+
+      function migrateChatSlice(chat) {
+        if (!chat || typeof chat !== "object") return null;
+        const version = Number(chat.version) || 0;
+        if (version >= CHAT_SLICE_VERSION) return chat;
+        return {...chat, version: CHAT_SLICE_VERSION};
+      }
+
+      function migrateAll() {
+        let changed = false;
+        if (slices.review) {
+          const migrated = migrateReviewSlice(slices.review);
+          if (migrated !== slices.review) {
+            slices.review = migrated;
+            changed = true;
+          }
+        }
+        if (slices.chat) {
+          const migrated = migrateChatSlice(slices.chat);
+          if (migrated !== slices.chat) {
+            slices.chat = migrated;
+            changed = true;
+          }
+        }
+        if (changed) persist();
+      }
+
+      function hydrate() {
+        try {
+          const legacy = sessionStorage.getItem(LEGACY_KEY);
+          if (legacy) {
+            const parsed = JSON.parse(legacy);
+            if (parsed && typeof parsed === "object") {
+              if (parsed.review) slices.review = parsed.review;
+              if (parsed.chat) slices.chat = parsed.chat;
+              if (parsed.ui) slices.ui = parsed.ui;
+            }
+            sessionStorage.removeItem(LEGACY_KEY);
+          }
+          const reviewRaw = sessionStorage.getItem(REVIEW_KEY);
+          if (reviewRaw) {
+            const parsed = JSON.parse(reviewRaw);
+            if (parsed && typeof parsed === "object") {
+              slices.review = parsed.review || (parsed.version ? parsed : null);
+            }
+          }
+          const chatRaw = localStorage.getItem(CHAT_KEY);
+          if (chatRaw) {
+            const parsed = JSON.parse(chatRaw);
+            if (parsed && typeof parsed === "object") slices.chat = parsed;
+          }
+          const uiRaw = sessionStorage.getItem(UI_KEY);
+          if (uiRaw) {
+            const parsed = JSON.parse(uiRaw);
+            if (parsed && typeof parsed === "object") slices.ui = parsed.ui || parsed;
+          }
+          migrateAll();
+        } catch {}
+      }
+
+      function get(slice) {
+        return slices[slice] ?? null;
+      }
+
+      function patch(slice, partial) {
+        slices[slice] = {...(slices[slice] || {}), ...(partial || {})};
+      }
+
+      function replace(slice, value) {
+        slices[slice] = value;
+      }
+
+      function clear(slice) {
+        slices[slice] = null;
+      }
+
+      function persist() {
+        try {
+          if (slices.review) {
+            sessionStorage.setItem(REVIEW_KEY, JSON.stringify({version: 1, savedAt: new Date().toISOString(), review: slices.review}));
+          } else {
+            sessionStorage.removeItem(REVIEW_KEY);
+          }
+          if (slices.chat) {
+            localStorage.setItem(CHAT_KEY, JSON.stringify({...slices.chat, version: 1, savedAt: new Date().toISOString()}));
+          } else {
+            localStorage.removeItem(CHAT_KEY);
+          }
+          if (slices.ui) {
+            sessionStorage.setItem(UI_KEY, JSON.stringify({version: 1, savedAt: new Date().toISOString(), ui: slices.ui}));
+          } else {
+            sessionStorage.removeItem(UI_KEY);
+          }
+        } catch {}
+      }
+
+      function migrateLegacyChat() {
+        try {
+          const activeInterview = localStorage.getItem(LEGACY_INTERVIEW_KEY);
+          const answerWorkspace = localStorage.getItem(LEGACY_ANSWER_WORKSPACE_KEY);
+          const activeTask = sessionStorage.getItem(LEGACY_ANSWER_TASK_KEY);
+          if (!activeInterview && !answerWorkspace && !activeTask) return;
+          const chat = slices.chat || {version: 1};
+          if (activeInterview && !chat.activeInterviewSessionId) {
+            chat.activeInterviewSessionId = activeInterview;
+          }
+          if (answerWorkspace) {
+            try {
+              const parsed = JSON.parse(answerWorkspace);
+              if (parsed && parsed.scope) {
+                chat.scope = {
+                  scopeType: parsed.scope.scopeType,
+                  scopeValue: parsed.scope.scopeValue,
+                  strictEvidence: parsed.scope.strictEvidence,
+                };
+              }
+              if (parsed && parsed.pendingTurn) chat.pendingTurn = parsed.pendingTurn;
+            } catch {}
+          }
+          if (activeTask) chat.activeAnswerTaskId = activeTask;
+          slices.chat = migrateChatSlice(chat);
+          persist();
+          localStorage.removeItem(LEGACY_INTERVIEW_KEY);
+          localStorage.removeItem(LEGACY_ANSWER_WORKSPACE_KEY);
+          localStorage.removeItem(LEGACY_ANSWER_HISTORY_KEY);
+          sessionStorage.removeItem(LEGACY_ANSWER_TASK_KEY);
+        } catch {}
+      }
+
+      window.KnowledgeAgentWorkspace = {hydrate, get, patch, replace, clear, persist, migrateLegacyChat, migrate: migrateAll};
+    })();
+"""
+
+
 SHELL_SCRIPT = r"""
     (function () {
       const shell = document.querySelector(".app-shell");
@@ -3234,6 +3333,7 @@ def render_web_page(raw_html: str, title: str) -> str:
     legacy_css = extract_html_block(raw_html, "<style>", "</style>")
     legacy_body = extract_html_block(raw_html, "<body>", "</body>")
     content = strip_legacy_navigation(legacy_body or raw_html)
+    content = content.replace("__REVIEW_PROMPT_VERSION__", REVIEW_PROMPT_VERSION)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -3244,6 +3344,9 @@ def render_web_page(raw_html: str, title: str) -> str:
 {legacy_css}
 {SHELL_CSS}
   </style>
+  <script>
+{WORKSPACE_STORE_SCRIPT}
+  </script>
 </head>
 <body>
   <div class="app-shell">
@@ -5613,7 +5716,7 @@ REVIEW_OLD_HTML = r"""<!doctype html>
   <main>
     <section class="panel">
       <h2>逐条对照</h2>
-      <p>系统会先按到期知识弱项准备本轮题目；你逐条作答，再对照笔记纠偏。</p>
+      <p>系统会先按建议复查弱项准备本轮题目；你逐条作答，再对照笔记纠偏。</p>
       <div class="actions">
         <button id="cardMode" type="button">逐条对照</button>
         <button id="dialogueMode" class="secondary" type="button">对话复查</button>
@@ -5646,7 +5749,7 @@ REVIEW_OLD_HTML = r"""<!doctype html>
           $("donePanel").classList.remove("hidden");
           const message = data.summary || "可以继续面试或稍后再来。复习不是面试的前置条件。";
           $("donePanel").innerHTML = `<h3>暂无可独立复习的知识弱项</h3><p>${escapeHtml(message)}</p>`;
-          setStatus(data.summary || "暂无到期弱项。");
+          setStatus(data.summary || "暂无建议复查弱项。");
           return;
         }
         setStatus("正在生成复习题，第一题准备好后会自动显示。");
@@ -5704,7 +5807,7 @@ REVIEW_OLD_HTML = r"""<!doctype html>
     function renderOverview(data) {
       const topics = data.topics || [];
       $("overview").innerHTML = topics.length
-        ? topics.slice(0, 6).map((item) => `<span class="topic-chip">${escapeHtml(item.topic)} ${escapeHtml(item.due)} 个到期</span>`).join("")
+        ? topics.slice(0, 6).map((item) => `<span class="topic-chip">${escapeHtml(item.topic)} ${escapeHtml(item.candidate_count || item.due)} 个可复习</span>`).join("")
         : "";
     }
 
@@ -5720,7 +5823,7 @@ REVIEW_OLD_HTML = r"""<!doctype html>
           <h3>正在准备复习题</h3>
           <p>已准备 ${ready} 题，待生成 ${pending} 题。第一题准备好后会自动显示。</p>
           <div class="actions">
-            <button id="reloadDue" class="secondary" type="button">刷新到期弱项</button>
+            <button id="reloadDue" class="secondary" type="button">刷新建议复查弱项</button>
             <button id="endReview" class="secondary" type="button">结束本轮复习</button>
           </div>
         `;
@@ -5744,7 +5847,7 @@ REVIEW_OLD_HTML = r"""<!doctype html>
         ${renderStrategyConstraints(card.strategy_constraints || [])}
         <div class="actions">
           <button id="submitVerify" type="button" ${promptReady ? "" : "disabled"}>提交</button>
-          <button id="reloadDue" class="secondary" type="button">刷新到期弱项</button>
+          <button id="reloadDue" class="secondary" type="button">刷新建议复查弱项</button>
           <button id="endReview" class="secondary" type="button">结束本轮复习</button>
         </div>
         <div id="verifyResult" class="result hidden"></div>
@@ -5914,7 +6017,7 @@ REVIEW_OLD_HTML = r"""<!doctype html>
       state.dialogueHistory = state.dialogueHistory || [];
       $("donePanel").innerHTML = `
         <h3>对话复查</h3>
-        <p>Agent 会读取当前 topic 的到期弱项，逐条追问并给出建议；不会自动写入 profile。</p>
+        <p>Agent 会读取当前 topic 的建议复查弱项，逐条追问并给出建议；不会自动写入 profile。</p>
         <input id="dialogueTopic" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px" placeholder="可选 topic，例如 MCP 协议" />
         <div id="dialogueMessages" class="result compact"></div>
         <textarea id="dialogueMessage" placeholder="输入：开始对这个 topic 做对话复查，或回答 Agent 的追问。"></textarea>
@@ -6148,7 +6251,7 @@ REVIEW_LEGACY_HTML = r"""<!doctype html>
       try {
         const data = await postJson("/api/review/plan", {topics: [], question_types: [], limit: 10, allow_cross_topic: true});
         renderSetup(data);
-        setStatus("选择主题后开始复习。未选择主题时会使用全部到期薄弱点。");
+        setStatus("选择主题后开始复习。未选择主题时会使用全部可复习薄弱点。");
       } catch (error) {
         setStatus(error.message || String(error), true);
       }
@@ -6179,7 +6282,7 @@ REVIEW_LEGACY_HTML = r"""<!doctype html>
         state.index = 0;
         state.results = [];
         if (!state.cards.length) {
-          setStatus("当前没有到期复习卡片。可以换主题，或先完成一次面试生成 weak points。", true);
+          setStatus("当前没有可复习卡片。可以换主题，或先完成一次面试生成 weak points。", true);
           $("setupPanel").open = true;
           return;
         }
@@ -6225,7 +6328,7 @@ REVIEW_LEGACY_HTML = r"""<!doctype html>
             <h3>第 ${state.index + 1} / ${state.cards.length} 题</h3>
             <div class="status">${escapeHtml(card.topic || "未分类")} · ${escapeHtml(questionTypeLabels[qtype] || qtype)}</div>
           </div>
-          <span class="badge">${card.due ? "到期" : "提前"}</span>
+          <span class="badge">${reviewStateLabel(card.review_state)}</span>
         </div>
         <div class="question">${escapeHtml(prompt.prompt || "")}</div>
         ${prompt.hint ? `<div class="hint">提示：${escapeHtml(prompt.hint)}</div>` : ""}
@@ -6410,6 +6513,8 @@ REVIEW_HTML = r"""<!doctype html>
     .topic-chip.unselected .count { color:var(--muted); }
     .overview-line { display:flex; gap:8px; flex-wrap:wrap; color:var(--muted); font-size:13px; }
     .badge { display:inline-flex; border-radius:999px; padding:3px 8px; background:var(--chip); color:#3f3f3f; font-size:12px; font-weight:750; }
+    .workspace-progress { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:10px 12px; border:1px solid var(--line); border-radius:10px; background:var(--panel); }
+    .tab-progress { font-size:12px; font-weight:700; opacity:.88; margin-left:2px; }
     .nav-row { display:flex; justify-content:space-between; gap:8px; align-items:center; margin-bottom:12px; }
     .weak-point { border-left:4px solid var(--accent); padding:12px 14px; background:#f5fbfa; border-radius:8px; line-height:1.7; font-size:18px; font-weight:760; }
     .strategy-tip { margin-top:8px; color:var(--muted); font-size:13px; line-height:1.55; }
@@ -6448,10 +6553,12 @@ REVIEW_HTML = r"""<!doctype html>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
+    const CURRENT_REVIEW_PROMPT_VERSION = "__REVIEW_PROMPT_VERSION__";
     let mode = "selecting";
     let selectionState = {topics: [], selectedTopics: new Set(), loading: false};
     let cardReviewState = freshCardReviewState();
     let dialogueReviewState = freshDialogueReviewState();
+    let reviewPollInFlight = false;
 
     document.addEventListener("click", async (event) => {
       const target = event.target;
@@ -6467,17 +6574,300 @@ REVIEW_HTML = r"""<!doctype html>
       if (target.dataset.weakAction) await commitWeakAction(target.dataset.weakId, target.dataset.weakAction);
       if (target.id === "newReview") exitToSelecting();
       if (target.id === "sendDialogueReview") await sendDialogueReview();
+      if (target.id === "retryCardReview") retryCardReview();
+      if (target.id === "regenerateCardReview") await regenerateCurrentCard();
+      if (target.id === "regenerateCardReviewRun") await regenerateCardReviewRun();
     });
 
-    loadSelection();
-
     function freshCardReviewState() {
-      return {active: false, reviewRunId: "", runStatus: "", cards: [], index: 0, verify: null, results: [], pollTimer: null, topics: [], doneTitle: "", doneMessage: ""};
+      return {active: false, reviewRunId: "", runStatus: "", cards: [], index: 0, verify: null, results: [], pollTimer: null, topics: [], doneTitle: "", doneMessage: "", runStale: false, promptVersion: CURRENT_REVIEW_PROMPT_VERSION, needsReplan: false};
     }
 
     function freshDialogueReviewState() {
-      return {active: false, topics: [], history: [], pendingSuggestions: [], busy: false};
+      return {active: false, reviewRunId: "", topics: [], history: [], pendingSuggestions: [], busy: false};
     }
+
+    let reviewWorkspacePatchTimer = null;
+    const REVIEW_SNAPSHOT_VERSION = 1;
+
+    function buildReviewSnapshot() {
+      return {
+        version: REVIEW_SNAPSHOT_VERSION,
+        promptVersion: CURRENT_REVIEW_PROMPT_VERSION,
+        savedAt: new Date().toISOString(),
+        mode,
+        selectionState: {
+          topics: selectionState.topics,
+          selectedTopics: Array.from(selectionState.selectedTopics || []),
+          overview: selectionState.overview || null,
+          error: selectionState.error || null,
+        },
+        cardReviewState: {
+          active: cardReviewState.active,
+          reviewRunId: cardReviewState.reviewRunId,
+          runStatus: cardReviewState.runStatus,
+          cards: cardReviewState.cards,
+          index: cardReviewState.index,
+          verify: cardReviewState.verify,
+          results: cardReviewState.results,
+          topics: cardReviewState.topics,
+          doneTitle: cardReviewState.doneTitle,
+          doneMessage: cardReviewState.doneMessage,
+          runStale: Boolean(cardReviewState.runStale),
+          promptVersion: cardReviewState.promptVersion || CURRENT_REVIEW_PROMPT_VERSION,
+        },
+        dialogueReviewState: {
+          active: dialogueReviewState.active,
+          reviewRunId: dialogueReviewState.reviewRunId || "",
+          topics: dialogueReviewState.topics,
+          history: dialogueReviewState.history,
+          pendingSuggestions: dialogueReviewState.pendingSuggestions,
+        },
+      };
+    }
+
+    function buildReviewWorkspacePatch() {
+      const snapshot = buildReviewSnapshot();
+      return {
+        promptVersion: snapshot.promptVersion,
+        mode: snapshot.mode,
+        selectionState: snapshot.selectionState,
+        cardReviewState: snapshot.cardReviewState,
+        dialogueReviewState: snapshot.dialogueReviewState,
+      };
+    }
+
+    function getActiveReviewRunId() {
+      if (cardReviewState.reviewRunId) return cardReviewState.reviewRunId;
+      if (dialogueReviewState.reviewRunId) return dialogueReviewState.reviewRunId;
+      return "";
+    }
+
+    function scheduleReviewWorkspacePatch() {
+      const runId = getActiveReviewRunId();
+      if (!runId) return;
+      if (reviewWorkspacePatchTimer) window.clearTimeout(reviewWorkspacePatchTimer);
+      reviewWorkspacePatchTimer = window.setTimeout(async () => {
+        reviewWorkspacePatchTimer = null;
+        try {
+          await fetch(`/api/review/runs/${encodeURIComponent(runId)}/workspace`, {
+            method: "PATCH",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(buildReviewWorkspacePatch()),
+          });
+        } catch {}
+      }, 400);
+    }
+
+    function cancelReviewWorkspacePatch() {
+      if (reviewWorkspacePatchTimer) window.clearTimeout(reviewWorkspacePatchTimer);
+      reviewWorkspacePatchTimer = null;
+    }
+
+    function syncReviewWorkspace(options = {}) {
+      const ws = window.KnowledgeAgentWorkspace;
+      if (!ws) return;
+      ws.replace("review", buildReviewSnapshot());
+      ws.persist();
+      if (options.patch !== false) scheduleReviewWorkspacePatch();
+    }
+
+    function applyServerReviewWorkspace(workspace) {
+      if (!workspace || typeof workspace !== "object") return;
+      applyReviewSnapshot({version: 1, ...workspace});
+    }
+
+    function inferCardPromptVersion(cards) {
+      if (!Array.isArray(cards)) return "";
+      for (const card of cards) {
+        const version = card?.review_prompt?.prompt_version || card?.prompt_version || "";
+        if (version) return version;
+      }
+      return "";
+    }
+
+    function normalizePromptVersion(value) {
+      const text = String(value || "").trim();
+      if (!text || text === "__REVIEW_PROMPT_VERSION__") return "";
+      return text;
+    }
+
+    function resolveSavedPromptVersion(snapshot, cards) {
+      const cardState = snapshot?.cardReviewState || {};
+      return normalizePromptVersion(cardState.promptVersion)
+        || normalizePromptVersion(snapshot?.promptVersion)
+        || inferCardPromptVersion(cards)
+        || CURRENT_REVIEW_PROMPT_VERSION;
+    }
+
+    function migrateReviewSnapshot(snapshot) {
+      if (!snapshot || typeof snapshot !== "object") return null;
+      let version = Number(snapshot.version) || 0;
+      if (version >= REVIEW_SNAPSHOT_VERSION) return snapshot;
+      const next = {...snapshot, version: REVIEW_SNAPSHOT_VERSION};
+      if (version < 1) {
+        if (!next.promptVersion && next.cardReviewState?.promptVersion) {
+          next.promptVersion = next.cardReviewState.promptVersion;
+        }
+      }
+      return next.version === REVIEW_SNAPSHOT_VERSION ? next : null;
+    }
+
+    function applyReviewSnapshot(snapshot) {
+      const migrated = migrateReviewSnapshot(snapshot);
+      if (!migrated) return false;
+      snapshot = migrated;
+      mode = snapshot.mode || "selecting";
+      const sel = snapshot.selectionState || {};
+      selectionState = {
+        topics: Array.isArray(sel.topics) ? sel.topics : [],
+        selectedTopics: new Set(Array.isArray(sel.selectedTopics) ? sel.selectedTopics.filter(Boolean) : []),
+        loading: false,
+        overview: sel.overview || null,
+        error: sel.error || null,
+      };
+      const card = snapshot.cardReviewState || {};
+      const savedPromptVersion = resolveSavedPromptVersion(snapshot, card.cards || []);
+      const savedCards = Array.isArray(card.cards) ? card.cards : [];
+      const staleCardPrompts = Boolean(card.active) && savedCards.length > 0 && savedPromptVersion !== CURRENT_REVIEW_PROMPT_VERSION;
+      const cardTopics = Array.isArray(card.topics) && card.topics.length
+        ? card.topics
+        : Array.from(selectionState.selectedTopics || []);
+      cardReviewState = {
+        ...freshCardReviewState(),
+        active: Boolean(card.active),
+        reviewRunId: staleCardPrompts ? "" : (card.reviewRunId || ""),
+        runStatus: staleCardPrompts ? "" : (card.runStatus || ""),
+        cards: staleCardPrompts ? [] : savedCards,
+        index: staleCardPrompts ? 0 : (Number(card.index) || 0),
+        verify: staleCardPrompts ? null : (card.verify || null),
+        results: staleCardPrompts ? [] : (Array.isArray(card.results) ? card.results : []),
+        topics: cardTopics,
+        doneTitle: staleCardPrompts ? "" : (card.doneTitle || ""),
+        doneMessage: staleCardPrompts ? "" : (card.doneMessage || ""),
+        runStale: staleCardPrompts ? false : Boolean(card.runStale),
+        promptVersion: staleCardPrompts ? CURRENT_REVIEW_PROMPT_VERSION : (savedPromptVersion || CURRENT_REVIEW_PROMPT_VERSION),
+        needsReplan: staleCardPrompts,
+      };
+      const dlg = snapshot.dialogueReviewState || {};
+      dialogueReviewState = {
+        ...freshDialogueReviewState(),
+        active: Boolean(dlg.active),
+        reviewRunId: dlg.reviewRunId || "",
+        topics: Array.isArray(dlg.topics) ? dlg.topics : [],
+        history: Array.isArray(dlg.history) ? dlg.history : [],
+        pendingSuggestions: Array.isArray(dlg.pendingSuggestions) ? dlg.pendingSuggestions : [],
+      };
+      return true;
+    }
+
+    async function refreshSelectionOverview() {
+      const previousSelected = new Set(selectionState.selectedTopics || []);
+      selectionState.loading = true;
+      render();
+      try {
+        const data = await getJson("/api/review/due?limit=50");
+        selectionState.topics = Array.isArray(data.topics) ? data.topics : [];
+        selectionState.overview = data;
+        selectionState.error = null;
+        const validTopics = new Set(selectionState.topics.map((item) => item.topic).filter(Boolean));
+        if (previousSelected.size) {
+          selectionState.selectedTopics = new Set([...previousSelected].filter((topic) => validTopics.has(topic)));
+        } else {
+          selectionState.selectedTopics = new Set([...validTopics]);
+        }
+      } catch (error) {
+        selectionState.error = error.message || String(error);
+      } finally {
+        selectionState.loading = false;
+        render();
+        syncReviewWorkspace({patch: false});
+      }
+    }
+
+    async function resyncCardReviewRun() {
+      const runId = getActiveReviewRunId();
+      if (!runId) return;
+      if (cardReviewState.active && !cardReviewState.reviewRunId) return;
+      if (dialogueReviewState.active && !dialogueReviewState.reviewRunId && !cardReviewState.reviewRunId) return;
+      const beforeCard = currentCard();
+      const beforeCardId = beforeCard?.id || "";
+      const hadUsableCurrent = isCardUsable(beforeCard);
+      try {
+        const data = await getJson(`/api/review/plan/${encodeURIComponent(runId)}`);
+        if (cardReviewState.active && cardReviewState.reviewRunId) {
+          cardReviewState.runStale = false;
+          cardReviewState.runStatus = data.status || "";
+          cardReviewState.promptVersion = data.prompt_version || cardReviewState.promptVersion || CURRENT_REVIEW_PROMPT_VERSION;
+          cardReviewState.cards = mergeCards(cardReviewState.cards, data.cards || []);
+          if (!currentCard() || !isCardViewable(currentCard())) selectFirstUsableCard();
+          if ((data.status || "") !== "done") startPolling();
+          else stopPolling();
+          const afterCard = currentCard();
+          const shouldRender = !hadUsableCurrent || !isCardUsable(afterCard) || beforeCardId !== (afterCard?.id || "");
+          if (mode === "card_review" && shouldRender) renderCardReview();
+        } else if (data.workspace) {
+          applyServerReviewWorkspace(data.workspace);
+        }
+        syncReviewWorkspace({patch: false});
+      } catch (error) {
+        stopPolling();
+        if (cardReviewState.active) {
+          cardReviewState.runStale = true;
+          cardReviewState.runStatus = "stale";
+        }
+        setStatus("服务端 review run 已失效，本地进度仍保留。可继续逐条对照或新建复习。", true);
+        render();
+        syncReviewWorkspace({patch: false});
+      }
+    }
+
+    async function initReviewPage() {
+      const ws = window.KnowledgeAgentWorkspace;
+      if (ws) ws.hydrate();
+      const saved = ws ? ws.get("review") : null;
+      if (saved && saved.version === 1) {
+        stopPolling();
+        applyReviewSnapshot(saved);
+        render();
+        if (cardReviewState.active && cardReviewState.needsReplan) {
+          setStatus("复习题生成规则已更新，正在重新生成本轮卡片...");
+          await startCardReview({force: true, topics: cardReviewState.topics});
+        } else if ((cardReviewState.active && cardReviewState.reviewRunId && !cardReviewState.runStale)
+          || (dialogueReviewState.active && dialogueReviewState.reviewRunId)) {
+          await resyncCardReviewRun();
+        } else if (cardReviewState.active && cardReviewState.reviewRunId && cardReviewState.runStale) {
+          stopPolling();
+        } else if (cardReviewState.active && cardReviewState.runStatus !== "done" && cardReviewState.cards.some((item) => item.status === "pending")) {
+          startPolling();
+        }
+        syncReviewWorkspace({patch: false});
+        await refreshSelectionOverview();
+        return;
+      }
+      await loadSelection();
+    }
+
+    function pauseReviewPage() {
+      stopPolling();
+      cancelReviewWorkspacePatch();
+      syncReviewWorkspace({patch: false});
+    }
+
+    function resumeReviewPage() {
+      if (document.visibilityState === "hidden") return;
+      if (cardReviewState.active && cardReviewState.reviewRunId && !cardReviewState.runStale) {
+        resyncCardReviewRun();
+      }
+    }
+
+    window.addEventListener("pagehide", pauseReviewPage);
+    window.addEventListener("beforeunload", pauseReviewPage);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") pauseReviewPage();
+      else resumeReviewPage();
+    });
+    initReviewPage();
 
     async function loadSelection() {
       mode = "selecting";
@@ -6493,6 +6883,7 @@ REVIEW_HTML = r"""<!doctype html>
       } finally {
         selectionState.loading = false;
         render();
+        syncReviewWorkspace();
       }
     }
 
@@ -6512,7 +6903,7 @@ REVIEW_HTML = r"""<!doctype html>
         `<button type="button" class="tab ${mode === "selecting" ? "active" : ""}" data-tab="selecting">复习总览</button>`
       ];
       if (cardReviewState.active) {
-        tabs.push(`<button type="button" class="tab ${mode === "card_review" ? "active" : ""}" data-tab="card_review">逐条对照 <span class="tab-close" data-close-tab="card_review" title="关闭逐条对照">×</span></button>`);
+        tabs.push(`<button type="button" class="tab ${mode === "card_review" ? "active" : ""}" data-tab="card_review">逐条对照 <span class="tab-progress">${escapeHtml(cardProgressSummary())}</span> <span class="tab-close" data-close-tab="card_review" title="关闭逐条对照">×</span></button>`);
       }
       if (dialogueReviewState.active) {
         tabs.push(`<button type="button" class="tab ${mode === "dialogue_review" ? "active" : ""}" data-tab="dialogue_review">对话复查 <span class="tab-close" data-close-tab="dialogue_review" title="关闭对话复查">×</span></button>`);
@@ -6526,14 +6917,17 @@ REVIEW_HTML = r"""<!doctype html>
       if (!["selecting", "card_review", "dialogue_review"].includes(tab)) return;
       mode = tab;
       render();
+      syncReviewWorkspace();
     }
 
     function closeReviewTab(tab, event) {
       event?.stopPropagation?.();
       if (tab === "card_review") {
-        const total = cardReviewState.cards.length + cardReviewState.results.length;
-        const done = cardReviewState.results.length;
-        const message = `你在这轮逐条对照里已处理 ${done}/${total || 0} 条，确定结束？`;
+        const total = cardReviewState.cards.length;
+        const done = cardReviewState.cards.filter(isCardCompleted).length;
+        const message = total
+          ? `你在这轮逐条对照里已完成 ${done} / 共 ${total} 题，确定结束？`
+          : "确定结束逐条对照？";
         if (!window.confirm(message)) return;
         stopPolling();
         cardReviewState = freshCardReviewState();
@@ -6545,12 +6939,15 @@ REVIEW_HTML = r"""<!doctype html>
         if (mode === "dialogue_review") mode = "selecting";
       }
       render();
+      syncReviewWorkspace();
     }
 
     function renderSelecting() {
       const selectedCount = selectionState.selectedTopics.size;
-      const dueCount = selectionState.overview?.due_count || 0;
-      const overdueCount = selectionState.overview?.overdue_count || 0;
+      const dueCount = selectionState.overview?.candidate_count || selectionState.overview?.due_count || 0;
+      const recommendedCount = selectionState.overview?.recommended_count || 0;
+      const neverReviewedCount = selectionState.overview?.never_reviewed_count || 0;
+      const recentCount = selectionState.overview?.recent_count || 0;
       const strategyCount = selectionState.overview?.strategy_due_count || 0;
       const disabled = selectedCount === 0 || selectionState.loading;
       const topicsHtml = selectionState.topics.length
@@ -6559,24 +6956,26 @@ REVIEW_HTML = r"""<!doctype html>
             const selected = selectionState.selectedTopics.has(topic);
             return `<button type="button" class="topic-chip ${selected ? "" : "unselected"}" data-topic-toggle="${escapeHtml(topic)}">
               <span class="name">${escapeHtml(topic)}</span>
-              <span class="count">${escapeHtml(item.due || 0)} 到期</span>
+              <span class="count">${reviewTopicLabel(item)}</span>
             </button>`;
           }).join("")}</div>`
-        : `<div class="empty">暂无到期知识弱项。可以先完成一次面试并结束 session 后再回来复习。</div>`;
+        : `<div class="empty">暂无可复习知识弱项。可以先完成一次面试并结束 session 后再回来复习。</div>`;
       const workspaceHtml = renderWorkspaceSummary();
       $("selectPanel").innerHTML = `
         <div class="page-head">
           <div>
             <h2>选择本轮复习范围</h2>
-            <p>默认全选所有到期 topic。进入逐条对照或对话复查后，本轮范围会固定。</p>
+            <p>默认全选所有建议复查 topic。进入逐条对照或对话复查后，本轮范围会固定。</p>
           </div>
         </div>
         <div class="overview-line">
-          <span>知识弱项 ${escapeHtml(dueCount)} 个到期</span>
-          <span>逾期 ${escapeHtml(overdueCount)} 个</span>
-          ${strategyCount ? `<span>策略弱项 ${escapeHtml(strategyCount)} 个需在面试中训练</span>` : ""}
+          <span>知识弱项 ${escapeHtml(dueCount)} 个可复习</span>
+          <span>未复查 ${escapeHtml(neverReviewedCount)} 个</span>
+          <span>建议复查 ${escapeHtml(recommendedCount)} 个</span>
+          <span>最近确认 ${escapeHtml(recentCount)} 个</span>
+          ${strategyCount ? `<span>策略弱项 ${escapeHtml(strategyCount)} 个建议在面试中训练</span>` : ""}
         </div>
-        <div id="status" class="status ${selectionState.error ? "error" : ""}">${selectionState.loading ? "正在加载到期 topic..." : escapeHtml(selectionState.error || selectionState.overview?.summary || "")}</div>
+        <div id="status" class="status ${selectionState.error ? "error" : ""}">${selectionState.loading ? "正在加载建议复查 topic..." : escapeHtml(selectionState.error || selectionState.overview?.summary || "")}</div>
         <div class="actions">
           <button id="selectAllTopics" class="secondary" type="button">全选</button>
           <button id="clearTopics" class="secondary" type="button">清空</button>
@@ -6594,7 +6993,7 @@ REVIEW_HTML = r"""<!doctype html>
     function renderWorkspaceSummary() {
       const items = [];
       if (cardReviewState.active) {
-        items.push(`<div class="empty"><strong>逐条对照进行中</strong> (${escapeHtml(cardProgressSummary())})</div>`);
+        items.push(`<div class="workspace-progress"><strong>逐条对照进行中</strong><span class="badge">${escapeHtml(cardProgressSummary())}</span></div>`);
       }
       if (dialogueReviewState.active) {
         items.push(`<div class="empty"><strong>对话复查进行中</strong> (已聊 ${escapeHtml(dialogueRoundCount())} 轮)</div>`);
@@ -6602,21 +7001,41 @@ REVIEW_HTML = r"""<!doctype html>
       return items.length ? `<div style="display:grid;gap:8px;margin-top:12px">${items.join("")}</div>` : "";
     }
 
+    function reviewTopicLabel(item) {
+      const values = [];
+      const neverReviewed = Number(item.never_reviewed_count || 0);
+      const recommended = Number(item.recommended_count || 0);
+      const recent = Number(item.recent_count || 0);
+      if (neverReviewed) values.push(`未复查 ${neverReviewed}`);
+      if (recommended) values.push(`建议复查 ${recommended}`);
+      if (recent) values.push(`最近确认 ${recent}`);
+      return escapeHtml(values.join(" · ") || `${item.candidate_count || item.due || 0} 可复习`);
+    }
+
+    function reviewStateLabel(state) {
+      if (state === "never_reviewed") return "未复查";
+      if (state === "recent") return "最近确认";
+      return "建议复查";
+    }
+
     function toggleTopic(topic) {
       if (!topic) return;
       if (selectionState.selectedTopics.has(topic)) selectionState.selectedTopics.delete(topic);
       else selectionState.selectedTopics.add(topic);
       renderSelecting();
+      syncReviewWorkspace();
     }
 
     function selectAllTopics() {
       selectionState.selectedTopics = new Set(selectionState.topics.map((item) => item.topic).filter(Boolean));
       renderSelecting();
+      syncReviewWorkspace();
     }
 
     function clearTopics() {
       selectionState.selectedTopics = new Set();
       renderSelecting();
+      syncReviewWorkspace();
     }
 
     function selectedTopics() {
@@ -6624,51 +7043,61 @@ REVIEW_HTML = r"""<!doctype html>
     }
 
     function cardProgressSummary() {
-      const total = cardReviewState.cards.length + cardReviewState.results.length;
-      const done = cardReviewState.results.length;
+      const total = cardReviewState.cards.length;
+      const done = cardReviewState.cards.filter(isCardCompleted).length;
       if (cardReviewState.doneTitle) return cardReviewState.doneTitle;
-      if (!total) return "正在准备";
-      return `${done}/${total} 条`;
+      if (!total) return "准备中";
+      return `已完成 ${done} / 共 ${total}`;
     }
 
     function dialogueRoundCount() {
       return Math.floor((dialogueReviewState.history || []).length / 2);
     }
 
-    async function startCardReview() {
-      if (cardReviewState.active) {
+    async function startCardReview(options = {}) {
+      const force = Boolean(options.force);
+      if (cardReviewState.active && !force) {
         mode = "card_review";
         render();
+        syncReviewWorkspace();
         return;
       }
-      const topics = selectedTopics();
+      const topics = Array.isArray(options.topics) && options.topics.length ? options.topics : selectedTopics();
       if (!topics.length) return;
+      stopPolling();
       mode = "card_review";
-      cardReviewState = {...freshCardReviewState(), active: true, topics};
+      cardReviewState = {...freshCardReviewState(), active: true, topics, promptVersion: CURRENT_REVIEW_PROMPT_VERSION};
       render();
-      setStatus("正在创建逐条对照本轮题目...");
+      syncReviewWorkspace();
+      setStatus(force ? "正在按最新规则重新生成逐条对照题目..." : "正在创建逐条对照本轮题目...");
       try {
-        const data = await postJson("/api/review/plan", {topics, limit: 12, max_strategy_constraints: 2});
+        const data = await postJson("/api/review/plan", {topics, limit: 12, max_strategy_constraints: 2, force_regenerate: force});
         cardReviewState.reviewRunId = data.review_run_id || "";
         cardReviewState.runStatus = data.status || "";
+        cardReviewState.runStale = false;
+        cardReviewState.promptVersion = data.prompt_version || CURRENT_REVIEW_PROMPT_VERSION;
         cardReviewState.cards = data.cards || [];
         if (!cardReviewState.cards.length) {
           cardReviewState.doneTitle = "暂无可复习卡片";
-          cardReviewState.doneMessage = data.summary || "所选 topic 当前没有到期知识弱项。";
+          cardReviewState.doneMessage = data.summary || "所选 topic 当前没有可复习知识弱项。";
           renderCardReview();
+          syncReviewWorkspace();
           return;
         }
         selectFirstUsableCard();
         renderCardReview();
         startPolling();
+        syncReviewWorkspace();
       } catch (error) {
         setStatus(error.message || String(error), true);
+        syncReviewWorkspace();
       }
     }
 
     function startPolling() {
       stopPolling();
-      if (!cardReviewState.reviewRunId) return;
+      if (!cardReviewState.reviewRunId || cardReviewState.runStale) return;
+      if (document.visibilityState === "hidden") return;
       cardReviewState.pollTimer = window.setInterval(pollReviewRun, 1200);
       pollReviewRun();
     }
@@ -6679,7 +7108,10 @@ REVIEW_HTML = r"""<!doctype html>
     }
 
     async function pollReviewRun() {
-      if (!cardReviewState.reviewRunId || !cardReviewState.active) return;
+      if (!cardReviewState.reviewRunId || !cardReviewState.active || cardReviewState.runStale) return;
+      if (document.visibilityState === "hidden") return;
+      if (reviewPollInFlight) return;
+      reviewPollInFlight = true;
       try {
         const beforeCard = currentCard();
         const beforeCardId = beforeCard?.id || "";
@@ -6687,7 +7119,7 @@ REVIEW_HTML = r"""<!doctype html>
         const data = await getJson(`/api/review/plan/${encodeURIComponent(cardReviewState.reviewRunId)}`);
         cardReviewState.runStatus = data.status || "";
         cardReviewState.cards = mergeCards(cardReviewState.cards, data.cards || []);
-        if (!currentCard() || !isCardUsable(currentCard())) selectFirstUsableCard();
+        if (!currentCard() || !isCardViewable(currentCard())) selectFirstUsableCard();
         const afterCard = currentCard();
         const shouldRender = !hadUsableCurrent || beforeCardId !== (afterCard?.id || "");
         if (mode === "card_review" && shouldRender) renderCardReview();
@@ -6697,9 +7129,15 @@ REVIEW_HTML = r"""<!doctype html>
         const failed = data.failed_count || 0;
         if (mode === "card_review" && (ready || failed)) setStatus(`已准备 ${ready} 题，待生成 ${pending} 题${failed ? `，失败 ${failed} 题` : ""}。`);
         if ((data.status || "") === "done") stopPolling();
+        syncReviewWorkspace({patch: false});
       } catch (error) {
         stopPolling();
+        cardReviewState.runStale = true;
+        cardReviewState.runStatus = "stale";
         setStatus(error.message || String(error), true);
+        syncReviewWorkspace({patch: false});
+      } finally {
+        reviewPollInFlight = false;
       }
     }
 
@@ -6720,8 +7158,8 @@ REVIEW_HTML = r"""<!doctype html>
         `;
         return;
       }
-      if (!isCardUsable(card)) {
-        const ready = cardReviewState.cards.filter(isCardUsable).length;
+      if (!isCardViewable(card)) {
+        const ready = cardReviewState.cards.filter(isCardPending).length;
         const pending = cardReviewState.cards.filter((item) => item.status === "pending").length;
         $("cardPanel").innerHTML = `
           <div class="page-head"><div><h2>逐条对照</h2><p>范围：${escapeHtml(topicLine)}</p></div></div>
@@ -6730,9 +7168,15 @@ REVIEW_HTML = r"""<!doctype html>
         `;
         return;
       }
+      if (isCardCompleted(card)) {
+        renderCompletedCardReview(card, topicLine);
+        return;
+      }
       const promptPayload = card.review_prompt || null;
       const promptText = promptPayload?.prompt || "正在生成复习题...";
       const promptReady = Boolean(promptPayload?.prompt);
+      const verifyActive = Boolean(cardReviewState.verify);
+      const answerValue = card.last_answer || "";
       $("cardPanel").innerHTML = `
         <div class="page-head"><div><h2>逐条对照</h2><p>范围：${escapeHtml(topicLine)}</p></div></div>
         <div id="status" class="status">${escapeHtml(card.topic || "未分类")} · ${topicProgress(card)}</div>
@@ -6743,11 +7187,119 @@ REVIEW_HTML = r"""<!doctype html>
         </div>
         <div class="weak-point">${escapeHtml(promptText)}</div>
         ${promptPayload?.hint ? `<div class="meta">提示：${escapeHtml(promptPayload.hint)}</div>` : ""}
-        <textarea id="reviewAnswer" style="margin-top:14px" placeholder="先凭记忆回答，再提交对照。"></textarea>
+        <textarea id="reviewAnswer" style="margin-top:14px" placeholder="先凭记忆回答，再提交对照。" ${verifyActive ? "disabled" : ""}>${escapeHtml(answerValue)}</textarea>
         ${renderStrategyConstraints(card.strategy_constraints || [])}
-        <div class="actions"><button id="submitVerify" type="button" ${promptReady ? "" : "disabled"}>提交</button></div>
+        <div class="actions">
+          <button id="submitVerify" type="button" ${promptReady && !verifyActive ? "" : "disabled"}>提交</button>
+          <button id="regenerateCardReview" class="secondary" type="button">重新生成本题</button>
+          <button id="regenerateCardReviewRun" class="secondary" type="button">重新生成本轮</button>
+        </div>
         <div id="verifyResult" class="result hidden"></div>
       `;
+      if (cardReviewState.verify) renderVerifyResult(cardReviewState.verify);
+    }
+
+    function renderCompletedCardReview(card, topicLine) {
+      const promptPayload = card.review_prompt || null;
+      const promptText = promptPayload?.prompt || card.point || "";
+      const verify = card.last_verify || null;
+      const confirmed = card.confirmed_weak_points || {};
+      const actionSummary = Object.entries(confirmed).map(([id, action]) => {
+        const label = action === "improve" ? "已确认改善" : "还要再练";
+        return `<li>${escapeHtml(label)} · ${escapeHtml(id)}</li>`;
+      }).join("");
+      $("cardPanel").innerHTML = `
+        <div class="page-head"><div><h2>逐条对照</h2><p>范围：${escapeHtml(topicLine)}</p></div></div>
+        <div id="status" class="status">${escapeHtml(card.topic || "未分类")} · ${topicProgress(card)} · 已完成</div>
+        <div class="nav-row">
+          <button class="secondary" type="button" data-nav="-1" aria-label="上一条">←</button>
+          <span class="badge">第 ${cardReviewState.index + 1} / ${cardReviewState.cards.length} 题</span>
+          <button class="secondary" type="button" data-nav="1" aria-label="下一条">→</button>
+        </div>
+        <div class="weak-point">${escapeHtml(promptText)}</div>
+        ${promptPayload?.hint ? `<div class="meta">提示：${escapeHtml(promptPayload.hint)}</div>` : ""}
+        <div class="meta" style="margin-top:14px">你的回答</div>
+        <div class="result compact" style="margin-top:6px"><p>${escapeHtml(card.last_answer || "")}</p></div>
+        <div class="result compact" style="margin-top:12px">${renderReferenceAnswer(cardReferenceAnswer(card))}</div>
+        ${verify ? renderCompletedVerifySummary(verify) : ""}
+        ${actionSummary ? `<ul class="meta">${actionSummary}</ul>` : ""}
+        <div class="actions">
+          <button id="retryCardReview" class="secondary" type="button">重新回答</button>
+          <button id="regenerateCardReview" class="secondary" type="button">重新生成本题</button>
+          <button id="regenerateCardReviewRun" class="secondary" type="button">重新生成本轮</button>
+        </div>
+      `;
+    }
+
+    function renderCompletedVerifySummary(result) {
+      const correct = firstText(result.correct || [], "方向基本正确。");
+      const missedValues = [].concat(Array.isArray(result.missed) ? result.missed : []).concat(Array.isArray(result.strategy_feedback) ? result.strategy_feedback : []).filter(Boolean);
+      const missed = firstText(missedValues, "没有明显遗漏。");
+      const example = result.example || result.feedback || result.overall || "暂无示例。";
+      return `
+        <div class="result compact" style="margin-top:12px">
+          <p>✓ ${escapeHtml(correct)}</p>
+          <p>⚠ ${escapeHtml(missed)}</p>
+          <p><strong>示例：</strong><br>${escapeHtml(example)}</p>
+          ${renderCitations(result.citations || [])}
+        </div>
+      `;
+    }
+
+    function retryCardReview() {
+      const card = currentCard();
+      if (!card || !isCardCompleted(card)) return;
+      card.review_completed = false;
+      card.last_answer = "";
+      card.last_verify = null;
+      card.confirmed_weak_points = {};
+      cardReviewState.verify = null;
+      cardReviewState.doneTitle = "";
+      cardReviewState.doneMessage = "";
+      renderCardReview();
+      syncReviewWorkspace();
+      setStatus("已重置本题，可以重新作答。");
+    }
+
+    async function regenerateCardReviewRun() {
+      const topics = cardReviewState.topics && cardReviewState.topics.length ? cardReviewState.topics : selectedTopics();
+      if (!topics.length) return;
+      if (!window.confirm("将按最新规则重新生成本轮所有卡片，当前本轮作答和反馈会清空。继续？")) return;
+      await startCardReview({force: true, topics});
+    }
+
+    async function regenerateCurrentCard() {
+      const card = currentCard();
+      if (!card || !cardReviewState.reviewRunId) return;
+      if (!window.confirm("将按最新规则重新生成当前题目，当前本题作答和反馈会清空。继续？")) return;
+      setBusy(true, "正在重新生成当前题目...");
+      try {
+        const cardId = card.id || card.card_id;
+        card.status = "pending";
+        card.cache_hit = false;
+        delete card.review_prompt;
+        delete card.question_blocks;
+        delete card.reference_answer;
+        delete card.last_answer;
+        delete card.last_verify;
+        delete card.confirmed_weak_points;
+        card.review_completed = false;
+        cardReviewState.verify = null;
+        renderCardReview();
+        const data = await postJson(`/api/review/plan/${encodeURIComponent(cardReviewState.reviewRunId)}/cards/${encodeURIComponent(cardId)}/regenerate`, {});
+        cardReviewState.runStatus = data.status || "";
+        cardReviewState.cards = mergeCards(cardReviewState.cards, data.cards || []);
+        const nextIndex = cardReviewState.cards.findIndex((item) => (item.id || item.card_id) === cardId);
+        if (nextIndex >= 0) cardReviewState.index = nextIndex;
+        startPolling();
+        renderCardReview();
+        syncReviewWorkspace();
+        setStatus("当前题目正在重新生成，准备好后会自动显示。");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
     }
 
     function renderVerifyResult(result) {
@@ -6755,6 +7307,21 @@ REVIEW_HTML = r"""<!doctype html>
       if (!node) return;
       node.classList.remove("hidden");
       node.className = "result compact";
+      const referenceAnswer = result.reference_answer || result.referenceAnswer || cardReferenceAnswer(currentCard());
+      if (result.loading) {
+        node.innerHTML = `
+          ${renderReferenceAnswer(referenceAnswer)}
+          <p>正在根据你的回答生成对照反馈...</p>
+        `;
+        return;
+      }
+      if (result.error) {
+        node.innerHTML = `
+          ${renderReferenceAnswer(referenceAnswer)}
+          <p class="danger-text">反馈生成失败：${escapeHtml(result.error)}</p>
+        `;
+        return;
+      }
       const correct = firstText(result.correct || [], "方向基本正确。");
       const missedValues = [].concat(Array.isArray(result.missed) ? result.missed : []).concat(Array.isArray(result.strategy_feedback) ? result.strategy_feedback : []).filter(Boolean);
       const missed = firstText(missedValues, "没有明显遗漏。");
@@ -6765,6 +7332,7 @@ REVIEW_HTML = r"""<!doctype html>
         ? result.weak_results
         : fallbackWeakIds.map((id) => ({weak_point_id: id, point: id, suggested_action: "retry", reason: result.feedback || result.overall || ""}));
       node.innerHTML = `
+        ${renderReferenceAnswer(referenceAnswer)}
         <p>✓ ${escapeHtml(correct)}</p>
         <p>⚠ ${escapeHtml(missed)}</p>
         <p><strong>示例：</strong><br>${escapeHtml(example)}</p>
@@ -6783,11 +7351,29 @@ REVIEW_HTML = r"""<!doctype html>
       `;
     }
 
+    function cardReferenceAnswer(card) {
+      if (!card) return "";
+      return card.reference_answer || card.review_prompt?.reference_answer || "";
+    }
+
+    function renderReferenceAnswer(referenceAnswer) {
+      const text = String(referenceAnswer || "").trim();
+      if (!text) return `<p><strong>参考回答：</strong><br>暂无参考回答。</p>`;
+      return `<p><strong>参考回答：</strong><br>${escapeHtml(text)}</p>`;
+    }
+
     async function submitVerify() {
       const card = currentCard();
       const answer = $("reviewAnswer")?.value.trim() || "";
       if (!answer) { setStatus("请先写下你的理解。", true); return; }
       setBusy(true, "正在对照笔记纠偏...");
+      card.last_answer = answer;
+      cardReviewState.verify = {
+        loading: true,
+        reference_answer: cardReferenceAnswer(card),
+      };
+      renderCardReview();
+      syncReviewWorkspace();
       try {
         const prompt = card.review_prompt?.prompt || card.point || "";
         const weakPointIds = Array.isArray(card.weak_point_ids) && card.weak_point_ids.length ? card.weak_point_ids : [card.id];
@@ -6799,10 +7385,17 @@ REVIEW_HTML = r"""<!doctype html>
           prompt,
           question_blocks: card.question_blocks || card.review_prompt?.question_blocks || [],
         });
-        cardReviewState.verify = result;
+        cardReviewState.verify = {...result, reference_answer: cardReferenceAnswer(card)};
         renderVerifyResult(result);
-        setStatus("纠偏完成。确认改善或继续练习后会进入下一条。");
+        setStatus("纠偏完成。确认改善或继续练习后可保留本题反馈，并进入下一题。");
+        syncReviewWorkspace();
       } catch (error) {
+        cardReviewState.verify = {
+          loading: false,
+          reference_answer: cardReferenceAnswer(card),
+          error: error.message || String(error),
+        };
+        renderVerifyResult(cardReviewState.verify);
         setStatus(error.message || String(error), true);
       } finally {
         setBusy(false);
@@ -6822,19 +7415,21 @@ REVIEW_HTML = r"""<!doctype html>
         const expected = Array.isArray(card.weak_point_ids) && card.weak_point_ids.length ? card.weak_point_ids : [card.id];
         const allDone = expected.every((id) => card.confirmed_weak_points[id]);
         if (allDone) {
-          cardReviewState.cards.splice(cardReviewState.index, 1);
+          card.last_answer = card.last_answer || ($("reviewAnswer")?.value.trim() || "");
+          card.last_verify = cardReviewState.verify;
+          card.review_completed = true;
           cardReviewState.verify = null;
-          if (cardReviewState.index >= cardReviewState.cards.length) cardReviewState.index = 0;
-          if (!cardReviewState.cards.length) {
-            cardReviewState.doneTitle = "本轮复习完成";
-            cardReviewState.doneMessage = result.message || "已处理所有卡片。";
-            renderCardReview();
+          if (cardReviewState.cards.every(isCardCompleted)) {
+            setStatus("本轮已全部完成，可左右切换回看各题。");
+          } else {
+            setStatus("本题已完成，可回看反馈或用 → 进入下一题。");
           }
-          else renderCardReview();
+          renderCardReview();
         } else if (cardReviewState.verify) {
           renderVerifyResult(cardReviewState.verify);
         }
         setStatus(action === "improve" ? "已确认该弱项改善。" : "已标记该弱项继续练习。");
+        syncReviewWorkspace();
       } catch (error) {
         setStatus(error.message || String(error), true);
       } finally {
@@ -6846,6 +7441,7 @@ REVIEW_HTML = r"""<!doctype html>
       if (dialogueReviewState.active) {
         mode = "dialogue_review";
         render();
+        syncReviewWorkspace();
         return;
       }
       const topics = selectedTopics();
@@ -6853,7 +7449,17 @@ REVIEW_HTML = r"""<!doctype html>
       mode = "dialogue_review";
       dialogueReviewState = {...freshDialogueReviewState(), active: true, topics};
       render();
-      await sendDialogueReview("请开始本轮对话复查。先从选中 topic 的到期弱项中选择一个最适合开始的点，直接提出第一题。", true);
+      syncReviewWorkspace();
+      try {
+        const data = await postJson("/api/review/dialogue/sessions", {topics});
+        dialogueReviewState.reviewRunId = data.review_run_id || "";
+        if (data.workspace) applyServerReviewWorkspace(data.workspace);
+        syncReviewWorkspace();
+        await sendDialogueReview("请开始本轮对话复查。先从选中 topic 的建议复查弱项中选择一个最适合开始的点，直接提出第一题。", true);
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+        syncReviewWorkspace();
+      }
     }
 
     function renderDialogueReview() {
@@ -7020,6 +7626,7 @@ REVIEW_HTML = r"""<!doctype html>
       } finally {
         dialogueReviewState.busy = false;
         renderDialogueReview();
+        syncReviewWorkspace();
       }
     }
 
@@ -7027,6 +7634,7 @@ REVIEW_HTML = r"""<!doctype html>
       mode = "selecting";
       $("donePanel").classList.add("hidden");
       render();
+      syncReviewWorkspace();
     }
 
     function renderDone(title, message) {
@@ -7037,11 +7645,34 @@ REVIEW_HTML = r"""<!doctype html>
       $("selectPanel").classList.add("hidden");
       $("cardPanel").classList.add("hidden");
       $("dialoguePanel").classList.add("hidden");
+      syncReviewWorkspace();
     }
 
     function mergeCards(previous, next) {
       const byId = new Map((previous || []).map((card) => [card.id, card]));
-      for (const card of next || []) byId.set(card.id, {...(byId.get(card.id) || {}), ...card});
+      for (const card of next || []) {
+        const local = byId.get(card.id) || {};
+        const serverPrompt = card.review_prompt;
+        const localPrompt = local.review_prompt;
+        const review_prompt = (serverPrompt?.prompt ? serverPrompt : null)
+          || (localPrompt?.prompt ? localPrompt : null)
+          || serverPrompt
+          || localPrompt
+          || null;
+        const status = review_prompt?.prompt
+          ? (card.status === "failed" ? "failed" : "ready")
+          : (card.status || local.status || "pending");
+        byId.set(card.id, {
+          ...local,
+          ...card,
+          status,
+          review_prompt,
+          review_completed: Boolean(local.review_completed),
+          last_answer: local.last_answer || "",
+          last_verify: local.last_verify || null,
+          confirmed_weak_points: local.confirmed_weak_points || {},
+        });
+      }
       return (next || []).map((card) => byId.get(card.id) || card);
     }
 
@@ -7050,19 +7681,27 @@ REVIEW_HTML = r"""<!doctype html>
       let nextIndex = cardReviewState.index;
       for (let offset = 0; offset < cardReviewState.cards.length; offset += 1) {
         nextIndex = (nextIndex + delta + cardReviewState.cards.length) % cardReviewState.cards.length;
-        if (isCardUsable(cardReviewState.cards[nextIndex])) break;
+        if (isCardViewable(cardReviewState.cards[nextIndex])) break;
       }
       cardReviewState.index = nextIndex;
-      cardReviewState.verify = null;
+      const nextCard = currentCard();
+      cardReviewState.verify = isCardCompleted(nextCard) ? null : cardReviewState.verify;
       renderCardReview();
+      syncReviewWorkspace();
     }
 
     function isCardUsable(card) { return Boolean(card && card.review_prompt && card.review_prompt.prompt); }
+    function isCardCompleted(card) { return Boolean(card && card.review_completed); }
+    function isCardPending(card) { return isCardUsable(card) && !isCardCompleted(card); }
+    function isCardViewable(card) { return Boolean(card && (isCardPending(card) || isCardCompleted(card) || card.status === "pending" || card.status === "failed")); }
     function currentCard() { return cardReviewState.cards[cardReviewState.index] || null; }
     function selectFirstUsableCard() {
-      if (isCardUsable(currentCard())) return true;
-      const index = cardReviewState.cards.findIndex(isCardUsable);
+      if (isCardViewable(currentCard())) return true;
+      if (isCardPending(currentCard())) return true;
+      const index = cardReviewState.cards.findIndex(isCardPending);
       if (index >= 0) { cardReviewState.index = index; return true; }
+      const completedIndex = cardReviewState.cards.findIndex(isCardCompleted);
+      if (completedIndex >= 0) { cardReviewState.index = completedIndex; return true; }
       return false;
     }
     function topicProgress(card) {
@@ -8285,14 +8924,33 @@ CHAT_HTML = r"""<!doctype html>
     let currentInterviewPlanSignature = "";
     let currentInterviewState = null;
     let currentInterviewSessionId = "";
+    let currentAnswerSessionId = "";
     let currentConversationSignature = "";
     let lastContextItems = [];
     let sessionContextState = {scope: null, stats: null, references: [], interviewPlan: null, profileDebug: null, trace: []};
     let currentTurnTrace = {directorNoteInjected: false};
     let currentProcess = createAgentProcessState();
-    const activeInterviewSessionKey = "knowledge_agent.active_interview_session_id";
     const activeAnswerTaskKey = "knowledge_agent.active_answer_task_id";
+    let pendingAnswerTurn = null;
     let sessionContextPanelOpen = false;
+
+    (function initChatWorkspace() {
+      const ws = window.KnowledgeAgentWorkspace;
+      if (ws) {
+        ws.hydrate();
+        ws.migrateLegacyChat();
+        const chat = ws.get("chat") || {};
+        if (chat.activeInterviewSessionId) currentInterviewSessionId = chat.activeInterviewSessionId;
+        if (chat.activeAnswerSessionId) currentAnswerSessionId = chat.activeAnswerSessionId;
+        if (chat.scope) {
+          if (chat.scope.scopeType) $("scopeType").value = chat.scope.scopeType;
+          if (typeof chat.scope.scopeValue === "string") $("scopeValue").value = chat.scope.scopeValue;
+          if (typeof chat.scope.strictEvidence === "boolean") $("strictEvidence").checked = chat.scope.strictEvidence;
+        }
+        if (chat.pendingTurn) pendingAnswerTurn = {...chat.pendingTurn};
+        if (chat.activeAnswerTaskId) sessionStorage.setItem(activeAnswerTaskKey, chat.activeAnswerTaskId);
+      }
+    })();
 
     applyInitialChatMode();
     currentConversationSignature = conversationSignature();
@@ -8309,8 +8967,41 @@ CHAT_HTML = r"""<!doctype html>
     $("chatMode").addEventListener("change", handleChatModeChange);
     ["scopeType", "scopeValue", "strictEvidence"].forEach((id) => $(id).addEventListener("change", resetConversationIfNeeded));
     restoreActiveInterviewSession();
+    restoreAnswerWorkspace();
     restoreActiveAnswerTask();
     loadReviewNotice();
+    window.addEventListener("beforeunload", () => {
+      if ($("chatMode").value === "answer") syncChatWorkspace();
+    });
+
+    function buildChatWorkspaceSlice(overrides = {}) {
+      return {
+        version: 1,
+        activeInterviewSessionId: currentInterviewSessionId || "",
+        activeAnswerSessionId: currentAnswerSessionId || "",
+        scope: {
+          scopeType: $("scopeType").value,
+          scopeValue: $("scopeValue").value,
+          strictEvidence: $("strictEvidence").checked,
+        },
+        pendingTurn: pendingAnswerTurn ? {...pendingAnswerTurn} : null,
+        activeAnswerTaskId: sessionStorage.getItem(activeAnswerTaskKey) || pendingAnswerTurn?.taskId || "",
+        ...overrides,
+      };
+    }
+
+    function syncChatWorkspace(overrides = {}) {
+      const ws = window.KnowledgeAgentWorkspace;
+      if (!ws) return;
+      const slice = buildChatWorkspaceSlice(overrides);
+      if (slice.activeAnswerTaskId) {
+        sessionStorage.setItem(activeAnswerTaskKey, slice.activeAnswerTaskId);
+      } else {
+        sessionStorage.removeItem(activeAnswerTaskKey);
+      }
+      ws.replace("chat", slice);
+      ws.persist();
+    }
 
     function applyInitialChatMode() {
       const params = new URLSearchParams(window.location.search);
@@ -8353,7 +9044,8 @@ CHAT_HTML = r"""<!doctype html>
       currentInterviewPlanSignature = "";
       currentInterviewState = null;
       currentInterviewSessionId = "";
-      localStorage.removeItem(activeInterviewSessionKey);
+      currentAnswerSessionId = "";
+      syncChatWorkspace({activeInterviewSessionId: "", activeAnswerSessionId: ""});
       lastContextItems = [];
       sessionContextPanelOpen = false;
       resetSessionContext();
@@ -8367,6 +9059,10 @@ CHAT_HTML = r"""<!doctype html>
       const query = $("query").value.trim();
       if (!query) return;
       resetConversationIfNeeded();
+      if ($("chatMode").value === "answer") {
+        pendingAnswerTurn = {query, taskId: null, status: "running"};
+        syncChatWorkspace();
+      }
       appendUserMessage(query);
       $("query").value = "";
       currentAssistant = appendAssistantMessage("");
@@ -8390,6 +9086,9 @@ CHAT_HTML = r"""<!doctype html>
               interview_state: body.interview_state || {}
             });
           }
+        } else if ($("chatMode").value === "answer") {
+          await ensureAnswerSession();
+          body.session_id = currentAnswerSessionId;
         }
         const streamResult = await streamAgentAnswerWithRetry(body);
         turnIds = streamResult?.turnIds || null;
@@ -8398,19 +9097,27 @@ CHAT_HTML = r"""<!doctype html>
           const assistantNode = currentAssistant;
           renderAssistantExtras();
           const shouldReview = $("chatMode").value === "interview" && shouldRequestTurnSummary(query, answerText);
-          chatHistory.push({role:"user", content:query});
-          chatHistory.push({role:"assistant", content:answerText});
-          trimChatHistory();
           if ($("chatMode").value === "interview") {
+            chatHistory.push({role:"user", content:query});
+            chatHistory.push({role:"assistant", content:answerText});
+            trimChatHistory();
             const stateChange = isServerInterviewState() ? null : updateInterviewState(query, answerText);
             recordInterviewStateTrace(stateChange);
             renderInterviewDirectionBar();
             if (shouldReview && turnIds) runTurnReviewInBackground(answerText, turnIds, assistantNode);
+          } else {
+            pendingAnswerTurn = null;
+            await reloadAnswerSessionFromServer();
           }
         }
         setBusy(false, "就绪");
       } catch (error) {
         currentPayload.errors.push(error.message);
+        if ($("chatMode").value === "answer" && pendingAnswerTurn) {
+          pendingAnswerTurn.status = "failed";
+          pendingAnswerTurn.error = error.message;
+          syncChatWorkspace();
+        }
         if (currentAssistant) {
           currentAssistant.querySelector(".answer").innerHTML += `<p class="error">${escapeHtml(error.message)}</p>`;
           if (error.retryable !== false) attachRegenerateButton(currentAssistant, query, turnIds);
@@ -8430,7 +9137,7 @@ CHAT_HTML = r"""<!doctype html>
         chat_history: chatHistory.slice(-12),
         interview_plan: $("chatMode").value === "interview" && currentInterviewPlanSignature === conversationSignature() ? currentInterviewPlan : null,
         interview_state: $("chatMode").value === "interview" ? currentInterviewState : null,
-        session_id: $("chatMode").value === "interview" ? currentInterviewSessionId : null,
+        session_id: $("chatMode").value === "interview" ? currentInterviewSessionId : ($("chatMode").value === "answer" ? currentAnswerSessionId : null),
         notes_top_k: numberValue("notesTopK"),
         dense_top_k: numberValue("denseTopK"),
         hybrid_bm25_top_k: numberValue("hybridBm25TopK"),
@@ -8521,6 +9228,9 @@ CHAT_HTML = r"""<!doctype html>
             await ensureInterviewSession();
             payload.session_id = currentInterviewSessionId;
             payload.source_note_paths = sourceNotePaths();
+          } else if (payload.chat_mode === "answer") {
+            await ensureAnswerSession();
+            payload.session_id = currentAnswerSessionId;
           }
           if (options.assistantMessageId) payload.assistant_message_id = options.assistantMessageId;
           const response = await fetch("/api/agent/runs", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
@@ -8531,7 +9241,8 @@ CHAT_HTML = r"""<!doctype html>
             throw error;
           }
           if (payload.chat_mode === "answer" && data.task_id) {
-            sessionStorage.setItem(activeAnswerTaskKey, data.task_id);
+            if (pendingAnswerTurn) pendingAnswerTurn.taskId = data.task_id;
+            syncChatWorkspace({activeAnswerTaskId: data.task_id, pendingTurn: pendingAnswerTurn});
           }
           const streamResponse = await fetch(`/api/tasks/${encodeURIComponent(data.task_id)}/stream`);
           if (!streamResponse.ok || !streamResponse.body) throw new Error(`task stream failed: ${streamResponse.status}`);
@@ -8558,8 +9269,14 @@ CHAT_HTML = r"""<!doctype html>
     }
 
     async function restoreActiveAnswerTask() {
-      const taskId = sessionStorage.getItem(activeAnswerTaskKey);
-      if (!taskId || $("chatMode").value !== "answer") return;
+      if ($("chatMode").value !== "answer") return;
+      const taskId = sessionStorage.getItem(activeAnswerTaskKey) || pendingAnswerTurn?.taskId || null;
+      if (!taskId && !pendingAnswerTurn?.query) return;
+      ensurePendingAnswerUserMessage();
+      if (!taskId) {
+        if (pendingAnswerTurn?.status === "running") setBusy(true, "查询中...");
+        return;
+      }
       try {
         const taskResponse = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`);
         if (!taskResponse.ok) {
@@ -8567,12 +9284,34 @@ CHAT_HTML = r"""<!doctype html>
           return;
         }
         const task = await taskResponse.json();
-        if (!["queued", "running"].includes(task.status || "")) {
+        const status = task.status || "";
+        if (status === "succeeded") {
+          finalizePendingAnswerTurn(task);
+          sessionStorage.removeItem(activeAnswerTaskKey);
+          setBusy(false, "就绪");
+          return;
+        }
+        if (status === "failed") {
+          showPendingAnswerFailure(task.error || "assistant generation failed");
+          sessionStorage.removeItem(activeAnswerTaskKey);
+          setBusy(false, "Error");
+          return;
+        }
+        if (!["queued", "running"].includes(status)) {
           sessionStorage.removeItem(activeAnswerTaskKey);
           return;
         }
-        currentAssistant = appendAssistantMessage("");
-        currentAssistantText = "";
+        const lastMessage = messages.querySelector(".message:last-child");
+        if (lastMessage && lastMessage.classList.contains("assistant")) {
+          currentAssistant = lastMessage;
+          currentAssistantText = pendingAnswerTurn?.partialAssistantText || "";
+          if (currentAssistantText) {
+            currentAssistant.querySelector(".answer").innerHTML = renderMarkdown(currentAssistantText);
+          }
+        } else {
+          currentAssistant = appendAssistantMessage(pendingAnswerTurn?.partialAssistantText || "");
+          currentAssistantText = pendingAnswerTurn?.partialAssistantText || "";
+        }
         currentPayload = {router: null, retrieval: null, retrievalStatus: null, interviewPlan: null, profileDebug: null, context: null, answer: null, done: null, errors: []};
         currentProcess = createAgentProcessState();
         renderAgentProcess();
@@ -8580,10 +9319,63 @@ CHAT_HTML = r"""<!doctype html>
         const streamResponse = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/stream`);
         if (!streamResponse.ok || !streamResponse.body) throw new Error(`task stream failed: ${streamResponse.status}`);
         await readSse(streamResponse.body);
-        if ((task.status || "") === "succeeded" || currentAssistantText.trim()) sessionStorage.removeItem(activeAnswerTaskKey);
-        setBusy(false, "就绪");
-      } catch {
+        const refreshed = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+        const refreshedTask = refreshed.ok ? await refreshed.json() : task;
+        if ((refreshedTask.status || "") === "succeeded") {
+          finalizePendingAnswerTurn(refreshedTask);
+        } else if ((refreshedTask.status || "") === "failed") {
+          showPendingAnswerFailure(refreshedTask.error || "assistant generation failed");
+        } else if (currentAssistantText.trim()) {
+          finalizePendingAnswerTurn({result: {answer: currentAssistantText}});
+        }
         sessionStorage.removeItem(activeAnswerTaskKey);
+        setBusy(false, "就绪");
+      } catch (error) {
+        if (pendingAnswerTurn) {
+          pendingAnswerTurn.status = "failed";
+          pendingAnswerTurn.error = error.message || "restore failed";
+          syncChatWorkspace();
+        }
+        sessionStorage.removeItem(activeAnswerTaskKey);
+        setBusy(false, "Error");
+      }
+    }
+
+    function ensurePendingAnswerUserMessage() {
+      if (!pendingAnswerTurn?.query) return;
+      const lastUser = [...chatHistory].reverse().find((item) => item.role === "user");
+      if (lastUser && lastUser.content === pendingAnswerTurn.query) return;
+      const nodes = messages.querySelectorAll(".message.user .answer");
+      const lastDomUser = nodes.length ? nodes[nodes.length - 1] : null;
+      if (lastDomUser && lastDomUser.textContent.trim() === pendingAnswerTurn.query.trim()) return;
+      appendUserMessage(pendingAnswerTurn.query);
+    }
+
+    async function finalizePendingAnswerTurn(task) {
+      pendingAnswerTurn = null;
+      syncChatWorkspace({pendingTurn: null, activeAnswerTaskId: ""});
+      await reloadAnswerSessionFromServer();
+      if (!messages.querySelector(".message.user")) {
+        const query = task?.query || "";
+        const answerText = String(task?.result?.answer || currentAssistantText || "").trim();
+        if (query) chatHistory.push({role: "user", content: query});
+        if (answerText) chatHistory.push({role: "assistant", content: answerText});
+        trimChatHistory();
+        renderAnswerConversation();
+      }
+    }
+
+    function showPendingAnswerFailure(message) {
+      ensurePendingAnswerUserMessage();
+      currentAssistant = appendAssistantMessage("");
+      currentAssistantText = "";
+      if (currentAssistant) {
+        currentAssistant.querySelector(".answer").innerHTML = `<p class="error">${escapeHtml(message)}</p>`;
+      }
+      if (pendingAnswerTurn) {
+        pendingAnswerTurn.status = "failed";
+        pendingAnswerTurn.error = message;
+        syncChatWorkspace();
       }
     }
 
@@ -8616,26 +9408,36 @@ CHAT_HTML = r"""<!doctype html>
       setBusy(true, "Retrying...");
       try {
         const body = buildAgentRequestBody(query);
-        body.session_id = currentInterviewSessionId;
-        currentTurnTrace = {directorNoteInjected: shouldInjectDirectorNote(body.interview_state)};
-        if (currentTurnTrace.directorNoteInjected) {
-          recordSessionTrace("director_note_injected", `Director Note injected (follow_up=${body.interview_state?.follow_up_count || 0})`, {
-            interview_state: body.interview_state || {},
-            retry: true
-          });
+        if ($("chatMode").value === "interview") {
+          body.session_id = currentInterviewSessionId;
+          currentTurnTrace = {directorNoteInjected: shouldInjectDirectorNote(body.interview_state)};
+          if (currentTurnTrace.directorNoteInjected) {
+            recordSessionTrace("director_note_injected", `Director Note injected (follow_up=${body.interview_state?.follow_up_count || 0})`, {
+              interview_state: body.interview_state || {},
+              retry: true
+            });
+          }
+        } else if ($("chatMode").value === "answer") {
+          await ensureAnswerSession();
+          body.session_id = currentAnswerSessionId;
         }
         await streamAgentAnswerWithRetry(body, {assistantMessageId: turnIds.assistant.id});
         const answerText = currentAssistantText.trim();
         if (!answerText) throw new Error("empty answer");
         renderAssistantExtras();
         const shouldReview = $("chatMode").value === "interview" && shouldRequestTurnSummary(query, answerText);
-        chatHistory.push({role:"user", content:query});
-        chatHistory.push({role:"assistant", content:answerText});
-        trimChatHistory();
-        const stateChange = isServerInterviewState() ? null : updateInterviewState(query, answerText);
-        recordInterviewStateTrace(stateChange);
-        renderInterviewDirectionBar();
-        if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
+        if ($("chatMode").value === "interview") {
+          chatHistory.push({role:"user", content:query});
+          chatHistory.push({role:"assistant", content:answerText});
+          trimChatHistory();
+          const stateChange = isServerInterviewState() ? null : updateInterviewState(query, answerText);
+          recordInterviewStateTrace(stateChange);
+          renderInterviewDirectionBar();
+          if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
+        } else {
+          await reloadAnswerSessionFromServer();
+        }
+        if ($("chatMode").value === "answer") syncChatWorkspace();
         setBusy(false, "就绪");
       } catch (error) {
         assistantNode.querySelector(".answer").innerHTML += `<p class="error">${escapeHtml(error.message)}</p>`;
@@ -9051,7 +9853,7 @@ CHAT_HTML = r"""<!doctype html>
       if (name === "recall_profile") {
         const weak = Number(stats.hit_count || output.matching_weak_count || output.weak_points_count || 0);
         const due = Number(output.due_review_count || output.due_reviews_count || 0);
-        return [weak ? `${weak} 条相关弱项` : "", due ? `${due} 条到期复习` : ""].filter(Boolean).join("，") || "已读取相关画像提示";
+        return [weak ? `${weak} 条相关弱项` : "", due ? `${due} 条建议复查` : ""].filter(Boolean).join("，") || "已读取相关画像提示";
       }
       if (name === "advance_layer") return String(output.current_layer_name || output.target_layer || output.summary || "追问层次已更新");
       if (name === "select_topic") return String(output.current_topic || output.topic || output.summary || "主题已更新");
@@ -9596,8 +10398,13 @@ CHAT_HTML = r"""<!doctype html>
       }
     }
 
-    function startNewConversation() {
-      localStorage.removeItem(activeInterviewSessionKey);
+    async function startNewConversation() {
+      if ($("chatMode").value === "answer" && currentAnswerSessionId) {
+        try {
+          await fetch(`/api/answer/sessions/${encodeURIComponent(currentAnswerSessionId)}/archive`, {method: "POST"});
+        } catch {}
+      }
+      pendingAnswerTurn = null;
       chatHistory = [];
       currentAssistant = null;
       currentAssistantText = "";
@@ -9606,15 +10413,129 @@ CHAT_HTML = r"""<!doctype html>
       currentInterviewPlanSignature = "";
       currentInterviewState = null;
       currentInterviewSessionId = "";
+      currentAnswerSessionId = "";
       lastContextItems = [];
       resetSessionContext();
       currentConversationSignature = conversationSignature();
+      syncChatWorkspace({
+        activeInterviewSessionId: "",
+        activeAnswerSessionId: "",
+        pendingTurn: null,
+        activeAnswerTaskId: "",
+      });
       $("query").value = "";
       $("starters").innerHTML = "";
-      messages.innerHTML = `<article class="message assistant"><div class="role">Assistant</div><div class="answer">已开始新对话。可以选择面试模式并发送消息开始。</div></article>`;
+      const newConversationHint = $("chatMode").value === "interview"
+        ? "已开始新对话。可以选择面试模式并发送消息开始。"
+        : "已开始新对话。可以直接提问。";
+      messages.innerHTML = `<article class="message assistant"><div class="role">Assistant</div><div class="answer">${newConversationHint}</div></article>`;
       updateSessionLabel();
       setBusy(false, "就绪");
       scrollToBottom();
+    }
+
+    async function ensureAnswerSession() {
+      if (currentAnswerSessionId) return currentAnswerSessionId;
+      const response = await fetch("/api/answer/sessions", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          scope_type: $("scopeType").value,
+          scope_value: $("scopeValue").value.trim() || null,
+          scope_paths: scopePaths(),
+          strict_evidence: $("strictEvidence").checked,
+          extra: {created_from: "chat"},
+        }),
+      });
+      if (!response.ok) throw new Error("创建问答记录失败");
+      const data = await response.json();
+      currentAnswerSessionId = data.session.session_id;
+      syncChatWorkspace({activeAnswerSessionId: currentAnswerSessionId});
+      updateSessionLabel();
+      return currentAnswerSessionId;
+    }
+
+    function restoreAnswerSessionIntoChat(session) {
+      const context = session.context || {};
+      if (context.scope_type) $("scopeType").value = context.scope_type;
+      if (context.scope_type === "selected_notes") {
+        $("scopeValue").value = (context.scope_paths || []).join("\n");
+      } else if (context.scope_value) {
+        $("scopeValue").value = context.scope_value;
+      }
+      if (typeof context.strict_evidence === "boolean") $("strictEvidence").checked = context.strict_evidence;
+      currentAnswerSessionId = session.session_id || "";
+      currentConversationSignature = conversationSignature();
+      syncChatWorkspace({activeAnswerSessionId: currentAnswerSessionId});
+      const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
+      chatHistory = sessionMessages
+        .filter((message) => ["user", "assistant"].includes(message.role))
+        .filter((message) => message.role !== "assistant" || !["pending", "failed"].includes(message.status))
+        .map((message) => ({role: message.role, content: message.content || ""}));
+      trimChatHistory();
+      const pendingAssistant = sessionMessages.find((message) => message.role === "assistant" && message.status === "pending");
+      if (pendingAssistant) {
+        const pendingIndex = sessionMessages.indexOf(pendingAssistant);
+        const pendingUser = pendingIndex > 0 ? sessionMessages[pendingIndex - 1] : null;
+        pendingAnswerTurn = {
+          query: pendingUser && pendingUser.role === "user" ? pendingUser.content || "" : "",
+          taskId: sessionStorage.getItem(activeAnswerTaskKey) || null,
+          status: "running",
+        };
+      } else {
+        pendingAnswerTurn = null;
+      }
+      messages.innerHTML = sessionMessages.length
+        ? sessionMessages.map((message, index) => renderMessageWithReview(message, null, sessionMessages[index - 1])).join("")
+        : `<article class="message assistant"><div class="role">Assistant</div><div class="answer">已恢复问答对话。</div></article>`;
+      attachRestoredRetryButtons();
+      updateSessionLabel();
+    }
+
+    async function reloadAnswerSessionFromServer() {
+      if (!currentAnswerSessionId) return;
+      try {
+        const response = await fetch(`/api/answer/sessions/${encodeURIComponent(currentAnswerSessionId)}`);
+        if (!response.ok) return;
+        const data = await response.json();
+        restoreAnswerSessionIntoChat(data.session || {});
+        scrollToBottom();
+      } catch {}
+    }
+
+    async function restoreAnswerWorkspace() {
+      if ($("chatMode").value !== "answer") return;
+      if (!currentAnswerSessionId) return;
+      try {
+        await reloadAnswerSessionFromServer();
+        setBusy(false, "已恢复问答对话");
+      } catch {}
+    }
+
+    function renderAnswerConversation() {
+      const parts = chatHistory.map((message) => {
+        const cls = message.role === "user" ? "user" : "assistant";
+        const roleLabel = message.role === "user" ? "You" : "Assistant";
+        return `<article class="message ${cls}"><div class="role">${roleLabel}</div><div class="answer">${renderMarkdown(message.content || "")}</div></article>`;
+      });
+      if (pendingAnswerTurn?.query) {
+        const lastUser = [...chatHistory].reverse().find((item) => item.role === "user");
+        if (!lastUser || lastUser.content !== pendingAnswerTurn.query) {
+          parts.push(`<article class="message user"><div class="role">You</div><div class="answer">${renderMarkdown(pendingAnswerTurn.query)}</div></article>`);
+        }
+        if (pendingAnswerTurn.partialAssistantText) {
+          parts.push(`<article class="message assistant"><div class="role">Assistant</div><div class="answer">${renderMarkdown(pendingAnswerTurn.partialAssistantText)}</div></article>`);
+        } else if (pendingAnswerTurn.status === "failed" && pendingAnswerTurn.error) {
+          parts.push(`<article class="message assistant"><div class="role">Assistant</div><div class="answer"><p class="error">${escapeHtml(pendingAnswerTurn.error)}</p></div></article>`);
+        }
+      }
+      if (!parts.length) return false;
+      messages.innerHTML = parts.join("");
+      return true;
+    }
+
+    function renderAnswerMessagesFromChatHistory() {
+      return renderAnswerConversation();
     }
 
     async function loadReviewNotice() {
@@ -9632,10 +10553,10 @@ CHAT_HTML = r"""<!doctype html>
         const topicText = topics.slice(0, 3).map((item) => {
           const topic = item.topic || "未分组";
           const count = Number(item.count || 0);
-          return `${escapeHtml(topic)} ${count} 个弱项到期`;
+          return `${escapeHtml(topic)} ${count} 个弱项建议复查`;
         }).join(" · ");
         node.innerHTML = `
-          <div><strong>复习提醒</strong> ${topicText || `${dueCount} 个弱项到期`}</div>
+          <div><strong>复习提醒</strong> ${topicText || `${dueCount} 个弱项建议复查`}</div>
           <div class="review-notice-actions">
             <button type="button" data-review-action="cards">逐条对照</button>
             <button type="button" class="secondary" data-review-action="chat" disabled title="对话复查将在下一阶段接入">对话复查</button>
@@ -9656,23 +10577,25 @@ CHAT_HTML = r"""<!doctype html>
     }
 
     async function restoreActiveInterviewSession() {
-      const sessionId = localStorage.getItem(activeInterviewSessionKey);
+      const urlMode = new URLSearchParams(window.location.search).get("mode") || "answer";
+      if (urlMode === "answer") return;
+      const sessionId = currentInterviewSessionId;
       if (!sessionId) return;
       try {
         const response = await fetch(`/api/interview/sessions/${encodeURIComponent(sessionId)}`);
         if (!response.ok) {
-          localStorage.removeItem(activeInterviewSessionKey);
+          syncChatWorkspace({activeInterviewSessionId: ""});
           return;
         }
         const data = await response.json();
         const session = data.session || {};
         if (!["active", "end_failed"].includes(session.status)) {
-          localStorage.removeItem(activeInterviewSessionKey);
+          syncChatWorkspace({activeInterviewSessionId: ""});
           return;
         }
         restoreSessionIntoChat(session, data.reviews || []);
       } catch {
-        localStorage.removeItem(activeInterviewSessionKey);
+        syncChatWorkspace({activeInterviewSessionId: ""});
       }
     }
 
@@ -9693,7 +10616,7 @@ CHAT_HTML = r"""<!doctype html>
       currentInterviewPlanSignature = currentInterviewPlan ? conversationSignature() : "";
       currentInterviewState = session.interview_state || null;
       currentConversationSignature = conversationSignature();
-      localStorage.setItem(activeInterviewSessionKey, currentInterviewSessionId);
+      syncChatWorkspace({activeInterviewSessionId: currentInterviewSessionId});
       sessionContextState = sessionContextFromSession(session);
       renderSessionContext();
       renderInterviewDirectionBar();
@@ -9762,7 +10685,7 @@ CHAT_HTML = r"""<!doctype html>
       if (!response.ok) throw new Error("创建面试记录失败");
       const data = await response.json();
       currentInterviewSessionId = data.session.session_id;
-      localStorage.setItem(activeInterviewSessionKey, currentInterviewSessionId);
+      syncChatWorkspace({activeInterviewSessionId: currentInterviewSessionId});
       updateSessionLabel();
       return currentInterviewSessionId;
     }
@@ -9918,7 +10841,7 @@ CHAT_HTML = r"""<!doctype html>
         });
         appendSystemMessage(data.session && data.session.status === "completed" ? "本次面试已保存，长期画像已更新。" : "本次面试已保存，但最终总结或画像更新失败。可以稍后从历史记录重试。");
         currentInterviewSessionId = "";
-        localStorage.removeItem(activeInterviewSessionKey);
+        syncChatWorkspace({activeInterviewSessionId: ""});
         updateSessionLabel();
       } catch (error) {
         appendSystemMessage(`结束失败：${error.message}`);
@@ -9930,7 +10853,11 @@ CHAT_HTML = r"""<!doctype html>
     async function openHistory() {
       $("historyModal").classList.add("open");
       $("historyModal").setAttribute("aria-hidden", "false");
-      await loadInterviewHistoryListOnly();
+      if ($("chatMode").value === "interview") {
+        await loadInterviewHistoryListOnly();
+      } else {
+        await loadAnswerHistoryListOnly();
+      }
     }
 
     function closeHistory() {
@@ -9945,6 +10872,51 @@ CHAT_HTML = r"""<!doctype html>
         if (!response.ok) throw new Error("历史记录加载失败");
         const data = await response.json();
         renderInterviewHistory(data.sessions || []);
+      } catch (error) {
+        $("historyContent").innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    async function loadAnswerHistoryListOnly() {
+      $("historyContent").innerHTML = "加载中...";
+      try {
+        const response = await fetch("/api/answer/sessions?limit=30");
+        if (!response.ok) throw new Error("问答历史加载失败");
+        const data = await response.json();
+        renderAnswerHistory(data.sessions || []);
+      } catch (error) {
+        $("historyContent").innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    function renderAnswerHistory(sessions) {
+      if (!sessions.length) {
+        $("historyContent").innerHTML = "暂无问答历史。当前对话保存在服务端；新建对话时，上一轮会归档。";
+        return;
+      }
+      $("historyContent").innerHTML = sessions.map((session) => `<button class="history-item" type="button" data-answer-session="${escapeHtml(session.session_id || "")}"><strong>${escapeHtml(session.title || "问答对话")}</strong><div class="history-meta">${escapeHtml(session.status || "")} | ${escapeHtml(session.updated_at || session.created_at || "")}</div></button>`).join("");
+      document.querySelectorAll("[data-answer-session]").forEach((button) => button.addEventListener("click", () => loadAnswerSession(button.dataset.answerSession)));
+    }
+
+    async function loadAnswerSession(sessionId) {
+      if (!sessionId) return;
+      $("historyContent").innerHTML = "正在加载问答记录...";
+      try {
+        const response = await fetch(`/api/answer/sessions/${encodeURIComponent(sessionId)}`);
+        if (!response.ok) throw new Error("问答记录加载失败");
+        const data = await response.json();
+        if ($("chatMode").value === "answer" && currentAnswerSessionId && currentAnswerSessionId !== sessionId) {
+          try {
+            await fetch(`/api/answer/sessions/${encodeURIComponent(currentAnswerSessionId)}/archive`, {method: "POST"});
+          } catch {}
+        }
+        $("chatMode").value = "answer";
+        window.history.replaceState(null, "", "/?mode=answer");
+        updateChatNavActive();
+        restoreAnswerSessionIntoChat(data.session || {});
+        closeHistory();
+        setBusy(false, "已恢复问答记录");
+        scrollToBottom();
       } catch (error) {
         $("historyContent").innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
       }
@@ -10277,4 +11249,3 @@ CHAT_HTML = r"""<!doctype html>
 </body>
 </html>
 """
-
