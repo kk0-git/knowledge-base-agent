@@ -368,6 +368,26 @@ with urllib.request.urlopen(req, timeout=120) as resp:
 
 复习页面不走 `chat_mode=study`；旧 `mode=study` 页面入口会重定向到 `/review`。
 
+### 8.6 Agent 解耦 runs API
+
+```powershell
+# 创建后台 run（面试需先有 session_id）
+python -m pytest tests/test_session_repository.py tests/test_agent_turn_service.py tests/test_agent_run_stream.py -q
+
+# curl 示例（问答）
+curl -s -X POST http://127.0.0.1:8003/api/agent/runs -H "Content-Type: application/json" -d "{\"query\":\"MCP 是什么\",\"chat_mode\":\"answer\",\"scope_type\":\"folder\",\"scope_value\":\"个人/面试/agent面试\"}"
+
+# 订阅 task 事件流（将 TASK_ID 替换为上一步返回值）
+curl -N http://127.0.0.1:8003/api/tasks/TASK_ID/stream
+```
+
+### 8.5 复习页三态重构检查
+
+```powershell
+python -m py_compile "src/web/app.py" "src/agent/tools/review.py"
+python -m pytest tests/test_review_practice.py -q --tb=short
+```
+
 
 
 

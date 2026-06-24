@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 import json
@@ -28,9 +28,11 @@ from agent.apps import (
 from agent.llm.tool_calling import OpenAICompatibleToolCallingClient
 from agent.interview.state import build_interview_state_machine
 from agent.runtime import AgentRuntime
+from agent.schema import AgentMessage, AgentRunConfig, AgentState, WorkingMemory
 from agent.skill_loader import SkillLoader
 from agent.tool_registry import ToolRegistry
-from agent.tools import register_debug_tools, register_interview_tools, register_profile_tools
+from agent.tool_executor import ToolExecutionContext
+from agent.tools import register_debug_tools, register_interview_tools, register_profile_tools, register_review_tools
 from agent.tools.vault import register_vault_tools
 from agent.trace import TraceRecorder
 from knowledge_base_agent.config import load_llm_config
@@ -81,19 +83,32 @@ from services.workflows.interview_sessions import InterviewSessionStore
 from services.workflows.review_practice import (
     build_due_review_overview,
     build_correction_query,
+    build_grouped_review_prompt,
+    build_grouped_weak_point_verification_query,
     build_weak_point_verification_query,
     build_recall_prompt,
-    build_review_plan,
     commit_review_action,
     commit_review_outcome,
     find_weak_point,
+    grouped_review_cards,
     parse_correction_payload,
+    parse_grouped_verification_payload,
     parse_verification_payload,
+    read_review_card_cache,
+    read_review_prompt_cache,
+    review_prompt_cache_key,
     select_strategy_constraints,
+    write_review_card_cache,
+    write_review_prompt_cache,
 )
 from services.workflows.runner import WorkflowRunner, task_result_to_dict
 from services.workflows.schema import ScopeSpec, WorkflowSpec, WritebackSpec
 from services.workflows.scope_resolver import ScopeResolver
+from ports.file_session_repository import FileSessionRepository
+from ports.in_memory_agent_run_repository import InMemoryAgentRunRepository
+from services.agent_turns import AgentTurnInput, AgentTurnRunner, AgentTurnRunnerDeps, AgentTurnService
+from services.tasks.pipeline_task import PipelineTaskContext, PipelineTaskManager
+from services.tasks.stream import stream_task_events
 
 
 def resolve_profile_topic_for_request(
@@ -223,6 +238,7 @@ class AgentRequest(BaseModel):
     interview_plan: dict[str, Any] | None = Field(default=None)
     interview_state: dict[str, Any] | None = Field(default=None)
     session_id: str | None = Field(default=None)
+    assistant_message_id: str | None = Field(default=None)
 
 
 class InterviewSummaryRequest(BaseModel):
@@ -387,6 +403,13 @@ class ReviewPlanRequest(BaseModel):
     question_types: list[str] = Field(default_factory=list)
     limit: int = Field(default=10, ge=1, le=50)
     allow_cross_topic: bool = Field(default=True)
+    max_strategy_constraints: int = Field(default=2, ge=0, le=5)
+
+
+class ReviewPrepareRequest(BaseModel):
+    topics: list[str] = Field(default_factory=list)
+    limit: int = Field(default=12, ge=1, le=50)
+    max_strategy_constraints: int = Field(default=2, ge=0, le=5)
 
 
 class ReviewPromptRequest(BaseModel):
@@ -405,13 +428,23 @@ class ReviewCommitRequest(BaseModel):
 
 class ReviewVerifyRequest(BaseModel):
     weak_point_id: str = Field(default="")
+    weak_point_ids: list[str] = Field(default_factory=list)
+    card_id: str = Field(default="")
     answer: str = Field(default="")
     prompt: str = Field(default="")
+    question_blocks: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ReviewActionCommitRequest(BaseModel):
     weak_point_id: str = Field(default="")
     action: str = Field(default="")
+
+
+class ReviewDialogueRequest(BaseModel):
+    topic: str = Field(default="")
+    topics: list[str] = Field(default_factory=list)
+    message: str = Field(default="")
+    chat_history: list[dict[str, str]] = Field(default_factory=list)
 
 
 @dataclass
@@ -436,120 +469,6 @@ class WorkspaceRuntimeConfig:
             "min_notes_per_tag": self.min_notes_per_tag,
             "overview_note_threshold": self.overview_note_threshold,
         }
-
-
-@dataclass
-class PipelineTask:
-    task_id: str
-    kind: str
-    status: str
-    created_at: str
-    started_at: str | None = None
-    finished_at: str | None = None
-    current_step: str | None = None
-    events: list[dict[str, Any]] | None = None
-    result: Any = None
-    error: str | None = None
-    error_type: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "task_id": self.task_id,
-            "kind": self.kind,
-            "status": self.status,
-            "created_at": self.created_at,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "current_step": self.current_step,
-            "events": list(self.events or []),
-            "result": self.result,
-            "error": self.error,
-            "error_type": self.error_type,
-        }
-
-
-class PipelineTaskContext:
-    def __init__(self, manager: "PipelineTaskManager", task_id: str) -> None:
-        self.manager = manager
-        self.task_id = task_id
-
-    def emit(self, event: str, payload: dict[str, Any] | None = None) -> None:
-        self.manager.emit(self.task_id, event, payload or {})
-
-
-class PipelineTaskManager:
-    def __init__(self, *, max_workers: int = 1, max_events: int = 200) -> None:
-        self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="pipeline-task")
-        self.max_events = max_events
-        self.lock = threading.Lock()
-        self.tasks: dict[str, PipelineTask] = {}
-
-    def submit(self, kind: str, fn: Callable[[PipelineTaskContext], Any]) -> PipelineTask:
-        task_id = uuid.uuid4().hex
-        task = PipelineTask(
-            task_id=task_id,
-            kind=kind,
-            status="queued",
-            created_at=utc_now_iso(),
-            events=[],
-        )
-        with self.lock:
-            self.tasks[task_id] = task
-        self.executor.submit(self._run, task_id, fn)
-        return task
-
-    def get(self, task_id: str) -> dict[str, Any] | None:
-        with self.lock:
-            task = self.tasks.get(task_id)
-            return task.to_dict() if task else None
-
-    def list_recent(self, limit: int = 20) -> list[dict[str, Any]]:
-        with self.lock:
-            tasks = sorted(self.tasks.values(), key=lambda task: task.created_at, reverse=True)
-            return [task.to_dict() for task in tasks[:limit]]
-
-    def emit(self, task_id: str, event: str, payload: dict[str, Any]) -> None:
-        with self.lock:
-            task = self.tasks.get(task_id)
-            if not task:
-                return
-            task.current_step = event
-            task.events = task.events or []
-            task.events.append(
-                {
-                    "at": utc_now_iso(),
-                    "event": event,
-                    "payload": payload,
-                }
-            )
-            if len(task.events) > self.max_events:
-                task.events = task.events[-self.max_events :]
-
-    def _run(self, task_id: str, fn: Callable[[PipelineTaskContext], Any]) -> None:
-        with self.lock:
-            task = self.tasks[task_id]
-            task.status = "running"
-            task.started_at = utc_now_iso()
-            task.current_step = "started"
-        context = PipelineTaskContext(self, task_id)
-        context.emit("started", {})
-        try:
-            result = fn(context)
-            with self.lock:
-                task = self.tasks[task_id]
-                task.status = "succeeded"
-                task.result = result
-                task.finished_at = utc_now_iso()
-                task.current_step = "succeeded"
-        except Exception as exc:
-            with self.lock:
-                task = self.tasks[task_id]
-                task.status = "failed"
-                task.error_type = type(exc).__name__
-                task.error = f"{type(exc).__name__}: {exc}"
-                task.result = {"traceback": traceback.format_exc()}
-                task.finished_at = utc_now_iso()
-                task.current_step = "failed"
 
 
 def load_workspace_runtime_config(
@@ -708,6 +627,11 @@ def create_app(
     )
     rag_prewarm_lock = threading.Lock()
     rag_prewarm_started = False
+    review_prepare_cache: dict[str, dict[str, Any]] = {}
+    review_cache_dir = project_root / "review-cache"
+    review_run_lock = threading.Lock()
+    review_run_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="review-run")
+    review_runs: dict[str, dict[str, Any]] = {}
 
     @app.get("/", response_class=HTMLResponse)
     def home(request: Request):
@@ -802,16 +726,245 @@ def create_app(
         profile = interview_profile_store.load()
         return build_due_review_overview(profile, limit=limit)
 
+    def build_review_prompt_for_card(weak: dict[str, Any], request: ReviewPromptRequest | None = None) -> dict[str, Any]:
+        prompt_request = request or ReviewPromptRequest()
+        cache_key = review_prompt_cache_key(weak)
+        cached = read_review_prompt_cache(review_cache_dir, cache_key)
+        if cached:
+            result = dict(cached)
+            result["cache_hit"] = True
+            return result
+        try:
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+            prompt = build_recall_prompt(
+                weak,
+                allowed_question_types=prompt_request.allowed_question_types,
+                related_topics=prompt_request.related_topics,
+                llm_client=llm_client,
+                model=llm_config.model,
+                temperature=min(llm_config.temperature, 0.2),
+            )
+            write_review_prompt_cache(review_cache_dir, cache_key, prompt)
+            return prompt
+        except Exception as exc:
+            prompt = build_recall_prompt(
+                weak,
+                allowed_question_types=prompt_request.allowed_question_types,
+                related_topics=prompt_request.related_topics,
+            )
+            prompt["error"] = str(exc)
+            return prompt
+
+    def review_run_snapshot(review_run_id: str) -> dict[str, Any] | None:
+        with review_run_lock:
+            run = review_runs.get(review_run_id)
+            if run is None:
+                return None
+            cards = [dict(card) for card in run.get("cards", [])]
+            ready_count = len([card for card in cards if card.get("status") == "ready"])
+            failed_count = len([card for card in cards if card.get("status") == "failed"])
+            pending_count = len([card for card in cards if card.get("status") == "pending"])
+            payload = {
+                key: value
+                for key, value in run.items()
+                if key not in {"cards", "weak_points", "card_weak_points"}
+            }
+            payload["cards"] = cards
+            payload["ready_count"] = ready_count
+            payload["failed_count"] = failed_count
+            payload["pending_count"] = pending_count
+            return payload
+
+    def create_review_run(request: ReviewPlanRequest | ReviewPrepareRequest) -> dict[str, Any]:
+        profile = interview_profile_store.load()
+        max_strategy_constraints = int(getattr(request, "max_strategy_constraints", 2) or 2)
+        grouped = grouped_review_cards(
+            profile,
+            topics=getattr(request, "topics", []),
+            limit=int(getattr(request, "limit", 12) or 12),
+            max_strategy_constraints=max_strategy_constraints,
+        )
+        selected_topics = {str(topic).strip() for topic in grouped.get("selected_topics", []) if str(topic).strip()}
+        limit = int(getattr(request, "limit", 12) or 12)
+        cards: list[dict[str, Any]] = []
+        card_weak_points: dict[str, list[dict[str, Any]]] = {}
+        for card in grouped.get("cards", []):
+            card_id = str(card.get("id") or "")
+            weak_ids = [str(item).strip() for item in card.get("weak_point_ids") or [] if str(item).strip()]
+            weak_group = [find_weak_point(profile, weak_id) for weak_id in weak_ids]
+            weak_group = [weak for weak in weak_group if isinstance(weak, dict)]
+            if not card_id or not weak_group:
+                continue
+            shell = dict(card)
+            shell.pop("review_prompt", None)
+            cache_key = str(shell.get("cache_key") or "")
+            cached = read_review_card_cache(review_cache_dir, cache_key) if cache_key else None
+            if cached:
+                review_prompt = cached.get("review_prompt") or cached
+                shell.update(
+                    {
+                        "status": "ready",
+                        "review_prompt": review_prompt,
+                        "question_blocks": cached.get("question_blocks") or review_prompt.get("question_blocks") or [],
+                        "reference_answer": cached.get("reference_answer") or review_prompt.get("reference_answer") or "",
+                        "strategy_tips": cached.get("strategy_tips") or shell.get("strategy_tips") or [],
+                        "cache_hit": True,
+                    }
+                )
+            else:
+                shell["status"] = "pending"
+                shell["cache_hit"] = False
+            cards.append(shell)
+            card_weak_points[card_id] = json.loads(json.dumps(weak_group, ensure_ascii=False))
+        review_run_id = f"review-{uuid.uuid4().hex[:12]}"
+        ready_count = len([card for card in cards if card.get("status") == "ready"])
+        pending_count = len([card for card in cards if card.get("status") == "pending"])
+        run = dict(grouped)
+        run.update(
+            {
+                "review_run_id": review_run_id,
+                "status": "queued" if pending_count else "done",
+                "cards": cards,
+                "card_weak_points": card_weak_points,
+                "due_count": sum(len(card.get("weak_point_ids") or []) for card in cards),
+                "prepared_count": ready_count,
+                "limit": limit,
+                "selected_topics": sorted(selected_topics),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "finished_at": datetime.now(timezone.utc).isoformat() if not pending_count else "",
+            }
+        )
+        with review_run_lock:
+            review_runs[review_run_id] = run
+        if pending_count:
+            review_run_executor.submit(generate_review_run_cards, review_run_id)
+        snapshot = review_run_snapshot(review_run_id)
+        return snapshot or run
+
+    def generate_review_run_cards(review_run_id: str) -> None:
+        with review_run_lock:
+            run = review_runs.get(review_run_id)
+            if run is None:
+                return
+            run["status"] = "running"
+            run["updated_at"] = datetime.now(timezone.utc).isoformat()
+            card_ids = [str(card.get("id") or "") for card in run.get("cards", []) if card.get("status") == "pending"]
+            card_weak_points = dict(run.get("card_weak_points") or {})
+        llm_config = None
+        llm_client = None
+        try:
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+        except Exception:
+            llm_config = None
+            llm_client = None
+        for card_id in card_ids:
+            weak_group = list(card_weak_points.get(card_id) or [])
+            if not weak_group:
+                continue
+            try:
+                strategy_constraints: list[dict[str, Any]] = []
+                cache_key = ""
+                with review_run_lock:
+                    run = review_runs.get(review_run_id)
+                    if run is None:
+                        return
+                    for card in run.get("cards", []):
+                        if str(card.get("id") or "") == card_id:
+                            strategy_constraints = list(card.get("strategy_constraints") or [])
+                            cache_key = str(card.get("cache_key") or "")
+                            break
+                if llm_client is not None and llm_config is not None:
+                    prompt = build_grouped_review_prompt(
+                        weak_group,
+                        strategy_constraints=strategy_constraints,
+                        llm_client=llm_client,
+                        model=llm_config.model,
+                        temperature=min(llm_config.temperature, 0.2),
+                    )
+                else:
+                    prompt = build_grouped_review_prompt(weak_group, strategy_constraints=strategy_constraints)
+                if cache_key:
+                    write_review_card_cache(
+                        review_cache_dir,
+                        cache_key,
+                        {
+                            "review_prompt": prompt,
+                            "question_blocks": prompt.get("question_blocks") or [],
+                            "reference_answer": prompt.get("reference_answer") or "",
+                            "strategy_tips": prompt.get("strategy_tips") or [],
+                            "prompt_version": prompt.get("prompt_version") or "",
+                        },
+                    )
+                with review_run_lock:
+                    run = review_runs.get(review_run_id)
+                    if run is None:
+                        return
+                    for card in run.get("cards", []):
+                        if str(card.get("id") or "") == card_id:
+                            card["review_prompt"] = prompt
+                            card["question_blocks"] = prompt.get("question_blocks") or []
+                            card["reference_answer"] = prompt.get("reference_answer") or ""
+                            card["strategy_tips"] = prompt.get("strategy_tips") or card.get("strategy_tips") or []
+                            card["status"] = "ready"
+                            break
+                    run["prepared_count"] = len([card for card in run.get("cards", []) if card.get("status") == "ready"])
+                    run["updated_at"] = datetime.now(timezone.utc).isoformat()
+            except Exception as exc:
+                with review_run_lock:
+                    run = review_runs.get(review_run_id)
+                    if run is None:
+                        return
+                    for card in run.get("cards", []):
+                        if str(card.get("id") or "") == card_id:
+                            card["status"] = "failed"
+                            card["error"] = str(exc)
+                            card["review_prompt"] = {
+                                "prompt": card.get("point") or "请围绕这个知识弱点，用自己的话完整回答。",
+                                "fallback_used": True,
+                                "error": str(exc),
+                            }
+                            break
+                    run["updated_at"] = datetime.now(timezone.utc).isoformat()
+        with review_run_lock:
+            run = review_runs.get(review_run_id)
+            if run is not None:
+                run["status"] = "done"
+                run["prepared_count"] = len([card for card in run.get("cards", []) if card.get("status") == "ready"])
+                run["finished_at"] = datetime.now(timezone.utc).isoformat()
+                run["updated_at"] = run["finished_at"]
+
+    @app.post("/api/review/prepare")
+    def review_prepare(request: ReviewPrepareRequest) -> dict[str, Any]:
+        payload = create_review_run(request)
+        review_prepare_cache[payload["review_run_id"]] = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "payload": payload,
+        }
+        return payload
+
+    @app.get("/api/review/prepare/{review_run_id}")
+    def review_prepared_run(review_run_id: str) -> dict[str, Any]:
+        snapshot = review_run_snapshot(review_run_id)
+        if snapshot is not None:
+            return snapshot
+        cached = review_prepare_cache.get(review_run_id)
+        if cached is None:
+            raise HTTPException(status_code=404, detail=f"review run not found: {review_run_id}")
+        return cached["payload"]
+
     @app.post("/api/review/plan")
     def review_plan(request: ReviewPlanRequest) -> dict[str, Any]:
-        profile = interview_profile_store.load()
-        return build_review_plan(
-            profile,
-            topics=request.topics,
-            question_types=request.question_types,
-            limit=request.limit,
-            allow_cross_topic=request.allow_cross_topic,
-        )
+        return create_review_run(request)
+
+    @app.get("/api/review/plan/{review_run_id}")
+    def review_plan_run(review_run_id: str) -> dict[str, Any]:
+        snapshot = review_run_snapshot(review_run_id)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail=f"review run not found: {review_run_id}")
+        return snapshot
 
     @app.post("/api/review/card/{card_id}/prompt")
     def review_card_prompt(card_id: str, request: ReviewPromptRequest) -> dict[str, Any]:
@@ -819,24 +972,7 @@ def create_app(
         weak = find_weak_point(profile, card_id)
         if weak is None:
             raise HTTPException(status_code=404, detail=f"review card not found: {card_id}")
-        try:
-            llm_config = load_llm_config(project_root)
-            llm_client = create_llm_client(llm_config)
-            prompt = build_recall_prompt(
-                weak,
-                allowed_question_types=request.allowed_question_types,
-                related_topics=request.related_topics,
-                llm_client=llm_client,
-                model=llm_config.model,
-                temperature=min(llm_config.temperature, 0.2),
-            )
-        except Exception as exc:
-            prompt = build_recall_prompt(
-                weak,
-                allowed_question_types=request.allowed_question_types,
-                related_topics=request.related_topics,
-            )
-            prompt["error"] = str(exc)
+        prompt = build_review_prompt_for_card(weak, request)
         return {"card_id": card_id, **prompt}
 
     @app.post("/api/review/card/{card_id}/grade")
@@ -899,16 +1035,29 @@ def create_app(
     def review_verify(request: ReviewVerifyRequest) -> dict[str, Any]:
         if runtime_config.vault_path is None:
             raise HTTPException(status_code=400, detail="vault path is required for review verification")
-        card_id = request.weak_point_id.strip()
-        if not card_id:
-            raise HTTPException(status_code=400, detail="weak_point_id is required")
+        card_id = request.card_id.strip() or request.weak_point_id.strip()
+        weak_point_ids = [str(item).strip() for item in request.weak_point_ids if str(item).strip()]
+        if not weak_point_ids and request.weak_point_id.strip():
+            weak_point_ids = [request.weak_point_id.strip()]
+        if not weak_point_ids:
+            raise HTTPException(status_code=400, detail="weak_point_ids is required")
         if not request.answer.strip():
             raise HTTPException(status_code=400, detail="answer is required")
         profile = interview_profile_store.load()
-        weak = find_weak_point(profile, card_id)
-        if weak is None:
-            raise HTTPException(status_code=404, detail=f"review card not found: {card_id}")
-        source_paths = tuple(str(path).strip() for path in weak.get("source_note_paths") or [] if str(path).strip())
+        weak_points = [find_weak_point(profile, weak_id) for weak_id in weak_point_ids]
+        weak_points = [weak for weak in weak_points if isinstance(weak, dict)]
+        if not weak_points:
+            raise HTTPException(status_code=404, detail=f"review weak point not found: {weak_point_ids[0]}")
+        source_paths = tuple(
+            sorted(
+                {
+                    str(path).strip()
+                    for weak in weak_points
+                    for path in weak.get("source_note_paths") or []
+                    if str(path).strip()
+                }
+            )
+        )
         if not source_paths:
             return {
                 "weak_point_id": card_id,
@@ -917,6 +1066,17 @@ def create_app(
                 "example": "建议先完成一次带来源记录的面试复盘，再回到这里复习。",
                 "feedback": "缺少来源笔记。",
                 "suggested_action": "retry",
+                "card_id": card_id,
+                "weak_point_ids": weak_point_ids,
+                "weak_results": [
+                    {
+                        "weak_point_id": weak_id,
+                        "point": str((find_weak_point(profile, weak_id) or {}).get("point") or "").strip(),
+                        "suggested_action": "retry",
+                        "reason": "missing source_note_paths",
+                    }
+                    for weak_id in weak_point_ids
+                ],
                 "parse_error": True,
                 "citations": [],
             }
@@ -927,10 +1087,11 @@ def create_app(
             strategy_constraints = select_strategy_constraints(profile)
             result = app_runner.run(
                 LibrarianRequest(
-                    query=build_weak_point_verification_query(
-                        weak=weak,
+                    query=build_grouped_weak_point_verification_query(
+                        weak_points=weak_points,
                         answer=request.answer,
                         prompt=request.prompt,
+                        question_blocks=request.question_blocks,
                         strategy_constraints=strategy_constraints,
                     ),
                     scope_type="selected_notes",
@@ -946,10 +1107,13 @@ def create_app(
                 )
             )
             citations = result.state.working.extra.get("citations", [])
+            parsed = parse_grouped_verification_payload(result.final_answer or "", weak_points=weak_points, citations=citations)
             return {
+                "card_id": card_id,
+                "weak_point_ids": weak_point_ids,
                 "weak_point_id": card_id,
                 "trace_path": result.trace_path,
-                **parse_verification_payload(result.final_answer or "", citations=citations),
+                **parsed,
             }
         except Exception as exc:
             return {
@@ -983,6 +1147,55 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/review/dialogue")
+    def review_dialogue(request: ReviewDialogueRequest) -> dict[str, Any]:
+        if not request.message.strip():
+            raise HTTPException(status_code=400, detail="message is required")
+        try:
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+            runtime = build_interview_agent_runtime(llm_client)
+            selected_topics = [str(topic).strip() for topic in request.topics if str(topic).strip()]
+            legacy_topic = request.topic.strip()
+            if not selected_topics and legacy_topic:
+                selected_topics = [legacy_topic]
+            working = WorkingMemory(current_topic=selected_topics[0] if len(selected_topics) == 1 else None)
+            working.extra["review_topics"] = selected_topics
+            state = AgentState(messages=[], working=working, skill_name="reviewer")
+            for item in request.chat_history[-12:]:
+                role = str(item.get("role") or "").strip()
+                if role in {"user", "assistant"}:
+                    state.messages.append(AgentMessage(role=role, content=str(item.get("content") or "")))
+            topic_line = f"Topics: {', '.join(selected_topics)}\n" if selected_topics else ""
+            result = runtime.run(
+                config=AgentRunConfig(
+                    skill_name="reviewer",
+                    max_steps=8,
+                    max_tool_calls_per_step=4,
+                    temperature=min(llm_config.temperature, 0.2),
+                    model=llm_config.model,
+                    trace_path=str(project_root / "eval-results" / "agent-debug" / "traces"),
+                    allowed_tools=["get_due_reviews", "verify_weak_point", "suggest_review_commit"],
+                    tool_mode="auto",
+                ),
+                user_input=f"{topic_line}{request.message.strip()}",
+                state=state,
+                tool_context=ToolExecutionContext(
+                    working=working,
+                    profile_store=interview_profile_store,
+                    turn_context={"review_topics": selected_topics},
+                ),
+            )
+            return {
+                "answer": result.final_answer,
+                "trace_path": result.trace_path,
+                "stopped_reason": result.stopped_reason,
+                "error": result.error,
+                "error_type": result.error_type,
+            }
+        except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/workspace/config")
@@ -1137,6 +1350,7 @@ def create_app(
         register_vault_tools(registry)
         register_interview_tools(registry)
         register_profile_tools(registry)
+        register_review_tools(registry)
         return AgentRuntime(
             llm_client=OpenAICompatibleToolCallingClient(llm_client),
             skill_loader=SkillLoader(project_root / "skills", registry=registry),
@@ -1234,6 +1448,40 @@ def create_app(
                 pass
 
         threading.Thread(target=run, name="interview-rag-prewarm", daemon=True).start()
+
+    session_repo = FileSessionRepository(interview_session_store)
+    run_repo = InMemoryAgentRunRepository(task_manager)
+
+    def build_agent_turn_runner(llm_client) -> AgentTurnRunner:
+        llm_config = load_llm_config(project_root)
+        return AgentTurnRunner(
+            AgentTurnRunnerDeps(
+                vault_path=runtime_config.vault_path,
+                wiki_state_path=runtime_config.wiki_state_path,
+                wiki_dir=runtime_config.wiki_dir,
+                project_root=project_root,
+                overview_note_threshold=runtime_config.overview_note_threshold,
+                interview_session_store=interview_session_store,
+                interview_profile_store=interview_profile_store,
+                llm_model=llm_config.model,
+                llm_temperature=llm_config.temperature,
+                build_agent_runtime=build_interview_agent_runtime,
+                build_interview_rag_manager=build_interview_rag_manager,
+                build_librarian_rag_manager=build_librarian_rag_manager,
+                resolve_librarian_scope=resolve_librarian_scope,
+                librarian_online_enabled=librarian_online_enabled,
+                prewarm_interview_rag=prewarm_interview_rag,
+                load_session_state=lambda session_id: session_repo.load_session(session_id),
+            ),
+            llm_client=llm_client,
+        )
+
+    agent_turn_service = AgentTurnService(
+        session_repo=session_repo,
+        run_repo=run_repo,
+        runner_factory=build_agent_turn_runner,
+        classify_error=classify_runtime_error,
+    )
 
     def stream_librarian_agent_v2(request: AgentRequest, llm_client, llm_config):
         if runtime_config.vault_path is None:
@@ -1525,6 +1773,32 @@ def create_app(
         if task is None:
             raise HTTPException(status_code=404, detail=f"task not found: {task_id}")
         return task
+
+    @app.get("/api/tasks/{task_id}/stream")
+    def task_stream(task_id: str) -> StreamingResponse:
+        if task_manager.get(task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task not found: {task_id}")
+        return StreamingResponse(stream_task_events(task_manager, task_id), media_type="text/event-stream")
+
+    @app.post("/api/agent/runs")
+    def agent_runs(request: AgentRequest) -> dict[str, Any]:
+        if runtime_config.vault_path is None:
+            raise HTTPException(status_code=400, detail="vault path is required for chat agent")
+        if request.chat_mode == "interview" and not agent_v2_interview_enabled():
+            raise HTTPException(status_code=400, detail="interview agent v2 is required for /api/agent/runs")
+        if request.chat_mode == "answer" and not agent_v2_librarian_enabled():
+            raise HTTPException(status_code=400, detail="librarian agent v2 is required for /api/agent/runs")
+        if request.chat_mode not in {"interview", "answer"}:
+            raise HTTPException(status_code=400, detail="only interview and answer modes are supported for /api/agent/runs")
+        llm_config = load_llm_config(project_root)
+        llm_client = create_llm_client(llm_config)
+        turn_input = AgentTurnInput.from_mapping(request.model_dump())
+        try:
+            return agent_turn_service.start_run(turn_input, llm_client=llm_client)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/wiki/sync")
     def wiki_sync(request: WikiSyncRequest) -> dict[str, Any]:
@@ -2580,7 +2854,9 @@ def workflow_answer_request(request: WorkflowRunRequest) -> AgentRequest:
 
 
 def sse_event(event: str, payload: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    from services.tasks.stream import sse_event as _sse_event
+
+    return _sse_event(event, payload)
 
 
 def build_reference_summary(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2938,15 +3214,15 @@ def strip_legacy_navigation(body_html: str) -> str:
         if header_end >= 0:
             cleaned = cleaned[header_end + len("</header>") :].lstrip()
     cleaned = re.sub(
-        r"(<main[^>]*>\s*)<header>.*?</header>\s*",
-        r"\1",
+        r"(<main[^>]*>)(.*?)(?:\s*<header>\s*<div class=\"topbar\">.*?</header>\s*)",
+        r"\1\2",
         cleaned,
         count=1,
         flags=re.DOTALL,
     )
     cleaned = re.sub(
-        r'(<main[^>]*>\s*)<div class="topbar">.*?</nav>\s*</div>\s*',
-        r"\1",
+        r'(<main[^>]*>)(.*?)(?:\s*<div class="topbar">.*?</nav>\s*</div>\s*)',
+        r"\1\2",
         cleaned,
         count=1,
         flags=re.DOTALL,
@@ -3817,17 +4093,6 @@ WIKI_HTML = r"""<!doctype html>
     }
   </style>
 </head>
-<body>
-  <header>
-    <nav>
-      <a href="/chat">对话</a>
-      <a href="/topics">知识主题</a>
-      <a href="/organize">整理</a>
-      <a href="/search">检索调试</a>
-      <a href="/admin/wiki">维护</a>
-      <a href="/settings">设置</a>
-    </nav>
-  </header>
   <main>
     <section class="page-intro">
       <p>用于同步、整理 tag、调整策略和查看原始状态。日常阅读请使用知识主题页面。</p>
@@ -4567,17 +4832,6 @@ TOPICS_HTML = r"""<!doctype html>
     }
   </style>
 </head>
-<body>
-  <header>
-    <nav>
-      <a href="/chat">对话</a>
-      <a href="/topics">知识主题</a>
-      <a href="/organize">整理</a>
-      <a href="/search">检索调试</a>
-      <a href="/admin/wiki">维护</a>
-      <a href="/settings">设置</a>
-    </nav>
-  </header>
   <main>
     <section class="hero">
       <p>这里只展示知识主题的状态和阅读入口。合成、同步和策略调整放在 Wiki Admin。</p>
@@ -4961,17 +5215,6 @@ AUDIT_HTML = r"""<!doctype html>
 <body>
   <header>
     <div>
-      <p>先做结构检查，再给出整理建议。这个入口会把确定性审计和 LLM 整理结果放到同一份报告里。</p>
-    </div>
-    <nav>
-      <a href="/chat">对话</a>
-      <a href="/topics">知识主题</a>
-      <a href="/organize">整理</a>
-      <a href="/search">检索调试</a>
-      <a href="/admin/wiki">维护</a>
-      <a href="/settings">设置</a>
-    </nav>
-  </header>
   <main>
     <section class="panel">
       <div class="form-grid">
@@ -5249,17 +5492,6 @@ SETTINGS_HTML = r"""<!doctype html>
   <main>
     <header>
       <div>
-        <p>设置当前笔记库路径和相关状态文件。浏览器不能直接选择本机目录，第一版使用路径输入。</p>
-      </div>
-      <nav>
-        <a href="/chat">对话</a>
-        <a href="/topics">知识主题</a>
-        <a href="/organize">整理</a>
-        <a href="/search">检索调试</a>
-        <a href="/admin/wiki">维护</a>
-        <a href="/settings">设置</a>
-      </nav>
-    </header>
 
     <section>
       <div class="grid">
@@ -5331,7 +5563,7 @@ SETTINGS_HTML = r"""<!doctype html>
 """
 
 
-REVIEW_HTML = r"""<!doctype html>
+REVIEW_OLD_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
@@ -5358,20 +5590,14 @@ REVIEW_HTML = r"""<!doctype html>
     .card-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:14px; }
     .nav-row { display:flex; justify-content:space-between; gap:8px; align-items:center; margin-bottom:12px; }
     .weak-point { border-left:4px solid var(--accent); padding:12px 14px; background:#f5fbfa; border-radius:8px; line-height:1.7; font-size:18px; font-weight:760; }
-    .training-target { margin-top:10px; color:var(--muted); font-size:13px; }
-    .training-target summary { cursor:pointer; color:var(--accent-dark); font-weight:800; }
-    .training-target .target-body { margin-top:8px; display:grid; gap:8px; }
-    .strategy-box { margin-top:12px; border:1px solid #d7e5df; border-radius:8px; background:#f6fbf8; padding:12px 14px; }
-    .strategy-box h3 { font-size:15px; margin-bottom:8px; color:var(--accent-dark); }
-    .strategy-box ul { margin:6px 0 0 20px; padding:0; line-height:1.65; }
+    .strategy-tip { margin-top:8px; color:var(--muted); font-size:13px; line-height:1.55; }
     .evidence { margin-top:10px; color:#38423f; line-height:1.65; }
     .meta { margin-top:8px; color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
-    .source-details { margin-top:10px; color:var(--muted); font-size:13px; }
-    .source-details summary { cursor:pointer; color:var(--accent-dark); font-weight:800; }
-    .source-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
-    .source-chip { border:1px solid var(--line); border-radius:999px; padding:3px 8px; background:#f8fbfa; color:#334155; font-size:12px; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
     .result { border-top:1px solid var(--line); margin-top:16px; padding-top:16px; display:grid; gap:12px; }
+    .result.compact { gap:8px; line-height:1.65; }
+    .result.compact p { margin:0; color:var(--text); }
+    .result.compact .muted { color:var(--muted); }
     .result-line { border:1px solid var(--line); border-radius:8px; padding:12px; background:#fff; line-height:1.65; }
     .result-line.ok { border-color:rgba(15,118,110,.28); background:#f3fbf8; }
     .result-line.warn { border-color:#ead18a; background:#fffaf0; }
@@ -5387,8 +5613,12 @@ REVIEW_HTML = r"""<!doctype html>
   <main>
     <section class="panel">
       <h2>逐条对照</h2>
-      <p>这里不再自动出题。每张卡片直接来自 profile weak point：先写下你现在的理解，再对照笔记纠偏。</p>
-      <div id="status" class="status">正在加载到期弱项...</div>
+      <p>系统会先按到期知识弱项准备本轮题目；你逐条作答，再对照笔记纠偏。</p>
+      <div class="actions">
+        <button id="cardMode" type="button">逐条对照</button>
+        <button id="dialogueMode" class="secondary" type="button">对话复查</button>
+      </div>
+      <div id="status" class="status">正在准备本轮复习题...</div>
       <div id="overview" class="overview"></div>
     </section>
     <section id="cardPanel" class="panel hidden"></section>
@@ -5396,13 +5626,16 @@ REVIEW_HTML = r"""<!doctype html>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = {cards: [], index: 0, verify: null, results: []};
+    const state = {cards: [], index: 0, verify: null, results: [], reviewRunId: "", runStatus: "", pollTimer: null};
     loadDue();
 
     async function loadDue() {
-      setStatus("正在加载到期弱项...");
+      stopPolling();
+      setStatus("正在准备本轮复习题...");
       try {
-        const data = await getJson("/api/review/due?limit=80");
+        const data = await postJson("/api/review/plan", {limit: 12, max_strategy_constraints: 2});
+        state.reviewRunId = data.review_run_id || "";
+        state.runStatus = data.status || "";
         state.cards = data.cards || [];
         state.index = 0;
         state.verify = null;
@@ -5416,11 +5649,56 @@ REVIEW_HTML = r"""<!doctype html>
           setStatus(data.summary || "暂无到期弱项。");
           return;
         }
-        setStatus("可以先用左右箭头浏览，再选择一条填写理解。");
+        setStatus("正在生成复习题，第一题准备好后会自动显示。");
+        selectFirstUsableCard();
         renderCard();
+        startPolling();
       } catch (error) {
         setStatus(error.message || String(error), true);
       }
+    }
+
+    function startPolling() {
+      stopPolling();
+      if (!state.reviewRunId) return;
+      state.pollTimer = window.setInterval(pollReviewRun, 1200);
+      pollReviewRun();
+    }
+
+    function stopPolling() {
+      if (state.pollTimer) window.clearInterval(state.pollTimer);
+      state.pollTimer = null;
+    }
+
+    async function pollReviewRun() {
+      if (!state.reviewRunId) return;
+      try {
+        const beforeCard = currentCard();
+        const hadUsableCurrent = isCardUsable(beforeCard);
+        const beforeCardId = beforeCard?.id || "";
+        const data = await getJson(`/api/review/plan/${encodeURIComponent(state.reviewRunId)}`);
+        state.runStatus = data.status || "";
+        state.cards = mergeCards(state.cards, data.cards || []);
+        renderOverview(data);
+        if (!currentCard() || !isCardUsable(currentCard())) selectFirstUsableCard();
+        const afterCard = currentCard();
+        const shouldRender = !hadUsableCurrent || beforeCardId !== (afterCard?.id || "");
+        if (shouldRender) renderCard();
+        const ready = data.ready_count || 0;
+        const pending = data.pending_count || 0;
+        const failed = data.failed_count || 0;
+        if (ready || failed) setStatus(`已准备 ${ready} 题，待生成 ${pending} 题${failed ? `，失败 ${failed} 题` : ""}。`);
+        if ((data.status || "") === "done") stopPolling();
+      } catch (error) {
+        stopPolling();
+        setStatus(error.message || String(error), true);
+      }
+    }
+
+    function mergeCards(previous, next) {
+      const byId = new Map((previous || []).map((card) => [card.id, card]));
+      for (const card of next || []) byId.set(card.id, {...(byId.get(card.id) || {}), ...card});
+      return (next || []).map((card) => byId.get(card.id) || card);
     }
 
     function renderOverview(data) {
@@ -5433,83 +5711,127 @@ REVIEW_HTML = r"""<!doctype html>
     function renderCard() {
       const card = currentCard();
       if (!card) return renderDone(false);
+      if (!isCardUsable(card)) {
+        show($("cardPanel"));
+        hide($("donePanel"));
+        const ready = state.cards.filter(isCardUsable).length;
+        const pending = state.cards.filter((item) => item.status === "pending").length;
+        $("cardPanel").innerHTML = `
+          <h3>正在准备复习题</h3>
+          <p>已准备 ${ready} 题，待生成 ${pending} 题。第一题准备好后会自动显示。</p>
+          <div class="actions">
+            <button id="reloadDue" class="secondary" type="button">刷新到期弱项</button>
+            <button id="endReview" class="secondary" type="button">结束本轮复习</button>
+          </div>
+        `;
+        return;
+      }
       show($("cardPanel"));
       hide($("donePanel"));
       const topicPosition = topicProgress(card);
-      const main = card.main_weak_point || card;
       const promptPayload = card.review_prompt || null;
       const promptText = promptPayload?.prompt || "正在生成复习题...";
       const promptReady = Boolean(promptPayload?.prompt);
       $("cardPanel").innerHTML = `
         <div class="nav-row">
-          <button class="secondary" type="button" data-nav="-1">← 上一条</button>
+          <button class="secondary" type="button" data-nav="-1" aria-label="上一条">←</button>
           <span class="status">${escapeHtml(card.topic || "未分类")} · ${topicPosition}</span>
-          <button class="secondary" type="button" data-nav="1">下一条 →</button>
-        </div>
-        <div class="card-head">
-          <div>
-            <h3>第 ${state.index + 1} / ${state.cards.length} 条</h3>
-            <span class="badge">到期</span>
-          </div>
-          <button id="endReview" class="secondary" type="button">结束复习</button>
+          <button class="secondary" type="button" data-nav="1" aria-label="下一条">→</button>
         </div>
         <div class="weak-point">${escapeHtml(promptText)}</div>
         ${promptPayload?.hint ? `<div class="meta">提示：${escapeHtml(promptPayload.hint)}</div>` : ""}
-        ${renderTrainingTarget(main, card)}
+        <textarea id="reviewAnswer" style="margin-top:14px" placeholder="回答比如：我会先说明定义，再区分触发时机和工程边界。"></textarea>
         ${renderStrategyConstraints(card.strategy_constraints || [])}
-        ${renderSourceDetails(card.source_note_paths || [])}
-        <label style="display:block;margin-top:14px">
-          <span class="status">回答这道题</span>
-          <textarea id="reviewAnswer" placeholder="例如：我会先说明定义，再区分触发时机和工程边界。"></textarea>
-        </label>
         <div class="actions">
           <button id="submitVerify" type="button" ${promptReady ? "" : "disabled"}>提交</button>
           <button id="reloadDue" class="secondary" type="button">刷新到期弱项</button>
+          <button id="endReview" class="secondary" type="button">结束本轮复习</button>
         </div>
         <div id="verifyResult" class="result hidden"></div>
       `;
-      loadCardPrompt(card);
     }
 
     function renderVerifyResult(result) {
       const node = $("verifyResult");
       node.classList.remove("hidden");
-      node.innerHTML = `
-        <div class="result-line ok">
-          <h3>✅ 方向对了</h3>
-          ${renderList(result.correct || [], "没有明确覆盖点。")}
-        </div>
-        <div class="result-line warn">
-          <h3>⚠️ 还缺什么</h3>
-          ${renderList(result.missed || [], "没有明显遗漏。")}
-        </div>
-        <div class="result-line">
-          <h3>示例</h3>
-          <p>${escapeHtml(result.example || result.feedback || "暂无示例。")}</p>
-          ${renderCitations(result.citations || [])}
-        </div>
-        ${renderStrategyFeedback(result.strategy_feedback || [])}
-        <div class="actions">
+      node.className = "result compact";
+      const correct = firstText(result.correct || [], "方向基本正确。");
+      const missedValues = []
+        .concat(Array.isArray(result.missed) ? result.missed : [])
+        .concat(Array.isArray(result.strategy_feedback) ? result.strategy_feedback : [])
+        .filter(Boolean);
+      const missed = firstText(missedValues, "没有明显遗漏。");
+      const example = result.example || result.feedback || result.overall || "暂无示例。";
+      const card = currentCard();
+      const fallbackWeakIds = card && Array.isArray(card.weak_point_ids) ? card.weak_point_ids : [];
+      const weakResults = Array.isArray(result.weak_results) && result.weak_results.length
+        ? result.weak_results
+        : fallbackWeakIds.map((id) => ({weak_point_id: id, point: id, suggested_action: "retry", reason: result.feedback || result.overall || ""}));
+      const weakResultsHtml = weakResults.length
+        ? `<div class="weak-results">${weakResults.map((item) => {
+            const action = item.suggested_action === "improve" ? "improve" : "retry";
+            return `<div class="weak-result">
+              <p><strong>${escapeHtml(action === "improve" ? "建议确认改善" : "建议继续练习")}</strong>：${escapeHtml(item.point || item.weak_point_id || "")}</p>
+              ${item.reason ? `<p>${escapeHtml(item.reason)}</p>` : ""}
+              <div class="actions">
+                <button type="button" data-weak-id="${escapeHtml(item.weak_point_id || "")}" data-weak-action="improve">确认改善</button>
+                <button type="button" class="danger" data-weak-id="${escapeHtml(item.weak_point_id || "")}" data-weak-action="retry">还要再练</button>
+              </div>
+            </div>`;
+          }).join("")}</div>`
+        : `<div class="actions">
           <button type="button" data-action="improve">确认改善</button>
           <button type="button" class="danger" data-action="retry">还要再练</button>
-        </div>
+        </div>`;
+      node.innerHTML = `
+        <p>✓ ${escapeHtml(correct)}</p>
+        <p>⚠ ${escapeHtml(missed)}</p>
+        <p><strong>示例：</strong><br>${escapeHtml(example)}</p>
+        ${renderCitations(result.citations || [])}
+        ${weakResultsHtml}
       `;
     }
-
     document.addEventListener("click", async (event) => {
       if (event.target.dataset.nav) move(Number(event.target.dataset.nav));
       if (event.target.id === "submitVerify") await submitVerify();
+      if (event.target.dataset.weakAction) await commitWeakAction(event.target.dataset.weakId, event.target.dataset.weakAction);
       if (event.target.dataset.action) await commitAction(event.target.dataset.action);
-      if (event.target.id === "endReview") renderDone(true);
       if (event.target.id === "reloadDue") await loadDue();
       if (event.target.id === "newReview") await loadDue();
+      if (event.target.id === "cardMode") await loadDue();
+      if (event.target.id === "dialogueMode") renderDialogueReview();
+      if (event.target.id === "sendDialogueReview") await sendDialogueReview();
+      if (event.target.id === "endReview") {
+        stopPolling();
+        renderDone(true);
+        setStatus("已结束本轮复习。");
+      }
     });
 
     function move(delta) {
       if (!state.cards.length) return;
-      state.index = (state.index + delta + state.cards.length) % state.cards.length;
+      let nextIndex = state.index;
+      for (let offset = 0; offset < state.cards.length; offset += 1) {
+        nextIndex = (nextIndex + delta + state.cards.length) % state.cards.length;
+        if (isCardUsable(state.cards[nextIndex])) break;
+      }
+      state.index = nextIndex;
       state.verify = null;
       renderCard();
+    }
+
+    function isCardUsable(card) {
+      return Boolean(card && card.review_prompt && card.review_prompt.prompt);
+    }
+
+    function selectFirstUsableCard() {
+      if (isCardUsable(currentCard())) return true;
+      const index = state.cards.findIndex(isCardUsable);
+      if (index >= 0) {
+        state.index = index;
+        return true;
+      }
+      return false;
     }
 
     async function submitVerify() {
@@ -5519,7 +5841,15 @@ REVIEW_HTML = r"""<!doctype html>
       setBusy(true, "正在对照笔记纠偏...");
       try {
         const prompt = card.review_prompt?.prompt || card.point || "";
-        const result = await postJson("/api/review/verify", {weak_point_id: card.id, answer, prompt});
+        const weakPointIds = Array.isArray(card.weak_point_ids) && card.weak_point_ids.length ? card.weak_point_ids : [card.id];
+        const result = await postJson("/api/review/verify", {
+          card_id: card.card_id || card.id,
+          weak_point_ids: weakPointIds,
+          weak_point_id: weakPointIds[0] || card.id,
+          answer,
+          prompt,
+          question_blocks: card.question_blocks || card.review_prompt?.question_blocks || [],
+        });
         state.verify = result;
         renderVerifyResult(result);
         setStatus("纠偏完成。确认改善或继续练习后会进入下一条。");
@@ -5546,6 +5876,83 @@ REVIEW_HTML = r"""<!doctype html>
       } finally {
         setBusy(false);
       }
+    }
+
+    async function commitWeakAction(weakPointId, action) {
+      const card = currentCard();
+      const weakId = String(weakPointId || "").trim();
+      if (!weakId) return;
+      setBusy(true, "正在保存该弱项的复习结果...");
+      try {
+        const result = await postJson("/api/review/commit", {weak_point_id: weakId, action});
+        card.confirmed_weak_points = card.confirmed_weak_points || {};
+        card.confirmed_weak_points[weakId] = action;
+        state.results.push({card_id: card.id, weak_point_id: weakId, action, result});
+        const expected = Array.isArray(card.weak_point_ids) && card.weak_point_ids.length ? card.weak_point_ids : [card.id];
+        const allDone = expected.every((id) => card.confirmed_weak_points[id]);
+        if (allDone) {
+          state.cards.splice(state.index, 1);
+          state.verify = null;
+          if (state.index >= state.cards.length) state.index = 0;
+          if (!state.cards.length) renderDone(false);
+          else renderCard();
+        } else if (state.verify) {
+          renderVerifyResult(state.verify);
+        }
+        setStatus(action === "improve" ? "已确认该弱项改善。" : "已标记该弱项继续练习。");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function renderDialogueReview() {
+      stopPolling();
+      hide($("cardPanel"));
+      show($("donePanel"));
+      state.dialogueHistory = state.dialogueHistory || [];
+      $("donePanel").innerHTML = `
+        <h3>对话复查</h3>
+        <p>Agent 会读取当前 topic 的到期弱项，逐条追问并给出建议；不会自动写入 profile。</p>
+        <input id="dialogueTopic" style="width:100%;border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px" placeholder="可选 topic，例如 MCP 协议" />
+        <div id="dialogueMessages" class="result compact"></div>
+        <textarea id="dialogueMessage" placeholder="输入：开始对这个 topic 做对话复查，或回答 Agent 的追问。"></textarea>
+        <div class="actions">
+          <button id="sendDialogueReview" type="button">发送</button>
+          <button id="cardMode" class="secondary" type="button">回到逐条对照</button>
+        </div>
+      `;
+      setStatus("已切换到对话复查。");
+    }
+
+    async function sendDialogueReview() {
+      const input = $("dialogueMessage");
+      const topic = $("dialogueTopic")?.value.trim() || "";
+      const message = input.value.trim();
+      if (!message) { setStatus("请先输入对话内容。", true); return; }
+      state.dialogueHistory = state.dialogueHistory || [];
+      state.dialogueHistory.push({role: "user", content: message});
+      input.value = "";
+      renderDialogueMessages();
+      setBusy(true, "正在进行对话复查...");
+      try {
+        const result = await postJson("/api/review/dialogue", {topic, message, chat_history: state.dialogueHistory});
+        state.dialogueHistory.push({role: "assistant", content: result.answer || result.error || ""});
+        renderDialogueMessages();
+        setStatus("对话复查已更新。");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function renderDialogueMessages() {
+      const node = $("dialogueMessages");
+      if (!node) return;
+      const history = state.dialogueHistory || [];
+      node.innerHTML = history.map((item) => `<p><strong>${item.role === "user" ? "你" : "Agent"}：</strong>${escapeHtml(item.content || "")}</p>`).join("");
     }
 
     function renderDone(ended) {
@@ -5588,58 +5995,31 @@ REVIEW_HTML = r"""<!doctype html>
         if (currentCard()?.id === card.id) renderCard();
       }
     }
-    function renderTrainingTarget(main, card) {
-      const point = main.point || card.point || "";
-      const evidence = main.evidence || card.evidence || "";
-      if (!point && !evidence) return "";
-      return `
-        <details class="training-target">
-          <summary>训练目标</summary>
-          <div class="target-body">
-            ${point ? `<div>${escapeHtml(point)}</div>` : ""}
-            ${evidence ? `<div>上次暴露：${escapeHtml(evidence)}</div>` : ""}
-          </div>
-        </details>
-      `;
-    }
     function renderStrategyConstraints(items) {
       const constraints = Array.isArray(items) ? items.filter((item) => item && item.point) : [];
       if (!constraints.length) return "";
-      return `
-        <div class="strategy-box">
-          <h3>本题作答要求</h3>
-          <ul>${constraints.map((item) => `<li>${escapeHtml(item.point)}</li>`).join("")}</ul>
-        </div>
-      `;
+      const tips = [];
+      for (const item of constraints) {
+        const tip = strategyTipLabel(item.point);
+        if (tip && !tips.includes(tip)) tips.push(tip);
+        if (tips.length >= 3) break;
+      }
+      if (!tips.length) return "";
+      return `<div class="strategy-tip">💡 本次复习关注：${tips.map(escapeHtml).join(" · ")}</div>`;
     }
-    function renderStrategyFeedback(items) {
+    function strategyTipLabel(point) {
+      const text = String(point || "");
+      if (!text.trim()) return "";
+      if (text.includes("回答过短") || text.includes("推理展开") || text.includes("系统性工程思维")) return "展开推理过程";
+      if (text.includes("简单归因") || text.includes("部署拓扑") || text.includes("部署场景")) return "按部署场景做判断";
+      if (text.includes("边界") || text.includes("职责")) return "先区分边界";
+      if (text.includes("选型") || text.includes("取舍")) return "说明工程取舍";
+      if (text.includes("结构") || text.includes("框架")) return "先给结论再分层展开";
+      return text.length > 18 ? `${text.slice(0, 18)}...` : text;
+    }
+    function firstText(items, emptyText) {
       const values = Array.isArray(items) ? items.filter(Boolean) : [];
-      if (!values.length) return "";
-      return `
-        <div class="result-line">
-          <h3>作答要求反馈</h3>
-          ${renderList(values, "暂无作答要求反馈。")}
-        </div>
-      `;
-    }
-    function renderSourceDetails(paths) {
-      const values = Array.isArray(paths) ? paths.filter(Boolean) : [];
-      if (!values.length) return `<details class="source-details"><summary>来源</summary><div class="meta">未记录来源笔记</div></details>`;
-      const visible = values.slice(0, 3);
-      const extra = values.length - visible.length;
-      return `
-        <details class="source-details">
-          <summary>来源 (${values.length})</summary>
-          <div class="source-chips">
-            ${visible.map((path) => `<span class="source-chip" title="${escapeHtml(path)}">${escapeHtml(fileName(path))}</span>`).join("")}
-            ${extra > 0 ? `<span class="source-chip" title="${escapeHtml(values.slice(3).join("，"))}">+${extra}</span>` : ""}
-          </div>
-        </details>
-      `;
-    }
-    function fileName(path) {
-      const normalized = String(path || "").replaceAll("\\", "/");
-      return normalized.split("/").filter(Boolean).pop() || normalized || "source";
+      return values.length ? String(values[0]) : emptyText;
     }
     function renderList(items, emptyText) {
       const values = Array.isArray(items) ? items.filter(Boolean) : [];
@@ -5984,6 +6364,754 @@ REVIEW_LEGACY_HTML = r"""<!doctype html>
     function setBusy(busy, message="") { $("startBtn").disabled = busy; if (message) setStatus(message); }
     function show(node) { node.classList.remove("hidden"); }
     function hide(node) { node.classList.add("hidden"); }
+    function escapeHtml(value) { return String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;"); }
+  </script>
+</body>
+</html>
+"""
+
+
+REVIEW_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>复习</title>
+  <style>
+    :root { --bg:#f7f7f4; --panel:#fff; --line:#d9d9d2; --text:#171717; --muted:#666; --accent:#0f766e; --accent-dark:#115e59; --danger:#b42318; --chip:#eef2f1; --ok:#0f766e; --warn:#9a5b00; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width:min(960px, calc(100vw - 32px)); margin:0 auto; padding:24px 0 48px; display:grid; gap:14px; }
+    .panel { border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:18px; }
+    .tabs { display:flex; flex-wrap:wrap; gap:8px; align-items:center; border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:8px; }
+    .tab { display:inline-flex; align-items:center; gap:8px; border:1px solid transparent; border-radius:8px; background:#fff; color:var(--muted); padding:8px 10px; font-weight:850; }
+    .tab.active { border-color:rgba(15,118,110,.26); background:#e7f3f1; color:var(--accent-dark); }
+    .tab-close { border:0; background:transparent; color:inherit; padding:0 2px; min-width:0; font-size:16px; line-height:1; }
+    .tab-close:hover { color:var(--danger); }
+    .page-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
+    h2 { margin:0 0 8px; font-size:25px; }
+    h3 { margin:0 0 10px; font-size:18px; }
+    p { margin:0 0 12px; color:var(--muted); line-height:1.65; }
+    textarea { width:100%; min-height:140px; resize:vertical; border:1px solid var(--line); border-radius:8px; padding:11px 12px; line-height:1.65; font:inherit; color:var(--text); background:#fff; }
+    button { border:1px solid var(--accent); border-radius:7px; background:var(--accent); color:#fff; padding:8px 12px; cursor:pointer; font-weight:800; font:inherit; }
+    button.secondary { background:#fff; color:var(--accent-dark); border-color:var(--line); }
+    button.danger { background:#fff; color:var(--danger); border-color:#f3b5ad; }
+    button.close { width:34px; height:34px; padding:0; border-radius:999px; background:#fff; color:var(--muted); border-color:var(--line); font-size:18px; line-height:1; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .status { color:var(--muted); font-size:13px; min-height:20px; }
+    .status.error { color:var(--danger); }
+    .hidden { display:none !important; }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; align-items:center; }
+    .topic-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(180px, 1fr)); gap:10px; margin-top:12px; }
+    .topic-chip { display:flex; justify-content:space-between; align-items:center; gap:10px; border:1px solid rgba(15,118,110,.26); border-radius:10px; background:#e7f3f1; color:#143b36; padding:10px 12px; cursor:pointer; text-align:left; }
+    .topic-chip .name { font-weight:850; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .topic-chip .count { color:var(--accent-dark); font-size:12px; font-weight:800; flex:0 0 auto; }
+    .topic-chip.unselected { background:#fff; border-color:var(--line); color:var(--muted); opacity:.62; }
+    .topic-chip.unselected .count { color:var(--muted); }
+    .overview-line { display:flex; gap:8px; flex-wrap:wrap; color:var(--muted); font-size:13px; }
+    .badge { display:inline-flex; border-radius:999px; padding:3px 8px; background:var(--chip); color:#3f3f3f; font-size:12px; font-weight:750; }
+    .nav-row { display:flex; justify-content:space-between; gap:8px; align-items:center; margin-bottom:12px; }
+    .weak-point { border-left:4px solid var(--accent); padding:12px 14px; background:#f5fbfa; border-radius:8px; line-height:1.7; font-size:18px; font-weight:760; }
+    .strategy-tip { margin-top:8px; color:var(--muted); font-size:13px; line-height:1.55; }
+    .meta { margin-top:8px; color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+    .result { border-top:1px solid var(--line); margin-top:16px; padding-top:16px; display:grid; gap:12px; }
+    .result.compact { gap:8px; line-height:1.65; }
+    .result.compact p { margin:0; color:var(--text); }
+    .weak-result { border:1px solid var(--line); border-radius:8px; padding:10px; background:#fff; margin-top:8px; }
+    .citations { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+    .citation { border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; background:#f8fbfa; color:#334155; }
+    .dialogue { display:grid; gap:10px; margin:12px 0; }
+    .bubble { border:1px solid var(--line); border-radius:10px; padding:10px 12px; line-height:1.65; background:#fff; }
+    .bubble.user { margin-left:8%; background:#fdfdfb; }
+    .bubble.assistant { margin-right:8%; background:#f6fbfa; }
+    .bubble p { margin:0 0 10px; color:var(--text); }
+    .bubble p:last-child { margin-bottom:0; }
+    .bubble ul, .bubble ol { margin:8px 0 10px 20px; padding:0; }
+    .bubble hr { border:0; border-top:1px solid var(--line); margin:12px 0; }
+    .bubble code { background:#eef2f1; border-radius:4px; padding:1px 4px; }
+    .bubble pre { overflow-x:auto; background:#eef2f1; border-radius:7px; padding:10px; }
+    .bubble table { width:100%; border-collapse:collapse; margin:10px 0 12px; font-size:14px; line-height:1.5; }
+    .bubble th, .bubble td { border:1px solid var(--line); padding:7px 9px; text-align:left; vertical-align:top; }
+    .bubble th { background:#eef2f1; font-weight:800; }
+    .bubble tr:nth-child(even) td { background:#fafbf9; }
+    .empty { border:1px dashed var(--line); border-radius:10px; padding:18px; color:var(--muted); background:#fff; }
+    @media (max-width:760px) { .page-head, .nav-row { display:block; } .bubble.user, .bubble.assistant { margin:0; } }
+  </style>
+</head>
+<body>
+  <main>
+    <nav id="reviewTabs" class="tabs" aria-label="复习模式"></nav>
+    <section id="selectPanel" class="panel"></section>
+    <section id="cardPanel" class="panel hidden"></section>
+    <section id="dialoguePanel" class="panel hidden"></section>
+    <section id="donePanel" class="panel hidden"></section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let mode = "selecting";
+    let selectionState = {topics: [], selectedTopics: new Set(), loading: false};
+    let cardReviewState = freshCardReviewState();
+    let dialogueReviewState = freshDialogueReviewState();
+
+    document.addEventListener("click", async (event) => {
+      const target = event.target;
+      if (target.dataset.topicToggle) toggleTopic(target.dataset.topicToggle);
+      if (target.dataset.tab) switchTab(target.dataset.tab);
+      if (target.dataset.closeTab) closeReviewTab(target.dataset.closeTab, event);
+      if (target.id === "selectAllTopics") selectAllTopics();
+      if (target.id === "clearTopics") clearTopics();
+      if (target.id === "startCardReview") await startCardReview();
+      if (target.id === "startDialogueReview") await startDialogueReview();
+      if (target.dataset.nav) moveCard(Number(target.dataset.nav));
+      if (target.id === "submitVerify") await submitVerify();
+      if (target.dataset.weakAction) await commitWeakAction(target.dataset.weakId, target.dataset.weakAction);
+      if (target.id === "newReview") exitToSelecting();
+      if (target.id === "sendDialogueReview") await sendDialogueReview();
+    });
+
+    loadSelection();
+
+    function freshCardReviewState() {
+      return {active: false, reviewRunId: "", runStatus: "", cards: [], index: 0, verify: null, results: [], pollTimer: null, topics: [], doneTitle: "", doneMessage: ""};
+    }
+
+    function freshDialogueReviewState() {
+      return {active: false, topics: [], history: [], pendingSuggestions: [], busy: false};
+    }
+
+    async function loadSelection() {
+      mode = "selecting";
+      selectionState.loading = true;
+      render();
+      try {
+        const data = await getJson("/api/review/due?limit=50");
+        selectionState.topics = Array.isArray(data.topics) ? data.topics : [];
+        selectionState.selectedTopics = new Set(selectionState.topics.map((item) => item.topic).filter(Boolean));
+        selectionState.overview = data;
+      } catch (error) {
+        selectionState.error = error.message || String(error);
+      } finally {
+        selectionState.loading = false;
+        render();
+      }
+    }
+
+    function render() {
+      $("donePanel").classList.add("hidden");
+      renderTabs();
+      $("selectPanel").classList.toggle("hidden", mode !== "selecting");
+      $("cardPanel").classList.toggle("hidden", mode !== "card_review" || !cardReviewState.active);
+      $("dialoguePanel").classList.toggle("hidden", mode !== "dialogue_review" || !dialogueReviewState.active);
+      if (mode === "selecting") renderSelecting();
+      if (mode === "card_review" && cardReviewState.active) renderCardReview();
+      if (mode === "dialogue_review" && dialogueReviewState.active) renderDialogueReview();
+    }
+
+    function renderTabs() {
+      const tabs = [
+        `<button type="button" class="tab ${mode === "selecting" ? "active" : ""}" data-tab="selecting">复习总览</button>`
+      ];
+      if (cardReviewState.active) {
+        tabs.push(`<button type="button" class="tab ${mode === "card_review" ? "active" : ""}" data-tab="card_review">逐条对照 <span class="tab-close" data-close-tab="card_review" title="关闭逐条对照">×</span></button>`);
+      }
+      if (dialogueReviewState.active) {
+        tabs.push(`<button type="button" class="tab ${mode === "dialogue_review" ? "active" : ""}" data-tab="dialogue_review">对话复查 <span class="tab-close" data-close-tab="dialogue_review" title="关闭对话复查">×</span></button>`);
+      }
+      $("reviewTabs").innerHTML = tabs.join("");
+    }
+
+    function switchTab(tab) {
+      if (tab === "card_review" && !cardReviewState.active) return;
+      if (tab === "dialogue_review" && !dialogueReviewState.active) return;
+      if (!["selecting", "card_review", "dialogue_review"].includes(tab)) return;
+      mode = tab;
+      render();
+    }
+
+    function closeReviewTab(tab, event) {
+      event?.stopPropagation?.();
+      if (tab === "card_review") {
+        const total = cardReviewState.cards.length + cardReviewState.results.length;
+        const done = cardReviewState.results.length;
+        const message = `你在这轮逐条对照里已处理 ${done}/${total || 0} 条，确定结束？`;
+        if (!window.confirm(message)) return;
+        stopPolling();
+        cardReviewState = freshCardReviewState();
+        if (mode === "card_review") mode = "selecting";
+      } else if (tab === "dialogue_review") {
+        const rounds = Math.floor((dialogueReviewState.history || []).length / 2);
+        if (!window.confirm(`本轮对话已进行 ${rounds} 轮，确定结束？`)) return;
+        dialogueReviewState = freshDialogueReviewState();
+        if (mode === "dialogue_review") mode = "selecting";
+      }
+      render();
+    }
+
+    function renderSelecting() {
+      const selectedCount = selectionState.selectedTopics.size;
+      const dueCount = selectionState.overview?.due_count || 0;
+      const overdueCount = selectionState.overview?.overdue_count || 0;
+      const strategyCount = selectionState.overview?.strategy_due_count || 0;
+      const disabled = selectedCount === 0 || selectionState.loading;
+      const topicsHtml = selectionState.topics.length
+        ? `<div class="topic-grid">${selectionState.topics.map((item) => {
+            const topic = item.topic || "";
+            const selected = selectionState.selectedTopics.has(topic);
+            return `<button type="button" class="topic-chip ${selected ? "" : "unselected"}" data-topic-toggle="${escapeHtml(topic)}">
+              <span class="name">${escapeHtml(topic)}</span>
+              <span class="count">${escapeHtml(item.due || 0)} 到期</span>
+            </button>`;
+          }).join("")}</div>`
+        : `<div class="empty">暂无到期知识弱项。可以先完成一次面试并结束 session 后再回来复习。</div>`;
+      const workspaceHtml = renderWorkspaceSummary();
+      $("selectPanel").innerHTML = `
+        <div class="page-head">
+          <div>
+            <h2>选择本轮复习范围</h2>
+            <p>默认全选所有到期 topic。进入逐条对照或对话复查后，本轮范围会固定。</p>
+          </div>
+        </div>
+        <div class="overview-line">
+          <span>知识弱项 ${escapeHtml(dueCount)} 个到期</span>
+          <span>逾期 ${escapeHtml(overdueCount)} 个</span>
+          ${strategyCount ? `<span>策略弱项 ${escapeHtml(strategyCount)} 个需在面试中训练</span>` : ""}
+        </div>
+        <div id="status" class="status ${selectionState.error ? "error" : ""}">${selectionState.loading ? "正在加载到期 topic..." : escapeHtml(selectionState.error || selectionState.overview?.summary || "")}</div>
+        <div class="actions">
+          <button id="selectAllTopics" class="secondary" type="button">全选</button>
+          <button id="clearTopics" class="secondary" type="button">清空</button>
+          <span class="status">已选 ${selectedCount} / ${selectionState.topics.length}</span>
+        </div>
+        ${topicsHtml}
+        ${workspaceHtml}
+        <div class="actions">
+          <button id="startCardReview" type="button" ${disabled ? "disabled" : ""}>${cardReviewState.active ? "进入逐条对照" : "开始逐条对照"}</button>
+          <button id="startDialogueReview" class="secondary" type="button" ${disabled ? "disabled" : ""}>${dialogueReviewState.active ? "进入对话复查" : "开始对话复查"}</button>
+        </div>
+      `;
+    }
+
+    function renderWorkspaceSummary() {
+      const items = [];
+      if (cardReviewState.active) {
+        items.push(`<div class="empty"><strong>逐条对照进行中</strong> (${escapeHtml(cardProgressSummary())})</div>`);
+      }
+      if (dialogueReviewState.active) {
+        items.push(`<div class="empty"><strong>对话复查进行中</strong> (已聊 ${escapeHtml(dialogueRoundCount())} 轮)</div>`);
+      }
+      return items.length ? `<div style="display:grid;gap:8px;margin-top:12px">${items.join("")}</div>` : "";
+    }
+
+    function toggleTopic(topic) {
+      if (!topic) return;
+      if (selectionState.selectedTopics.has(topic)) selectionState.selectedTopics.delete(topic);
+      else selectionState.selectedTopics.add(topic);
+      renderSelecting();
+    }
+
+    function selectAllTopics() {
+      selectionState.selectedTopics = new Set(selectionState.topics.map((item) => item.topic).filter(Boolean));
+      renderSelecting();
+    }
+
+    function clearTopics() {
+      selectionState.selectedTopics = new Set();
+      renderSelecting();
+    }
+
+    function selectedTopics() {
+      return Array.from(selectionState.selectedTopics);
+    }
+
+    function cardProgressSummary() {
+      const total = cardReviewState.cards.length + cardReviewState.results.length;
+      const done = cardReviewState.results.length;
+      if (cardReviewState.doneTitle) return cardReviewState.doneTitle;
+      if (!total) return "正在准备";
+      return `${done}/${total} 条`;
+    }
+
+    function dialogueRoundCount() {
+      return Math.floor((dialogueReviewState.history || []).length / 2);
+    }
+
+    async function startCardReview() {
+      if (cardReviewState.active) {
+        mode = "card_review";
+        render();
+        return;
+      }
+      const topics = selectedTopics();
+      if (!topics.length) return;
+      mode = "card_review";
+      cardReviewState = {...freshCardReviewState(), active: true, topics};
+      render();
+      setStatus("正在创建逐条对照本轮题目...");
+      try {
+        const data = await postJson("/api/review/plan", {topics, limit: 12, max_strategy_constraints: 2});
+        cardReviewState.reviewRunId = data.review_run_id || "";
+        cardReviewState.runStatus = data.status || "";
+        cardReviewState.cards = data.cards || [];
+        if (!cardReviewState.cards.length) {
+          cardReviewState.doneTitle = "暂无可复习卡片";
+          cardReviewState.doneMessage = data.summary || "所选 topic 当前没有到期知识弱项。";
+          renderCardReview();
+          return;
+        }
+        selectFirstUsableCard();
+        renderCardReview();
+        startPolling();
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      }
+    }
+
+    function startPolling() {
+      stopPolling();
+      if (!cardReviewState.reviewRunId) return;
+      cardReviewState.pollTimer = window.setInterval(pollReviewRun, 1200);
+      pollReviewRun();
+    }
+
+    function stopPolling() {
+      if (cardReviewState.pollTimer) window.clearInterval(cardReviewState.pollTimer);
+      cardReviewState.pollTimer = null;
+    }
+
+    async function pollReviewRun() {
+      if (!cardReviewState.reviewRunId || !cardReviewState.active) return;
+      try {
+        const beforeCard = currentCard();
+        const beforeCardId = beforeCard?.id || "";
+        const hadUsableCurrent = isCardUsable(beforeCard);
+        const data = await getJson(`/api/review/plan/${encodeURIComponent(cardReviewState.reviewRunId)}`);
+        cardReviewState.runStatus = data.status || "";
+        cardReviewState.cards = mergeCards(cardReviewState.cards, data.cards || []);
+        if (!currentCard() || !isCardUsable(currentCard())) selectFirstUsableCard();
+        const afterCard = currentCard();
+        const shouldRender = !hadUsableCurrent || beforeCardId !== (afterCard?.id || "");
+        if (mode === "card_review" && shouldRender) renderCardReview();
+        if (mode === "selecting") renderSelecting();
+        const ready = data.ready_count || 0;
+        const pending = data.pending_count || 0;
+        const failed = data.failed_count || 0;
+        if (mode === "card_review" && (ready || failed)) setStatus(`已准备 ${ready} 题，待生成 ${pending} 题${failed ? `，失败 ${failed} 题` : ""}。`);
+        if ((data.status || "") === "done") stopPolling();
+      } catch (error) {
+        stopPolling();
+        setStatus(error.message || String(error), true);
+      }
+    }
+
+    function renderCardReview() {
+      const topicLine = cardReviewState.topics.join("、");
+      const card = currentCard();
+      if (cardReviewState.doneTitle) {
+        $("cardPanel").innerHTML = `
+          <div class="page-head"><div><h2>逐条对照</h2><p>范围：${escapeHtml(topicLine)}</p></div></div>
+          <div class="empty"><strong>${escapeHtml(cardReviewState.doneTitle)}</strong><br>${escapeHtml(cardReviewState.doneMessage || "")}</div>
+        `;
+        return;
+      }
+      if (!card) {
+        $("cardPanel").innerHTML = `
+          <div class="page-head"><div><h2>逐条对照</h2><p>范围：${escapeHtml(topicLine)}</p></div></div>
+          <div id="status" class="status">正在准备题目...</div>
+        `;
+        return;
+      }
+      if (!isCardUsable(card)) {
+        const ready = cardReviewState.cards.filter(isCardUsable).length;
+        const pending = cardReviewState.cards.filter((item) => item.status === "pending").length;
+        $("cardPanel").innerHTML = `
+          <div class="page-head"><div><h2>逐条对照</h2><p>范围：${escapeHtml(topicLine)}</p></div></div>
+          <div id="status" class="status">已准备 ${ready} 题，待生成 ${pending} 题。</div>
+          <div class="empty">第一题准备好后会自动显示。</div>
+        `;
+        return;
+      }
+      const promptPayload = card.review_prompt || null;
+      const promptText = promptPayload?.prompt || "正在生成复习题...";
+      const promptReady = Boolean(promptPayload?.prompt);
+      $("cardPanel").innerHTML = `
+        <div class="page-head"><div><h2>逐条对照</h2><p>范围：${escapeHtml(topicLine)}</p></div></div>
+        <div id="status" class="status">${escapeHtml(card.topic || "未分类")} · ${topicProgress(card)}</div>
+        <div class="nav-row">
+          <button class="secondary" type="button" data-nav="-1" aria-label="上一条">←</button>
+          <span class="badge">第 ${cardReviewState.index + 1} / ${cardReviewState.cards.length} 题</span>
+          <button class="secondary" type="button" data-nav="1" aria-label="下一条">→</button>
+        </div>
+        <div class="weak-point">${escapeHtml(promptText)}</div>
+        ${promptPayload?.hint ? `<div class="meta">提示：${escapeHtml(promptPayload.hint)}</div>` : ""}
+        <textarea id="reviewAnswer" style="margin-top:14px" placeholder="先凭记忆回答，再提交对照。"></textarea>
+        ${renderStrategyConstraints(card.strategy_constraints || [])}
+        <div class="actions"><button id="submitVerify" type="button" ${promptReady ? "" : "disabled"}>提交</button></div>
+        <div id="verifyResult" class="result hidden"></div>
+      `;
+    }
+
+    function renderVerifyResult(result) {
+      const node = $("verifyResult");
+      if (!node) return;
+      node.classList.remove("hidden");
+      node.className = "result compact";
+      const correct = firstText(result.correct || [], "方向基本正确。");
+      const missedValues = [].concat(Array.isArray(result.missed) ? result.missed : []).concat(Array.isArray(result.strategy_feedback) ? result.strategy_feedback : []).filter(Boolean);
+      const missed = firstText(missedValues, "没有明显遗漏。");
+      const example = result.example || result.feedback || result.overall || "暂无示例。";
+      const card = currentCard();
+      const fallbackWeakIds = card && Array.isArray(card.weak_point_ids) ? card.weak_point_ids : [];
+      const weakResults = Array.isArray(result.weak_results) && result.weak_results.length
+        ? result.weak_results
+        : fallbackWeakIds.map((id) => ({weak_point_id: id, point: id, suggested_action: "retry", reason: result.feedback || result.overall || ""}));
+      node.innerHTML = `
+        <p>✓ ${escapeHtml(correct)}</p>
+        <p>⚠ ${escapeHtml(missed)}</p>
+        <p><strong>示例：</strong><br>${escapeHtml(example)}</p>
+        ${renderCitations(result.citations || [])}
+        <div class="weak-results">${weakResults.map((item) => {
+          const action = item.suggested_action === "improve" ? "improve" : "retry";
+          return `<div class="weak-result">
+            <p><strong>${escapeHtml(action === "improve" ? "建议确认改善" : "建议继续练习")}</strong>：${escapeHtml(item.point || item.weak_point_id || "")}</p>
+            ${item.reason ? `<p>${escapeHtml(item.reason)}</p>` : ""}
+            <div class="actions">
+              <button type="button" data-weak-id="${escapeHtml(item.weak_point_id || "")}" data-weak-action="improve">确认改善</button>
+              <button type="button" class="danger" data-weak-id="${escapeHtml(item.weak_point_id || "")}" data-weak-action="retry">还要再练</button>
+            </div>
+          </div>`;
+        }).join("")}</div>
+      `;
+    }
+
+    async function submitVerify() {
+      const card = currentCard();
+      const answer = $("reviewAnswer")?.value.trim() || "";
+      if (!answer) { setStatus("请先写下你的理解。", true); return; }
+      setBusy(true, "正在对照笔记纠偏...");
+      try {
+        const prompt = card.review_prompt?.prompt || card.point || "";
+        const weakPointIds = Array.isArray(card.weak_point_ids) && card.weak_point_ids.length ? card.weak_point_ids : [card.id];
+        const result = await postJson("/api/review/verify", {
+          card_id: card.card_id || card.id,
+          weak_point_ids: weakPointIds,
+          weak_point_id: weakPointIds[0] || card.id,
+          answer,
+          prompt,
+          question_blocks: card.question_blocks || card.review_prompt?.question_blocks || [],
+        });
+        cardReviewState.verify = result;
+        renderVerifyResult(result);
+        setStatus("纠偏完成。确认改善或继续练习后会进入下一条。");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function commitWeakAction(weakPointId, action) {
+      const card = currentCard();
+      const weakId = String(weakPointId || "").trim();
+      if (!weakId || !card) return;
+      setBusy(true, "正在保存该弱项的复习结果...");
+      try {
+        const result = await postJson("/api/review/commit", {weak_point_id: weakId, action});
+        card.confirmed_weak_points = card.confirmed_weak_points || {};
+        card.confirmed_weak_points[weakId] = action;
+        cardReviewState.results.push({card_id: card.id, weak_point_id: weakId, action, result});
+        const expected = Array.isArray(card.weak_point_ids) && card.weak_point_ids.length ? card.weak_point_ids : [card.id];
+        const allDone = expected.every((id) => card.confirmed_weak_points[id]);
+        if (allDone) {
+          cardReviewState.cards.splice(cardReviewState.index, 1);
+          cardReviewState.verify = null;
+          if (cardReviewState.index >= cardReviewState.cards.length) cardReviewState.index = 0;
+          if (!cardReviewState.cards.length) {
+            cardReviewState.doneTitle = "本轮复习完成";
+            cardReviewState.doneMessage = result.message || "已处理所有卡片。";
+            renderCardReview();
+          }
+          else renderCardReview();
+        } else if (cardReviewState.verify) {
+          renderVerifyResult(cardReviewState.verify);
+        }
+        setStatus(action === "improve" ? "已确认该弱项改善。" : "已标记该弱项继续练习。");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function startDialogueReview() {
+      if (dialogueReviewState.active) {
+        mode = "dialogue_review";
+        render();
+        return;
+      }
+      const topics = selectedTopics();
+      if (!topics.length) return;
+      mode = "dialogue_review";
+      dialogueReviewState = {...freshDialogueReviewState(), active: true, topics};
+      render();
+      await sendDialogueReview("请开始本轮对话复查。先从选中 topic 的到期弱项中选择一个最适合开始的点，直接提出第一题。", true);
+    }
+
+    function renderDialogueReview() {
+      const topics = dialogueReviewState.topics.join("、");
+      $("dialoguePanel").innerHTML = `
+        <div class="page-head"><div><h2>对话复查</h2><p>范围：${escapeHtml(topics)}</p></div></div>
+        <div id="status" class="status">${dialogueReviewState.busy ? "正在进行对话复查..." : "对话复查不会自动写入 profile，确认建议后再提交更新。"}</div>
+        <div id="dialogueMessages" class="dialogue">${renderDialogueMessages()}</div>
+        <textarea id="dialogueMessage" placeholder="回答 Agent 的追问。"></textarea>
+        <div class="actions"><button id="sendDialogueReview" type="button" ${dialogueReviewState.busy ? "disabled" : ""}>发送</button></div>
+      `;
+    }
+
+    function renderDialogueMessages() {
+      const history = dialogueReviewState.history || [];
+      if (!history.length) return `<div class="empty">正在启动对话复查...</div>`;
+      return history.map((item) => {
+        const isUser = item.role === "user";
+        const content = isUser ? escapeHtml(item.content || "") : renderReviewMarkdown(item.content || "");
+        return `<div class="bubble ${isUser ? "user" : "assistant"}"><strong>${isUser ? "你" : "Agent"}：</strong>${content}</div>`;
+      }).join("");
+    }
+
+    function renderReviewMarkdown(text) {
+      const codeBlocks = [];
+      let source = String(text || "").replace(/```([\s\S]*?)```/g, (_match, code) => {
+        const token = `@@CODE_${codeBlocks.length}@@`;
+        codeBlocks.push(`<pre><code>${escapeHtml(code.trim())}</code></pre>`);
+        return token;
+      });
+      source = escapeHtml(source);
+      const lines = source.split(/\r?\n/);
+      const html = [];
+      let list = [];
+      let orderedList = [];
+      const flush = () => {
+        if (list.length) {
+          html.push(`<ul>${list.map((item) => `<li>${inlineReviewMarkdown(item)}</li>`).join("")}</ul>`);
+          list = [];
+        }
+        if (orderedList.length) {
+          html.push(`<ol>${orderedList.map((item) => `<li>${inlineReviewMarkdown(item)}</li>`).join("")}</ol>`);
+          orderedList = [];
+        }
+      };
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        const trimmed = line.trim();
+        if (!trimmed) {
+          const previous = lines[i - 1] ? lines[i - 1].trim() : "";
+          const next = lines[i + 1] ? lines[i + 1].trim() : "";
+          if (isReviewTableRow(previous) && isReviewTableRow(next)) continue;
+          flush();
+          continue;
+        }
+        if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+          flush();
+          html.push("<hr>");
+          continue;
+        }
+        const heading = /^(#{1,4})\s+(.+)$/.exec(trimmed);
+        if (heading) {
+          flush();
+          const level = Math.min(heading[1].length + 2, 5);
+          html.push(`<h${level}>${inlineReviewMarkdown(heading[2])}</h${level}>`);
+          continue;
+        }
+        if (isReviewTableRow(trimmed) && isReviewTableSeparator(lines[i + 1] ? lines[i + 1].trim() : "")) {
+          flush();
+          const rows = [trimmed];
+          i += 2;
+          while (i < lines.length) {
+            const row = lines[i].trim();
+            if (!row) {
+              const next = lines[i + 1] ? lines[i + 1].trim() : "";
+              if (isReviewTableRow(next)) { i += 1; continue; }
+              break;
+            }
+            if (!isReviewTableRow(row)) { i -= 1; break; }
+            rows.push(row);
+            i += 1;
+          }
+          html.push(renderReviewMarkdownTable(rows));
+          continue;
+        }
+        const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
+        if (bullet) {
+          if (orderedList.length) flush();
+          list.push(bullet[1]);
+          continue;
+        }
+        const ordered = /^\d+[.)]\s+(.+)$/.exec(trimmed);
+        if (ordered) {
+          if (list.length) flush();
+          orderedList.push(ordered[1]);
+          continue;
+        }
+        flush();
+        html.push(`<p>${inlineReviewMarkdown(trimmed)}</p>`);
+      }
+      flush();
+      let rendered = html.join("");
+      codeBlocks.forEach((block, index) => {
+        rendered = rendered.replace(`@@CODE_${index}@@`, block);
+      });
+      return rendered;
+    }
+
+    function isReviewTableRow(text) {
+      const value = String(text || "").trim();
+      return value.includes("|") && /^\|?.+\|.+\|?$/.test(value);
+    }
+
+    function isReviewTableSeparator(text) {
+      const cells = splitReviewTableRow(text);
+      return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+    }
+
+    function splitReviewTableRow(text) {
+      let value = String(text || "").trim();
+      if (!value.includes("|")) return [];
+      if (value.startsWith("|")) value = value.slice(1);
+      if (value.endsWith("|")) value = value.slice(0, -1);
+      return value.split("|").map((cell) => cell.trim());
+    }
+
+    function renderReviewMarkdownTable(rows) {
+      const header = splitReviewTableRow(rows[0]);
+      const body = rows.slice(1).map(splitReviewTableRow).filter((cells) => cells.length);
+      const headerHtml = header.map((cell) => `<th>${inlineReviewMarkdown(cell)}</th>`).join("");
+      const bodyHtml = body.map((cells) => {
+        const padded = header.length ? cells.concat(Array(Math.max(0, header.length - cells.length)).fill("")) : cells;
+        return `<tr>${padded.slice(0, Math.max(header.length, cells.length)).map((cell) => `<td>${inlineReviewMarkdown(cell)}</td>`).join("")}</tr>`;
+      }).join("");
+      return `<table><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>`;
+    }
+
+    function inlineReviewMarkdown(text) {
+      return String(text || "")
+        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+        .replace(/\*(.+?)\*/g, "<em>$1</em>")
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .replace(/\[(S|N|R|B|W|E)(\d+)\]/g, '<span class="citation">[$1$2]</span>');
+    }
+
+    async function sendDialogueReview(kickoffMessage = "", hiddenUser = false) {
+      const input = $("dialogueMessage");
+      const message = kickoffMessage || (input?.value.trim() || "");
+      if (!message) { setStatus("请先输入对话内容。", true); return; }
+      if (!hiddenUser) dialogueReviewState.history.push({role: "user", content: message});
+      if (input) input.value = "";
+      dialogueReviewState.busy = true;
+      renderDialogueReview();
+      try {
+        const result = await postJson("/api/review/dialogue", {
+          topics: dialogueReviewState.topics,
+          message,
+          chat_history: dialogueReviewState.history,
+        });
+        dialogueReviewState.history.push({role: "assistant", content: result.answer || result.error || ""});
+        setStatus("对话复查已更新。");
+      } catch (error) {
+        setStatus(error.message || String(error), true);
+      } finally {
+        dialogueReviewState.busy = false;
+        renderDialogueReview();
+      }
+    }
+
+    function exitToSelecting() {
+      mode = "selecting";
+      $("donePanel").classList.add("hidden");
+      render();
+    }
+
+    function renderDone(title, message) {
+      stopPolling();
+      mode = "selecting";
+      $("donePanel").classList.remove("hidden");
+      $("donePanel").innerHTML = `<h3>${escapeHtml(title || "本轮完成")}</h3><p>${escapeHtml(message || "")}</p><div class="actions"><button id="newReview" type="button">回到选择面板</button></div>`;
+      $("selectPanel").classList.add("hidden");
+      $("cardPanel").classList.add("hidden");
+      $("dialoguePanel").classList.add("hidden");
+    }
+
+    function mergeCards(previous, next) {
+      const byId = new Map((previous || []).map((card) => [card.id, card]));
+      for (const card of next || []) byId.set(card.id, {...(byId.get(card.id) || {}), ...card});
+      return (next || []).map((card) => byId.get(card.id) || card);
+    }
+
+    function moveCard(delta) {
+      if (!cardReviewState.cards.length) return;
+      let nextIndex = cardReviewState.index;
+      for (let offset = 0; offset < cardReviewState.cards.length; offset += 1) {
+        nextIndex = (nextIndex + delta + cardReviewState.cards.length) % cardReviewState.cards.length;
+        if (isCardUsable(cardReviewState.cards[nextIndex])) break;
+      }
+      cardReviewState.index = nextIndex;
+      cardReviewState.verify = null;
+      renderCardReview();
+    }
+
+    function isCardUsable(card) { return Boolean(card && card.review_prompt && card.review_prompt.prompt); }
+    function currentCard() { return cardReviewState.cards[cardReviewState.index] || null; }
+    function selectFirstUsableCard() {
+      if (isCardUsable(currentCard())) return true;
+      const index = cardReviewState.cards.findIndex(isCardUsable);
+      if (index >= 0) { cardReviewState.index = index; return true; }
+      return false;
+    }
+    function topicProgress(card) {
+      const same = cardReviewState.cards.filter((item) => item.topic === card.topic);
+      const pos = same.findIndex((item) => item.id === card.id) + 1;
+      return `${pos}/${same.length}`;
+    }
+    function renderStrategyConstraints(items) {
+      const constraints = Array.isArray(items) ? items.filter((item) => item && item.point) : [];
+      if (!constraints.length) return "";
+      return `<div class="strategy-tip">本次复习关注：${constraints.slice(0, 3).map((item) => escapeHtml(strategyTipLabel(item.point))).join(" · ")}</div>`;
+    }
+    function strategyTipLabel(point) {
+      const text = String(point || "");
+      if (text.includes("回答过短") || text.includes("推理展开") || text.includes("系统性工程思维")) return "展开推理过程";
+      if (text.includes("简单归因") || text.includes("部署拓扑") || text.includes("部署场景")) return "按部署场景做判断";
+      if (text.includes("边界") || text.includes("职责")) return "先区分边界";
+      if (text.includes("选型") || text.includes("取舍")) return "说明工程取舍";
+      if (text.includes("结构") || text.includes("框架")) return "先给结论再分层展开";
+      return text.length > 18 ? `${text.slice(0, 18)}...` : text;
+    }
+    function firstText(items, emptyText) {
+      const values = Array.isArray(items) ? items.filter(Boolean) : [];
+      return values.length ? String(values[0]) : emptyText;
+    }
+    function renderCitations(citations) {
+      if (!citations.length) return "";
+      return `<div class="citations">${citations.slice(0, 8).map((item) => `<span class="citation">${escapeHtml(item.path || item.source_path || item.title || "source")}</span>`).join("")}</div>`;
+    }
+    async function getJson(url) {
+      const response = await fetch(url);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || `${response.status} ${response.statusText}`);
+      return data;
+    }
+    async function postJson(url, payload) {
+      const response = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || `${response.status} ${response.statusText}`);
+      return data;
+    }
+    function setBusy(busy, message="") { document.querySelectorAll("button").forEach((button) => button.disabled = busy); if (message) setStatus(message); }
+    function setStatus(message, error=false) {
+      const status = document.querySelector("section:not(.hidden) #status") || $("status");
+      if (status) {
+        status.textContent = message || "";
+        status.className = `status ${error ? "error" : ""}`;
+      }
+    }
     function escapeHtml(value) { return String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;"); }
   </script>
 </body>
@@ -7163,6 +8291,7 @@ CHAT_HTML = r"""<!doctype html>
     let currentTurnTrace = {directorNoteInjected: false};
     let currentProcess = createAgentProcessState();
     const activeInterviewSessionKey = "knowledge_agent.active_interview_session_id";
+    const activeAnswerTaskKey = "knowledge_agent.active_answer_task_id";
     let sessionContextPanelOpen = false;
 
     applyInitialChatMode();
@@ -7180,6 +8309,7 @@ CHAT_HTML = r"""<!doctype html>
     $("chatMode").addEventListener("change", handleChatModeChange);
     ["scopeType", "scopeValue", "strictEvidence"].forEach((id) => $(id).addEventListener("change", resetConversationIfNeeded));
     restoreActiveInterviewSession();
+    restoreActiveAnswerTask();
     loadReviewNotice();
 
     function applyInitialChatMode() {
@@ -7253,7 +8383,7 @@ CHAT_HTML = r"""<!doctype html>
 
       try {
         if ($("chatMode").value === "interview") {
-          turnIds = await persistPendingInterviewTurn(query);
+          await ensureInterviewSession();
           body.session_id = currentInterviewSessionId;
           if (currentTurnTrace.directorNoteInjected) {
             recordSessionTrace("director_note_injected", `Director Note injected (follow_up=${body.interview_state?.follow_up_count || 0})`, {
@@ -7261,7 +8391,8 @@ CHAT_HTML = r"""<!doctype html>
             });
           }
         }
-        await streamAgentAnswerWithRetry(body);
+        const streamResult = await streamAgentAnswerWithRetry(body);
+        turnIds = streamResult?.turnIds || null;
         const answerText = currentAssistantText.trim();
         if (answerText) {
           const assistantNode = currentAssistant;
@@ -7272,22 +8403,14 @@ CHAT_HTML = r"""<!doctype html>
           trimChatHistory();
           if ($("chatMode").value === "interview") {
             const stateChange = isServerInterviewState() ? null : updateInterviewState(query, answerText);
-            if (turnIds) {
-              await completeInterviewTurn(turnIds, answerText);
-            } else {
-              turnIds = await persistInterviewTurn(query, answerText);
-            }
             recordInterviewStateTrace(stateChange);
             renderInterviewDirectionBar();
-            if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
+            if (shouldReview && turnIds) runTurnReviewInBackground(answerText, turnIds, assistantNode);
           }
         }
         setBusy(false, "就绪");
       } catch (error) {
         currentPayload.errors.push(error.message);
-        if ($("chatMode").value === "interview" && turnIds) {
-          await failInterviewTurn(turnIds, currentAssistantText.trim(), error);
-        }
         if (currentAssistant) {
           currentAssistant.querySelector(".answer").innerHTML += `<p class="error">${escapeHtml(error.message)}</p>`;
           if (error.retryable !== false) attachRegenerateButton(currentAssistant, query, turnIds);
@@ -7354,7 +8477,10 @@ CHAT_HTML = r"""<!doctype html>
       if (sessionContextPanelOpen) renderSessionContext();
     }
 
-    async function streamAgentAnswerWithRetry(body) {
+    async function streamAgentAnswerWithRetry(body, options = {}) {
+      if (shouldUseDecoupledAgentRuns(body.chat_mode)) {
+        return streamDecoupledAgentRun(body, options);
+      }
       let lastError = null;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
@@ -7365,7 +8491,7 @@ CHAT_HTML = r"""<!doctype html>
           const response = await fetch("/api/agent/stream", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
           if (!response.ok || !response.body) throw new Error(`request failed: ${response.status}`);
           await readSse(response.body);
-          return;
+          return {turnIds: null, taskId: null};
         } catch (error) {
           lastError = error;
           const retryable = error.retryable !== false;
@@ -7375,6 +8501,90 @@ CHAT_HTML = r"""<!doctype html>
         }
       }
       if (lastError) throw lastError;
+      return {turnIds: null, taskId: null};
+    }
+
+    function shouldUseDecoupledAgentRuns(chatMode) {
+      return chatMode === "interview" || chatMode === "answer";
+    }
+
+    async function streamDecoupledAgentRun(body, options = {}) {
+      let lastError = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          if (attempt > 0) {
+            setBusy(true, "Retrying...");
+            await delay(1200);
+          }
+          const payload = {...body};
+          if (payload.chat_mode === "interview") {
+            await ensureInterviewSession();
+            payload.session_id = currentInterviewSessionId;
+            payload.source_note_paths = sourceNotePaths();
+          }
+          if (options.assistantMessageId) payload.assistant_message_id = options.assistantMessageId;
+          const response = await fetch("/api/agent/runs", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const error = new Error(data.detail || `request failed: ${response.status}`);
+            error.retryable = true;
+            throw error;
+          }
+          if (payload.chat_mode === "answer" && data.task_id) {
+            sessionStorage.setItem(activeAnswerTaskKey, data.task_id);
+          }
+          const streamResponse = await fetch(`/api/tasks/${encodeURIComponent(data.task_id)}/stream`);
+          if (!streamResponse.ok || !streamResponse.body) throw new Error(`task stream failed: ${streamResponse.status}`);
+          await readSse(streamResponse.body);
+          if (payload.chat_mode === "answer" && data.task_id) {
+            const taskResponse = await fetch(`/api/tasks/${encodeURIComponent(data.task_id)}`);
+            const task = await taskResponse.json().catch(() => ({}));
+            if ((task.status || "") === "succeeded") sessionStorage.removeItem(activeAnswerTaskKey);
+          }
+          const turnIds = data.user_message_id && data.assistant_message_id
+            ? {user: {id: data.user_message_id}, assistant: {id: data.assistant_message_id}}
+            : null;
+          return {turnIds, taskId: data.task_id || null};
+        } catch (error) {
+          lastError = error;
+          const retryable = error.retryable !== false;
+          const noOutputYet = !currentAssistantText.trim();
+          if (attempt === 0 && retryable && noOutputYet) continue;
+          throw error;
+        }
+      }
+      if (lastError) throw lastError;
+      return {turnIds: null, taskId: null};
+    }
+
+    async function restoreActiveAnswerTask() {
+      const taskId = sessionStorage.getItem(activeAnswerTaskKey);
+      if (!taskId || $("chatMode").value !== "answer") return;
+      try {
+        const taskResponse = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+        if (!taskResponse.ok) {
+          sessionStorage.removeItem(activeAnswerTaskKey);
+          return;
+        }
+        const task = await taskResponse.json();
+        if (!["queued", "running"].includes(task.status || "")) {
+          sessionStorage.removeItem(activeAnswerTaskKey);
+          return;
+        }
+        currentAssistant = appendAssistantMessage("");
+        currentAssistantText = "";
+        currentPayload = {router: null, retrieval: null, retrievalStatus: null, interviewPlan: null, profileDebug: null, context: null, answer: null, done: null, errors: []};
+        currentProcess = createAgentProcessState();
+        renderAgentProcess();
+        setBusy(true, "恢复生成中...");
+        const streamResponse = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/stream`);
+        if (!streamResponse.ok || !streamResponse.body) throw new Error(`task stream failed: ${streamResponse.status}`);
+        await readSse(streamResponse.body);
+        if ((task.status || "") === "succeeded" || currentAssistantText.trim()) sessionStorage.removeItem(activeAnswerTaskKey);
+        setBusy(false, "就绪");
+      } catch {
+        sessionStorage.removeItem(activeAnswerTaskKey);
+      }
     }
 
     function delay(ms) {
@@ -7414,7 +8624,7 @@ CHAT_HTML = r"""<!doctype html>
             retry: true
           });
         }
-        await streamAgentAnswerWithRetry(body);
+        await streamAgentAnswerWithRetry(body, {assistantMessageId: turnIds.assistant.id});
         const answerText = currentAssistantText.trim();
         if (!answerText) throw new Error("empty answer");
         renderAssistantExtras();
@@ -7423,13 +8633,11 @@ CHAT_HTML = r"""<!doctype html>
         chatHistory.push({role:"assistant", content:answerText});
         trimChatHistory();
         const stateChange = isServerInterviewState() ? null : updateInterviewState(query, answerText);
-        await completeInterviewTurn(turnIds, answerText);
         recordInterviewStateTrace(stateChange);
         renderInterviewDirectionBar();
         if (shouldReview) runTurnReviewInBackground(answerText, turnIds, assistantNode);
-        setBusy(false, "灏辩华");
+        setBusy(false, "就绪");
       } catch (error) {
-        await failInterviewTurn(turnIds, currentAssistantText.trim(), error);
         assistantNode.querySelector(".answer").innerHTML += `<p class="error">${escapeHtml(error.message)}</p>`;
         if (error.retryable !== false) attachRegenerateButton(assistantNode, query, turnIds);
         setBusy(false, "Error");
@@ -9069,3 +10277,4 @@ CHAT_HTML = r"""<!doctype html>
 </body>
 </html>
 """
+

@@ -1,0 +1,15 @@
+{
+  "name": "reviewer",
+  "version": 1,
+  "description": "Dialogue review coach for due weak points; advisory only and no automatic profile writes.",
+  "allowed_tools": ["get_due_reviews", "verify_weak_point", "suggest_review_commit"],
+  "denied_tools": [],
+  "max_steps": 8,
+  "temperature": 0.2,
+  "output_contract": {
+    "type": "review_dialogue"
+  },
+  "trace_policy": {
+    "save": true
+  }
+}

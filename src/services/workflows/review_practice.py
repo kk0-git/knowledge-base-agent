@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 from knowledge_base_agent.llm.schema import LLMMessage, LLMRequest
@@ -20,6 +21,8 @@ QUESTION_TYPES = ("recall", "boundary", "compare", "scenario", "followup")
 AUTO_QUESTION_TYPE = "auto"
 STRATEGY_CATEGORIES = {"answer_structure", "communication", "thinking_pattern"}
 DEFAULT_MAX_STRATEGY_CONSTRAINTS = 2
+REVIEW_PROMPT_VERSION = "review-prompt-v2"
+REVIEW_GROUPING_STRATEGY_VERSION = "topic-layer-category-v1"
 
 QUESTION_TYPE_LABELS = {
     "recall": "\u4e3b\u52a8\u56de\u5fc6",
@@ -285,6 +288,199 @@ def weak_point_id(weak: dict[str, Any]) -> str:
     return "weak-" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
 
 
+def weak_point_cache_content(weak: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": weak_point_id(weak),
+        "point": str(weak.get("point") or "").strip(),
+        "evidence": str(weak.get("evidence") or "").strip(),
+        "category": normalize_category(weak.get("category")),
+        "topic": str(weak.get("topic") or "").strip(),
+        "planned_layer": str(weak.get("planned_layer") or "").strip(),
+        "source_note_paths": sorted(str(path).strip() for path in weak.get("source_note_paths") or [] if str(path).strip()),
+    }
+
+
+def weak_point_content_hash(weak: dict[str, Any], *, prompt_version: str = REVIEW_PROMPT_VERSION) -> str:
+    payload = {"prompt_version": prompt_version, "weak_point": weak_point_cache_content(weak)}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def review_prompt_cache_key(weak: dict[str, Any], *, prompt_version: str = REVIEW_PROMPT_VERSION) -> str:
+    return weak_point_content_hash(weak, prompt_version=prompt_version)
+
+
+def review_card_cache_key(
+    weak_points: list[dict[str, Any]],
+    *,
+    grouping_strategy_version: str = REVIEW_GROUPING_STRATEGY_VERSION,
+    prompt_version: str = REVIEW_PROMPT_VERSION,
+) -> str:
+    payload = {
+        "grouping_strategy_version": grouping_strategy_version,
+        "prompt_version": prompt_version,
+        "weak_point_hashes": sorted(weak_point_content_hash(weak, prompt_version=prompt_version) for weak in weak_points),
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def load_review_cache(cache_dir: Path | str, filename: str) -> dict[str, Any]:
+    path = Path(cache_dir) / filename
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_review_cache(cache_dir: Path | str, filename: str, payload: dict[str, Any]) -> None:
+    path = Path(cache_dir) / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def read_review_card_cache(cache_dir: Path | str, cache_key: str) -> dict[str, Any] | None:
+    cache = load_review_cache(cache_dir, "card-cache.json")
+    item = cache.get(cache_key)
+    if not isinstance(item, dict) or item.get("error"):
+        return None
+    return dict(item)
+
+
+def read_review_prompt_cache(cache_dir: Path | str, cache_key: str) -> dict[str, Any] | None:
+    cache = load_review_cache(cache_dir, "prompt-cache.json")
+    item = cache.get(cache_key)
+    if not isinstance(item, dict) or item.get("error"):
+        return None
+    return dict(item)
+
+
+def write_review_card_cache(cache_dir: Path | str, cache_key: str, payload: dict[str, Any]) -> None:
+    if payload.get("error"):
+        return
+    cache = load_review_cache(cache_dir, "card-cache.json")
+    cache[cache_key] = dict(payload)
+    save_review_cache(cache_dir, "card-cache.json", cache)
+
+
+def write_review_prompt_cache(cache_dir: Path | str, cache_key: str, payload: dict[str, Any]) -> None:
+    if payload.get("error"):
+        return
+    cache = load_review_cache(cache_dir, "prompt-cache.json")
+    cache[cache_key] = dict(payload)
+    save_review_cache(cache_dir, "prompt-cache.json", cache)
+
+
+def grouped_review_cards(
+    profile: dict[str, Any],
+    *,
+    topics: list[str] | tuple[str, ...] | None = None,
+    limit: int = 12,
+    today: str | None = None,
+    max_strategy_constraints: int = DEFAULT_MAX_STRATEGY_CONSTRAINTS,
+) -> dict[str, Any]:
+    today_value = today or date.today().isoformat()
+    selected_topics = normalize_topics(topics)
+    due, other_due = split_due_reviews(profile, None)
+    due_weak_points = [
+        weak
+        for weak in [*due, *other_due]
+        if isinstance(weak, dict) and not weak.get("improved") and topic_matches(weak, selected_topics)
+    ]
+    strategies = select_strategy_constraints(profile, max_items=max_strategy_constraints, today=today_value)
+    buckets: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for weak in due_weak_points:
+        key = (
+            str(weak.get("topic") or UNCATEGORIZED).strip() or UNCATEGORIZED,
+            str(weak.get("planned_layer") or "").strip(),
+            normalize_category(weak.get("category")),
+        )
+        buckets.setdefault(key, []).append(weak)
+
+    cards: list[dict[str, Any]] = []
+    for key in sorted(buckets, key=lambda item: (item[0], item[1], item[2])):
+        weak_group = sorted(buckets[key], key=lambda weak: weak_point_id(weak))
+        cards.append(build_grouped_review_card_payload(weak_group, strategies=strategies))
+        if len(cards) >= max(0, limit):
+            break
+
+    by_topic: dict[str, int] = {}
+    overdue_count = 0
+    for card in cards:
+        topic = str(card.get("topic") or UNCATEGORIZED)
+        by_topic[topic] = by_topic.get(topic, 0) + len(card.get("weak_point_ids") or [])
+        for weak in card.get("weak_points_summary") or []:
+            next_review = str((weak.get("sr") or {}).get("next_review") or "")
+            if next_review and next_review < today_value:
+                overdue_count += 1
+    topics_payload = [
+        {"topic": topic, "due": count}
+        for topic, count in sorted(by_topic.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    summary = "；".join(f"{item['topic']} {item['due']} 个到期弱项" for item in topics_payload[:3])
+    return {
+        "today": today_value,
+        "selected_topics": selected_topics,
+        "due_count": sum(len(card.get("weak_point_ids") or []) for card in cards),
+        "card_count": len(cards),
+        "overdue_count": overdue_count,
+        "strategy_constraints": strategies,
+        "topics": topics_payload,
+        "cards": cards,
+        "summary": summary,
+    }
+
+
+def build_grouped_review_card_payload(weak_points: list[dict[str, Any]], *, strategies: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    if not weak_points:
+        raise ValueError("weak_points is required")
+    first = weak_points[0]
+    topic = str(first.get("topic") or UNCATEGORIZED).strip() or UNCATEGORIZED
+    planned_layer = str(first.get("planned_layer") or "").strip()
+    category = normalize_category(first.get("category"))
+    cache_key = review_card_cache_key(weak_points)
+    weak_ids = [weak_point_id(weak) for weak in weak_points]
+    source_note_paths = sorted(
+        {
+            str(path).strip()
+            for weak in weak_points
+            for path in weak.get("source_note_paths") or []
+            if str(path).strip()
+        }
+    )
+    weak_summary = []
+    for weak in weak_points:
+        summary = profile_weak_point_for_agent(weak)
+        summary.update(
+            {
+                "id": weak_point_id(weak),
+                "sr": dict(weak.get("sr") or {}),
+                "source_note_paths": list(weak.get("source_note_paths") or []),
+            }
+        )
+        weak_summary.append(summary)
+    return {
+        "id": "card-" + cache_key[:16],
+        "card_id": "card-" + cache_key[:16],
+        "cache_key": cache_key,
+        "topic": topic,
+        "planned_layer": planned_layer,
+        "category": category,
+        "weak_point_ids": weak_ids,
+        "weak_points_summary": weak_summary,
+        "weak_point_count": len(weak_ids),
+        "point": "；".join(str(weak.get("point") or "").strip() for weak in weak_points if str(weak.get("point") or "").strip()),
+        "evidence": "\n".join(str(weak.get("evidence") or "").strip() for weak in weak_points if str(weak.get("evidence") or "").strip()),
+        "source_note_paths": source_note_paths,
+        "strategy_constraints": [dict(item) for item in strategies or []],
+        "strategy_tips": [str(item.get("point") or "").strip() for item in strategies or [] if str(item.get("point") or "").strip()],
+        "status": "pending",
+    }
+
+
 def collect_review_topics(profile: dict[str, Any], *, today: str | None = None) -> list[dict[str, Any]]:
     today_value = today or date.today().isoformat()
     counts: dict[str, dict[str, int]] = {}
@@ -504,6 +700,131 @@ def build_recall_prompt(
         return result
 
 
+def build_grouped_review_prompt(
+    weak_points: list[dict[str, Any]],
+    *,
+    strategy_constraints: list[dict[str, Any]] | None = None,
+    llm_client: Any | None = None,
+    model: str = "",
+    temperature: float = 0.2,
+) -> dict[str, Any]:
+    fallback = build_static_grouped_review_prompt(weak_points, strategy_constraints=strategy_constraints)
+    if llm_client is None or not model:
+        return fallback
+    try:
+        payload = {
+            "weak_points": [profile_weak_point_for_agent(weak) | {"id": weak_point_id(weak)} for weak in weak_points],
+            "strategy_constraints": list(strategy_constraints or []),
+            "rules": {
+                "write_in_simplified_chinese": True,
+                "one_card_can_cover_multiple_weak_points": True,
+                "answer_structure_uses_evidence_reconstruction": True,
+                "thinking_pattern_uses_new_scenario": True,
+                "communication_reasks_for_clearer_expression": True,
+            },
+        }
+        response = llm_client.complete(
+            LLMRequest(
+                model=model,
+                temperature=temperature,
+                messages=[
+                    LLMMessage(
+                        role="system",
+                        content=(
+                            "You generate one grouped review card for a Chinese interview learner. "
+                            "Return only JSON with question_blocks, reference_answer, and strategy_tips. "
+                            "Each question block must include type, prompt, and weak_point_ids."
+                        ),
+                    ),
+                    LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False, indent=2)),
+                ],
+            )
+        )
+        parsed = parse_json_object(response.content)
+        question_blocks = normalize_question_blocks(parsed.get("question_blocks"), weak_points)
+        if not question_blocks:
+            raise ValueError("empty question_blocks")
+        return {
+            "prompt": "\n\n".join(block["prompt"] for block in question_blocks),
+            "question_blocks": question_blocks,
+            "reference_answer": str(parsed.get("reference_answer") or "").strip() or fallback["reference_answer"],
+            "strategy_tips": list_of_strings(parsed.get("strategy_tips")) or list(fallback.get("strategy_tips") or []),
+            "fallback_used": False,
+            "prompt_version": REVIEW_PROMPT_VERSION,
+        }
+    except Exception as exc:
+        result = dict(fallback)
+        result["error"] = str(exc)
+        return result
+
+
+def build_static_grouped_review_prompt(
+    weak_points: list[dict[str, Any]],
+    *,
+    strategy_constraints: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if not weak_points:
+        return {
+            "prompt": "请用自己的话复述这个薄弱点。",
+            "question_blocks": [],
+            "reference_answer": "",
+            "strategy_tips": [],
+            "fallback_used": True,
+            "prompt_version": REVIEW_PROMPT_VERSION,
+        }
+    category = normalize_category(weak_points[0].get("category"))
+    topic = str(weak_points[0].get("topic") or UNCATEGORIZED).strip() or UNCATEGORIZED
+    ids = [weak_point_id(weak) for weak in weak_points]
+    points = [str(weak.get("point") or "").strip() for weak in weak_points if str(weak.get("point") or "").strip()]
+    evidence = [str(weak.get("evidence") or "").strip() for weak in weak_points if str(weak.get("evidence") or "").strip()]
+    joined_points = "；".join(points) or "这个薄弱点"
+    if category == "answer_structure":
+        prompt = f"围绕「{topic}」，请根据上次暴露出的回答问题，重新组织一版更完整的回答。重点修复：{joined_points}"
+        if evidence:
+            prompt += f"\n上次证据摘要：{evidence[0][:500]}"
+        block_type = "answer_structure"
+    elif category == "thinking_pattern":
+        prompt = f"换一个新的工程场景来考察同一个思维模式：如果你在「{topic}」相关项目中遇到相似取舍，请说明你会如何判断。需要覆盖：{joined_points}"
+        block_type = "thinking_pattern"
+    elif category == "communication":
+        prompt = f"请重新回答一道相似面试题，目标是表达更清晰、有层次。主题是「{topic}」，需要修复：{joined_points}"
+        block_type = "communication"
+    else:
+        prompt = f"围绕「{topic}」，请用自己的话解释这些薄弱点，并说明定义、边界、触发时机和工程例子：{joined_points}"
+        block_type = "knowledge_gap"
+    tips = [str(item.get("point") or "").strip() for item in strategy_constraints or [] if str(item.get("point") or "").strip()]
+    return {
+        "prompt": prompt,
+        "question_blocks": [{"type": block_type, "prompt": prompt, "weak_point_ids": ids}],
+        "reference_answer": "参考答案应覆盖薄弱点原文、证据中暴露的遗漏，以及一个可迁移到面试表达的结构化示例。",
+        "strategy_tips": tips[:3],
+        "fallback_used": True,
+        "prompt_version": REVIEW_PROMPT_VERSION,
+    }
+
+
+def normalize_question_blocks(value: Any, weak_points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    allowed_ids = {weak_point_id(weak) for weak in weak_points}
+    result: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return result
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        prompt = str(item.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        ids = [str(weak_id).strip() for weak_id in item.get("weak_point_ids") or [] if str(weak_id).strip() in allowed_ids]
+        result.append(
+            {
+                "type": str(item.get("type") or "knowledge_gap").strip() or "knowledge_gap",
+                "prompt": prompt,
+                "weak_point_ids": ids or sorted(allowed_ids),
+            }
+        )
+    return result
+
+
 def choose_question_type_for_weak_point(weak: dict[str, Any]) -> str:
     text = " ".join(
         str(weak.get(key) or "")
@@ -648,6 +969,92 @@ def parse_verification_payload(text: str, *, citations: list[dict[str, Any]] | N
     }
 
 
+def parse_grouped_verification_payload(
+    text: str,
+    *,
+    weak_points: list[dict[str, Any]],
+    citations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    weak_by_id = {weak_point_id(weak): weak for weak in weak_points}
+    try:
+        payload = parse_json_object(text)
+    except Exception:
+        raw = str(text or "").strip()
+        return {
+            "overall": raw,
+            "correct": [],
+            "missed": [],
+            "example": raw,
+            "feedback": raw,
+            "suggested_action": "retry",
+            "weak_results": [
+                {
+                    "weak_point_id": weak_id,
+                    "point": str(weak.get("point") or "").strip(),
+                    "suggested_action": "retry",
+                    "reason": "verification response could not be parsed",
+                }
+                for weak_id, weak in weak_by_id.items()
+            ],
+            "parse_error": True,
+            "citations": list(citations or []),
+        }
+    weak_results: list[dict[str, Any]] = []
+    raw_results = payload.get("weak_results")
+    if isinstance(raw_results, list):
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            weak_id = str(item.get("weak_point_id") or "").strip()
+            if weak_id not in weak_by_id:
+                continue
+            action = normalize_review_action(item.get("suggested_action") or item.get("suggested_outcome"))
+            weak_results.append(
+                {
+                    "weak_point_id": weak_id,
+                    "point": str(item.get("point") or weak_by_id[weak_id].get("point") or "").strip(),
+                    "suggested_action": action,
+                    "reason": str(item.get("reason") or "").strip(),
+                }
+            )
+    existing = {item["weak_point_id"] for item in weak_results}
+    overall_action = normalize_review_action(payload.get("suggested_action") or payload.get("suggested_outcome"))
+    for weak_id, weak in weak_by_id.items():
+        if weak_id in existing:
+            continue
+        weak_results.append(
+            {
+                "weak_point_id": weak_id,
+                "point": str(weak.get("point") or "").strip(),
+                "suggested_action": overall_action,
+                "reason": str(payload.get("feedback") or payload.get("overall") or "").strip(),
+            }
+        )
+    correct = list_of_strings(payload.get("correct", payload.get("covered")))
+    missed = list_of_strings(payload.get("missed", payload.get("missing")))
+    suggested = "improve" if weak_results and all(item.get("suggested_action") == "improve" for item in weak_results) else "retry"
+    return {
+        "overall": str(payload.get("overall") or payload.get("feedback") or "").strip(),
+        "correct": correct,
+        "missed": missed,
+        "knowledge_correct": suggested == "improve",
+        "strategy_feedback": list_of_strings(payload.get("strategy_feedback")),
+        "example": str(payload.get("example") or payload.get("feedback") or "").strip(),
+        "feedback": str(payload.get("feedback") or payload.get("overall") or "").strip(),
+        "suggested_action": suggested,
+        "weak_results": weak_results,
+        "parse_error": False,
+        "citations": list(citations or []),
+    }
+
+
+def normalize_review_action(value: Any) -> str:
+    action = str(value or "retry").strip().lower()
+    if action in {"pass", "improved", "improve"}:
+        return "improve"
+    return "retry"
+
+
 def build_correction_query(*, prompt: str, weak: dict[str, Any], answer: str) -> str:
     return "\n".join(
         [
@@ -695,6 +1102,44 @@ def build_weak_point_verification_query(
             json.dumps(list(strategy_constraints or []), ensure_ascii=False),
             "",
             "\u7528\u6237\u5f53\u524d\u7406\u89e3:",
+            answer,
+        ]
+    )
+
+
+def build_grouped_weak_point_verification_query(
+    *,
+    weak_points: list[dict[str, Any]],
+    answer: str,
+    prompt: str = "",
+    question_blocks: list[dict[str, Any]] | None = None,
+    strategy_constraints: list[dict[str, Any]] | None = None,
+) -> str:
+    return "\n".join(
+        [
+            "请作为复习纠偏助手，对照指定笔记检查用户对一张复习卡的回答。",
+            "这张卡可能覆盖多个薄弱点。请给出整体反馈，并对每个 weak_point 单独给 suggested_action。",
+            "只返回 JSON，不要输出 Markdown。",
+            "",
+            "JSON schema:",
+            '{"overall":"整体反馈","correct":["方向正确点"],"missed":["遗漏点"],"example":"两三句话示例回答","suggested_action":"improve|retry","weak_results":[{"weak_point_id":"...","point":"...","suggested_action":"improve|retry","reason":"..."}]}',
+            "",
+            "薄弱点列表:",
+            json.dumps(
+                [profile_weak_point_for_agent(weak) | {"id": weak_point_id(weak)} for weak in weak_points],
+                ensure_ascii=False,
+            ),
+            "",
+            "题面:",
+            str(prompt or "").strip(),
+            "",
+            "题目分段:",
+            json.dumps(list(question_blocks or []), ensure_ascii=False),
+            "",
+            "作答策略要求（仅作为表达和思路评估）:",
+            json.dumps(list(strategy_constraints or []), ensure_ascii=False),
+            "",
+            "用户当前回答:",
             answer,
         ]
     )

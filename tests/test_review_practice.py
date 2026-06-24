@@ -15,17 +15,27 @@ if str(PROJECT_SRC) not in sys.path:
 from services.workflows.interview_profile import InterviewProfileStore
 from services.workflows.review_practice import (
     build_due_review_overview,
+    build_grouped_review_prompt,
     build_weak_point_verification_query,
     build_recall_prompt,
     build_review_plan,
     commit_review_action,
     commit_review_outcome,
+    grouped_review_cards,
     list_due_reviews,
     parse_correction_payload,
+    parse_grouped_verification_payload,
     parse_verification_payload,
+    read_review_card_cache,
+    review_card_cache_key,
     select_strategy_constraints,
+    weak_point_content_hash,
     weak_point_id,
+    write_review_card_cache,
 )
+from agent.schema import WorkingMemory
+from agent.tool_executor import ToolExecutionContext
+from agent.tools.review import get_due_reviews
 
 
 def make_writable_test_dir() -> Path:
@@ -51,6 +61,14 @@ class ChoosingLlm:
             )
 
         return Response()
+
+
+class FakeProfileStore:
+    def __init__(self, profile: dict):
+        self.profile = profile
+
+    def load(self) -> dict:
+        return self.profile
 
 
 def weak_point(
@@ -131,6 +149,23 @@ class ReviewPracticeTests(unittest.TestCase):
         self.assertEqual(plan["cards"][1]["candidate_related_topics"], ["Memory"])
         self.assertEqual(plan["cards"][0]["related_topics"], [])
         self.assertIn({"topic": "MCP", "total": 1, "due": 1}, plan["available_topics"])
+
+    def test_get_due_reviews_filters_multiple_topics(self) -> None:
+        today = date.today()
+        profile = {
+            "weak_points": [
+                weak_point("memory boundary", next_review=today.isoformat(), topic="Memory"),
+                weak_point("tool scenario", next_review=today.isoformat(), topic="Tool Use"),
+                weak_point("mcp excluded", next_review=today.isoformat(), topic="MCP"),
+            ]
+        }
+        ctx = ToolExecutionContext(working=WorkingMemory(), profile_store=FakeProfileStore(profile))
+
+        result = get_due_reviews({"topics": ["Memory", "Tool Use"], "limit": 10}, ctx)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["selected_topics"], ["Memory", "Tool Use"])
+        self.assertEqual([card["topic"] for card in result["cards"]], ["Memory", "Tool Use"])
 
     def test_build_review_plan_can_disable_cross_topic(self) -> None:
         today = date.today()
@@ -238,6 +273,66 @@ class ReviewPracticeTests(unittest.TestCase):
         constraints = select_strategy_constraints(profile, today=today.isoformat(), max_items=3)
 
         self.assertEqual([item["point"] for item in constraints], ["overdue wins", "due lower ease", "due higher ease"])
+
+    def test_weak_point_content_hash_changes_when_stable_content_changes(self) -> None:
+        today = date.today().isoformat()
+        first = weak_point("content hash", next_review=today)
+        second = weak_point("content hash", next_review=today)
+        self.assertEqual(weak_point_content_hash(first), weak_point_content_hash(second))
+
+        second["evidence"] = "new evidence"
+        self.assertNotEqual(weak_point_content_hash(first), weak_point_content_hash(second))
+
+    def test_grouped_review_cards_merge_same_topic_layer_category(self) -> None:
+        today = date.today().isoformat()
+        profile = {
+            "weak_points": [
+                weak_point("first gap", next_review=today, topic="MCP", category="knowledge_gap"),
+                weak_point("second gap", next_review=today, topic="MCP", category="knowledge_gap"),
+                weak_point("structure gap", next_review=today, topic="MCP", category="answer_structure"),
+            ]
+        }
+
+        grouped = grouped_review_cards(profile, topics=["MCP"], today=today)
+
+        counts = sorted(card["weak_point_count"] for card in grouped["cards"])
+        self.assertEqual(counts, [1, 2])
+        merged = [card for card in grouped["cards"] if card["weak_point_count"] == 2][0]
+        self.assertEqual(merged["topic"], "MCP")
+        self.assertEqual(merged["category"], "knowledge_gap")
+
+    def test_review_card_cache_round_trips_success_payload(self) -> None:
+        cache_dir = make_writable_test_dir()
+        today = date.today().isoformat()
+        weak_points = [weak_point("cached gap", next_review=today)]
+        cache_key = review_card_cache_key(weak_points)
+        self.assertIsNone(read_review_card_cache(cache_dir, cache_key))
+
+        write_review_card_cache(cache_dir, cache_key, {"review_prompt": {"prompt": "cached prompt"}})
+
+        self.assertEqual(read_review_card_cache(cache_dir, cache_key)["review_prompt"]["prompt"], "cached prompt")
+
+    def test_grouped_review_prompt_and_verification_payload(self) -> None:
+        today = date.today().isoformat()
+        weak_points = [
+            weak_point("first gap", next_review=today, topic="RAG"),
+            weak_point("second gap", next_review=today, topic="RAG"),
+        ]
+        prompt = build_grouped_review_prompt(weak_points)
+
+        self.assertIn("question_blocks", prompt)
+        self.assertEqual(set(prompt["question_blocks"][0]["weak_point_ids"]), {weak_point_id(item) for item in weak_points})
+
+        payload = parse_grouped_verification_payload(
+            '{"overall":"ok","correct":["a"],"missed":["b"],"example":"e","weak_results":['
+            f'{{"weak_point_id":"{weak_point_id(weak_points[0])}","suggested_action":"improve","reason":"good"}},'
+            f'{{"weak_point_id":"{weak_point_id(weak_points[1])}","suggested_action":"retry","reason":"miss"}}'
+            "]}",
+            weak_points=weak_points,
+        )
+
+        self.assertEqual(payload["suggested_action"], "retry")
+        self.assertEqual([item["suggested_action"] for item in payload["weak_results"]], ["improve", "retry"])
 
     def test_build_recall_prompt_falls_back_when_llm_fails(self) -> None:
         prompt = build_recall_prompt(
