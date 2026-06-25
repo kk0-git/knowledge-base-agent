@@ -417,10 +417,38 @@ Storage keys:
 
 - Review workspace: `sessionStorage` `knowledge_agent.workspace.review.v1`
 - Chat workspace: `localStorage` `knowledge_agent.workspace.chat.v1`
-- Review runs: `review-runs/*.json`
-- Answer sessions: `answer-sessions/YYYY-MM/*.json`
+- Review runs: `data/review-runs/*.json`
+- Answer sessions: `data/answer-sessions/YYYY-MM/*.json`
+- Interview sessions: `data/interview-sessions/YYYY-MM/*.json`
 
-### 8.5 复习页三态重构检查
+### 8.9 Conversation Storage P0
+
+```powershell
+python -m pytest tests/test_conversation_schema.py tests/test_session_repository.py tests/test_answer_session_repository.py tests/test_agent_turn_service.py -q
+```
+
+规范文档：`docs/CONVERSATION_STORAGE.md`
+
+### 8.10 Conversation Storage P1（复查对话 messages）
+
+```powershell
+python -m pytest tests/test_review_dialogue_storage.py tests/test_review_run_repository.py tests/test_conversation_schema.py -q
+```
+
+手测：
+
+1. `/review` 开始对话复查 2 轮 → F5 / 切页回来 → 对话从 `GET /api/review/plan/{id}` 的 `messages` 恢复
+2. 重启 uvicorn → 回 `/review` → 对话 history 仍完整（不再依赖客户端 `chat_history`）
+3. `data/review-runs/*.json` 对话 run 含 `messages[]`；`workspace.dialogueReviewState.history` 与 messages 一致
+
+### 8.11 Runtime data 目录（`data/`）
+
+```powershell
+python -m pytest tests/test_data_paths.py -q
+```
+
+启动 uvicorn 时会自动把项目根下的 `interview-sessions/`、`answer-sessions/`、`review-runs/`、`review-cache/` 迁入 `data/`（同名文件已存在则保留 `data/` 内版本）。
+
 
 ```powershell
 python -m py_compile "src/web/app.py" "src/agent/tools/review.py"

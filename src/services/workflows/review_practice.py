@@ -9,7 +9,7 @@ from typing import Any
 from knowledge_base_agent.llm.schema import LLMMessage, LLMRequest
 from services.workflows.interview_profile import (
     InterviewProfileStore,
-    mark_weak_point_improved,
+    advance_review_schedule,
     normalize_category,
     profile_weak_point_for_agent,
     update_weak_point,
@@ -282,7 +282,6 @@ def weak_point_id(weak: dict[str, Any]) -> str:
             str(weak.get("topic") or ""),
             str(weak.get("planned_layer") or ""),
             str(weak.get("point") or ""),
-            str(weak.get("evidence") or ""),
         ]
     )
     return "weak-" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
@@ -962,7 +961,7 @@ def grade_weak_point(profile: dict[str, Any], weak: dict[str, Any], *, outcome: 
     before = json.loads(json.dumps(weak.get("sr") or {}, ensure_ascii=False))
     previous_last_seen = weak.get("last_seen", "")
     if normalized == "pass":
-        mark_weak_point_improved(weak, observation, session_id="review", today=today_value)
+        advance_review_schedule(weak, observation, session_id="review", today=today_value)
     elif normalized == "fail":
         update_weak_point(weak, observation, session_id="review", today=today_value)
     else:

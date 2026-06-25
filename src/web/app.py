@@ -62,6 +62,13 @@ from services.wiki.tag_consolidation import (
     tag_cleanup_proposal_to_dict,
 )
 from services.wiki.tag_refinement import LLMTagRefiner, tag_refinement_proposal_to_dict
+from services.data_paths import (
+    answer_sessions_root,
+    interview_sessions_root,
+    migrate_legacy_runtime_dirs,
+    review_cache_root,
+    review_runs_root,
+)
 from services.workflows.context_builder import ContextBuilder
 from services.workflows.interview import (
     build_interview_messages,
@@ -83,6 +90,7 @@ from services.workflows.interview_sessions import InterviewSessionStore
 from services.workflows.answer_sessions import AnswerSessionStore
 from services.workflows.review_runs import ReviewRunStore
 from services.workflows.review_run_service import ReviewRunService
+from services.workflows.conversation_schema import extract_suggested_commits, project_dialogue_history
 from services.workflows.review_practice import (
     build_due_review_overview,
     build_correction_query,
@@ -453,6 +461,13 @@ class ReviewDialogueRequest(BaseModel):
     topics: list[str] = Field(default_factory=list)
     message: str = Field(default="")
     chat_history: list[dict[str, str]] = Field(default_factory=list)
+    review_run_id: str = Field(default="")
+
+
+class ReviewDialogueTurnRequest(BaseModel):
+    review_run_id: str = Field(default="")
+    message: str = Field(default="")
+    assistant_message_id: str = Field(default="")
 
 
 class ReviewRunWorkspacePatchRequest(BaseModel):
@@ -626,8 +641,9 @@ def create_app(
             overview_note_threshold=wiki_overview_note_threshold,
         ),
     )
-    interview_session_store = InterviewSessionStore(project_root / "interview-sessions")
-    answer_session_store = AnswerSessionStore(project_root / "answer-sessions")
+    migrate_legacy_runtime_dirs(project_root)
+    interview_session_store = InterviewSessionStore(interview_sessions_root(project_root))
+    answer_session_store = AnswerSessionStore(answer_sessions_root(project_root))
     interview_profile_store = InterviewProfileStore(project_root / "profile" / "interview_profile.json")
     startup_sync_status: dict[str, Any] = {
         "enabled": sync_on_start,
@@ -656,9 +672,9 @@ def create_app(
     rag_prewarm_lock = threading.Lock()
     rag_prewarm_started = False
     review_prepare_cache: dict[str, dict[str, Any]] = {}
-    review_cache_dir = project_root / "review-cache"
+    review_cache_dir = review_cache_root(project_root)
     review_run_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="review-run")
-    review_run_store = ReviewRunStore(project_root / "review-runs")
+    review_run_store = ReviewRunStore(review_runs_root(project_root))
     review_run_repo = FileReviewRunRepository(review_run_store)
     review_run_service = ReviewRunService(
         repository=review_run_repo,
@@ -1043,8 +1059,104 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/review/dialogue/turns")
+    def review_dialogue_turn(request: ReviewDialogueTurnRequest) -> dict[str, Any]:
+        review_run_id = str(request.review_run_id or "").strip()
+        if not review_run_id:
+            raise HTTPException(status_code=400, detail="review_run_id is required")
+        assistant_message_id = str(request.assistant_message_id or "").strip()
+        try:
+            prepared = review_run_service.prepare_dialogue_turn(
+                review_run_id,
+                message=request.message,
+                assistant_message_id=assistant_message_id,
+            )
+            assistant = prepared.get("assistant_message") or {}
+            assistant_message_id = str(assistant.get("id") or "")
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+            runtime = build_interview_agent_runtime(llm_client)
+            topics = list(prepared.get("topics") or [])
+            working = WorkingMemory(current_topic=topics[0] if len(topics) == 1 else None)
+            working.extra["review_topics"] = topics
+            state = AgentState(messages=[], working=working, skill_name="reviewer")
+            for item in prepared.get("chat_history") or []:
+                role = str(item.get("role") or "").strip()
+                if role in {"user", "assistant"}:
+                    state.messages.append(AgentMessage(role=role, content=str(item.get("content") or "")))
+            topic_line = f"Topics: {', '.join(topics)}\n" if topics else ""
+            user_text = str(prepared.get("user_text") or "")
+            result = runtime.run(
+                config=AgentRunConfig(
+                    skill_name="reviewer",
+                    max_steps=8,
+                    max_tool_calls_per_step=4,
+                    temperature=min(llm_config.temperature, 0.2),
+                    model=llm_config.model,
+                    trace_path=str(project_root / "eval-results" / "agent-debug" / "traces"),
+                    allowed_tools=["get_due_reviews", "verify_weak_point", "suggest_review_commit"],
+                    tool_mode="auto",
+                ),
+                user_input=f"{topic_line}{user_text}",
+                state=state,
+                tool_context=ToolExecutionContext(
+                    working=working,
+                    profile_store=interview_profile_store,
+                    turn_context={"review_topics": topics},
+                ),
+            )
+            agent_actions = list(getattr(result, "agent_actions", None) or [])
+            suggested_commits = extract_suggested_commits(agent_actions)
+            completed = review_run_service.complete_dialogue_assistant(
+                review_run_id,
+                assistant_message_id=assistant_message_id,
+                assistant_content=str(result.final_answer or ""),
+                agent_actions=agent_actions,
+                trace_path=str(result.trace_path or ""),
+                suggested_commits=suggested_commits,
+            )
+            snapshot = review_run_service.snapshot(review_run_id) or {}
+            messages = snapshot.get("messages") or []
+            return {
+                "review_run_id": review_run_id,
+                "answer": result.final_answer,
+                "trace_path": result.trace_path,
+                "stopped_reason": result.stopped_reason,
+                "error": result.error,
+                "error_type": result.error_type,
+                "user_message": prepared.get("user_message"),
+                "assistant_message": completed.get("assistant_message"),
+                "messages": messages,
+                "history": project_dialogue_history(messages),
+                "suggested_commits": completed.get("suggested_commits") or [],
+                "workspace": snapshot.get("workspace"),
+            }
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            if assistant_message_id:
+                try:
+                    review_run_service.fail_dialogue_assistant(
+                        review_run_id,
+                        assistant_message_id=assistant_message_id,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                except Exception:
+                    pass
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/review/dialogue")
     def review_dialogue(request: ReviewDialogueRequest) -> dict[str, Any]:
+        review_run_id = str(request.review_run_id or "").strip()
+        if review_run_id:
+            turn_request = ReviewDialogueTurnRequest(
+                review_run_id=review_run_id,
+                message=request.message,
+            )
+            return review_dialogue_turn(turn_request)
         if not request.message.strip():
             raise HTTPException(status_code=400, detail="message is required")
         try:
@@ -6066,7 +6178,7 @@ REVIEW_OLD_HTML = r"""<!doctype html>
       $("donePanel").innerHTML = `
         <h3>${ended ? "已结束复习" : "本轮复习完成"}</h3>
         <p>本轮处理 ${state.results.length} 条。确认改善 ${improved} 条，还要再练 ${retry} 条。</p>
-        <p>未复习或还要再练的弱项仍会在后续面试中注入，复习只是加速器。</p>
+        <p>确认改善会推迟下次复习；弱项仍会在后续面试 background 中保留，直到面试中再次验证通过。</p>
         <div class="actions"><button id="newReview" type="button">重新加载复习</button></div>
       `;
     }
@@ -6672,9 +6784,61 @@ REVIEW_HTML = r"""<!doctype html>
       if (options.patch !== false) scheduleReviewWorkspacePatch();
     }
 
+    function messagesToDialogueHistory(messages) {
+      return (messages || [])
+        .filter((msg) => msg && msg.status === "completed" && (msg.role === "user" || msg.role === "assistant"))
+        .map((msg) => ({role: msg.role, content: String(msg.content || "")}))
+        .filter((item) => item.content);
+    }
+
+    function applyDialogueRunPayload(data) {
+      if (!data || typeof data !== "object") return;
+      const runId = String(data.review_run_id || dialogueReviewState.reviewRunId || "").trim();
+      if (runId) dialogueReviewState.reviewRunId = runId;
+      if (Array.isArray(data.messages)) {
+        dialogueReviewState.history = messagesToDialogueHistory(data.messages);
+      } else if (Array.isArray(data.history)) {
+        dialogueReviewState.history = data.history;
+      }
+      const workspaceDlg = data.workspace?.dialogueReviewState;
+      if (workspaceDlg && typeof workspaceDlg === "object") {
+        if (typeof workspaceDlg.active === "boolean") dialogueReviewState.active = workspaceDlg.active;
+        if (Array.isArray(workspaceDlg.topics) && workspaceDlg.topics.length) {
+          dialogueReviewState.topics = workspaceDlg.topics;
+        }
+        if (!dialogueReviewState.history.length && Array.isArray(workspaceDlg.history)) {
+          dialogueReviewState.history = workspaceDlg.history;
+        }
+        if (Array.isArray(workspaceDlg.pendingSuggestions)) {
+          dialogueReviewState.pendingSuggestions = workspaceDlg.pendingSuggestions;
+        }
+        if (workspaceDlg.reviewRunId) dialogueReviewState.reviewRunId = String(workspaceDlg.reviewRunId);
+      }
+      const suggestions = data.suggested_commits
+        || data.workspace?.dialogueReviewState?.pendingSuggestions
+        || [];
+      if (Array.isArray(suggestions)) dialogueReviewState.pendingSuggestions = suggestions;
+    }
+
     function applyServerReviewWorkspace(workspace) {
       if (!workspace || typeof workspace !== "object") return;
-      applyReviewSnapshot({version: 1, ...workspace});
+      if (workspace.dialogueReviewState) {
+        applyDialogueRunPayload({
+          workspace,
+          review_run_id: dialogueReviewState.reviewRunId,
+        });
+      }
+      if (workspace.cardReviewState && cardReviewState.active) {
+        const card = workspace.cardReviewState;
+        if (typeof card.index === "number") cardReviewState.index = card.index;
+        if (Array.isArray(card.results)) cardReviewState.results = card.results;
+        if (Array.isArray(card.cards) && card.cards.length) {
+          cardReviewState.cards = mergeCards(cardReviewState.cards, card.cards);
+        }
+      }
+      if (typeof workspace.mode === "string" && workspace.mode && dialogueReviewState.active) {
+        mode = workspace.mode;
+      }
     }
 
     function inferCardPromptVersion(cards) {
@@ -6806,6 +6970,10 @@ REVIEW_HTML = r"""<!doctype html>
           const afterCard = currentCard();
           const shouldRender = !hadUsableCurrent || !isCardUsable(afterCard) || beforeCardId !== (afterCard?.id || "");
           if (mode === "card_review" && shouldRender) renderCardReview();
+        } else if (dialogueReviewState.active && dialogueReviewState.reviewRunId) {
+          applyDialogueRunPayload(data);
+          if (mode === "dialogue_review") renderDialogueReview();
+          await ensureDialogueKickoff();
         } else if (data.workspace) {
           applyServerReviewWorkspace(data.workspace);
         }
@@ -6836,6 +7004,7 @@ REVIEW_HTML = r"""<!doctype html>
         } else if ((cardReviewState.active && cardReviewState.reviewRunId && !cardReviewState.runStale)
           || (dialogueReviewState.active && dialogueReviewState.reviewRunId)) {
           await resyncCardReviewRun();
+          if (dialogueReviewState.active) await ensureDialogueKickoff();
         } else if (cardReviewState.active && cardReviewState.reviewRunId && cardReviewState.runStale) {
           stopPolling();
         } else if (cardReviewState.active && cardReviewState.runStatus !== "done" && cardReviewState.cards.some((item) => item.status === "pending")) {
@@ -6857,6 +7026,8 @@ REVIEW_HTML = r"""<!doctype html>
     function resumeReviewPage() {
       if (document.visibilityState === "hidden") return;
       if (cardReviewState.active && cardReviewState.reviewRunId && !cardReviewState.runStale) {
+        resyncCardReviewRun();
+      } else if (dialogueReviewState.active && dialogueReviewState.reviewRunId) {
         resyncCardReviewRun();
       }
     }
@@ -7437,10 +7608,28 @@ REVIEW_HTML = r"""<!doctype html>
       }
     }
 
+    function dialogueNeedsKickoff() {
+      return Boolean(
+        dialogueReviewState.active
+        && dialogueReviewState.reviewRunId
+        && !(dialogueReviewState.history || []).length
+        && !dialogueReviewState.busy,
+      );
+    }
+
+    async function ensureDialogueKickoff() {
+      if (!dialogueNeedsKickoff()) return;
+      await sendDialogueReview(
+        "请开始本轮对话复查。先从选中 topic 的建议复查弱项中选择一个最适合开始的点，直接提出第一题。",
+        true,
+      );
+    }
+
     async function startDialogueReview() {
       if (dialogueReviewState.active) {
         mode = "dialogue_review";
         render();
+        await ensureDialogueKickoff();
         syncReviewWorkspace();
         return;
       }
@@ -7452,12 +7641,14 @@ REVIEW_HTML = r"""<!doctype html>
       syncReviewWorkspace();
       try {
         const data = await postJson("/api/review/dialogue/sessions", {topics});
-        dialogueReviewState.reviewRunId = data.review_run_id || "";
-        if (data.workspace) applyServerReviewWorkspace(data.workspace);
+        applyDialogueRunPayload({...data, review_run_id: data.review_run_id || ""});
         syncReviewWorkspace();
         await sendDialogueReview("请开始本轮对话复查。先从选中 topic 的建议复查弱项中选择一个最适合开始的点，直接提出第一题。", true);
       } catch (error) {
+        dialogueReviewState = freshDialogueReviewState();
+        if (mode === "dialogue_review") mode = "selecting";
         setStatus(error.message || String(error), true);
+        render();
         syncReviewWorkspace();
       }
     }
@@ -7609,17 +7800,16 @@ REVIEW_HTML = r"""<!doctype html>
       const input = $("dialogueMessage");
       const message = kickoffMessage || (input?.value.trim() || "");
       if (!message) { setStatus("请先输入对话内容。", true); return; }
-      if (!hiddenUser) dialogueReviewState.history.push({role: "user", content: message});
+      if (!dialogueReviewState.reviewRunId) { setStatus("对话复查 run 未创建。", true); return; }
       if (input) input.value = "";
       dialogueReviewState.busy = true;
       renderDialogueReview();
       try {
-        const result = await postJson("/api/review/dialogue", {
-          topics: dialogueReviewState.topics,
+        const result = await postJson("/api/review/dialogue/turns", {
+          review_run_id: dialogueReviewState.reviewRunId,
           message,
-          chat_history: dialogueReviewState.history,
         });
-        dialogueReviewState.history.push({role: "assistant", content: result.answer || result.error || ""});
+        applyDialogueRunPayload(result);
         setStatus("对话复查已更新。");
       } catch (error) {
         setStatus(error.message || String(error), true);

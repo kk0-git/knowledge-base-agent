@@ -22,6 +22,7 @@ class AnswerSessionRepositoryTests(unittest.TestCase):
             session = store.create_session(scope_type="folder", scope_value="demo")
             pending = repo.append_pending_turn(session_id=session["session_id"], user_content="hello")
             self.assertEqual(pending["assistant_message"]["status"], "pending")
+            self.assertEqual(pending["user_message"]["turn_id"], pending["assistant_message"]["turn_id"])
             completed = repo.complete_assistant(
                 session_id=session["session_id"],
                 assistant_message_id=pending["assistant_message"]["id"],

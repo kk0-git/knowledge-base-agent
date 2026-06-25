@@ -679,7 +679,8 @@ def mark_weak_point_partial(weak: dict[str, Any], observation: dict[str, Any], *
     )
 
 
-def mark_weak_point_improved(weak: dict[str, Any], observation: dict[str, Any], *, session_id: str, today: str) -> None:
+def advance_review_schedule(weak: dict[str, Any], observation: dict[str, Any], *, session_id: str, today: str) -> None:
+    """Advance SM-2 after a successful review pass. Does not set improved."""
     weak["last_seen"] = today
     append_unique(weak.setdefault("source_session_ids", []), session_id, max_items=8)
     append_evidence(weak, observation.get("evidence", ""))
@@ -696,6 +697,13 @@ def mark_weak_point_improved(weak: dict[str, Any], observation: dict[str, Any], 
             "last_outcome": "pass",
         }
     )
+
+
+def mark_weak_point_improved(weak: dict[str, Any], observation: dict[str, Any], *, session_id: str, today: str) -> None:
+    """Interview-confirmed improvement: SM-2 pass plus improved flag after sustained success."""
+    advance_review_schedule(weak, observation, session_id=session_id, today=today)
+    sr = weak.get("sr") or {}
+    repetitions = int(sr.get("repetitions", 0) or 0)
     if repetitions >= 3:
         weak["improved"] = True
         weak["improved_at"] = today

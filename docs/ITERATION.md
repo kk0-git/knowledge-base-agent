@@ -2,6 +2,48 @@
 
 ## Current Iteration
 
+### 2026-06-24 Runtime data under `data/`
+
+Conversation / review runtime files no longer live at repo root:
+
+- **`src/services/data_paths.py`** — canonical paths under `data/` (interview, answer, review-runs, review-cache).
+- **`create_app`** — calls `migrate_legacy_runtime_dirs()` once at startup (merge root dirs into `data/`).
+- **`.gitignore`** — `data/` (user session JSON).
+
+Validation: `python -m pytest tests/test_data_paths.py -q`
+
+### 2026-06-24 Conversation Storage P1
+
+Review dialogue canonical transcript on server:
+
+- **`review-runs/{id}.json`** dialogue runs persist `messages[]`; workspace `history` derived on load/save.
+- **`POST /api/review/dialogue/turns`** — append pending turn, run reviewer agent, complete assistant message.
+- **Review frontend** — `sendDialogueReview` uses turn API; hydrate/resync from `GET plan` messages.
+- **Legacy** `POST /api/review/dialogue` with `review_run_id` delegates to turn API.
+
+Validation: `python -m pytest tests/test_review_dialogue_storage.py tests/test_review_run_repository.py tests/test_conversation_schema.py -q`
+
+### 2026-06-24 Conversation Storage P0
+
+Unified conversation message schema before memory system work:
+
+- **`docs/CONVERSATION_STORAGE.md`** — storage contract for interview / answer / review dialogue / review card.
+- **`conversation_schema.py`** — shared `turn_id`, message builders, normalize, complete/fail helpers.
+- **Interview + answer sessions** — pending/complete/fail use shared helpers; new sessions write `kind` + `agent.skill`; load normalizes messages.
+- **Review dialogue** — documented for P1 (`messages[]` in `review_run.json`); card review stays out of messages.
+
+Validation: `python -m pytest tests/test_conversation_schema.py tests/test_session_repository.py tests/test_answer_session_repository.py tests/test_agent_turn_service.py -q`
+
+### 2026-06-24 Review vs interview improvement split (Decision B)
+
+Separated review scheduling from interview-confirmed improvement:
+
+- **`advance_review_schedule()`** — review pass writes SM-2 only; never sets `improved`.
+- **`mark_weak_point_improved()`** — interview extractor path; SM-2 + `improved=True` when `repetitions >= 3`.
+- Review summary UI copy updated to reflect that background injection persists until interview verifies.
+
+Validation: `python -m pytest tests/test_review_practice.py -q`
+
 ### 2026-06-24 Phase C: Server Sessions + Chat WorkspaceStore
 
 Implemented disk-backed review runs and answer sessions; chat pointers moved to split WorkspaceStore.

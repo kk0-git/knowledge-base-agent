@@ -13,6 +13,7 @@ rag-index/
 
 # generated outputs
 audit-output/
+data/
 eval-results/*.json
 eval-results/**/*.json
 

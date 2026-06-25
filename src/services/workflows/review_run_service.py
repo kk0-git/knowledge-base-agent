@@ -16,7 +16,20 @@ from services.workflows.review_practice import (
     write_review_card_cache,
     REVIEW_PROMPT_VERSION,
 )
-from services.workflows.review_runs import ReviewRunStore, empty_workspace, utc_now_iso
+from services.workflows.review_runs import ReviewRunStore, empty_workspace, normalize_dialogue_run, utc_now_iso
+from services.workflows.conversation_schema import (
+    apply_assistant_completion,
+    apply_assistant_failure,
+    build_pending_assistant_message,
+    build_user_message,
+    extract_suggested_commits,
+    find_message as schema_find_message,
+    messages_for_agent_context,
+    next_message_id,
+    next_turn_id,
+    normalize_session_messages,
+    project_dialogue_history,
+)
 
 
 class ReviewRunService:
@@ -113,6 +126,7 @@ class ReviewRunService:
                 "prompt_version": REVIEW_PROMPT_VERSION,
                 "workspace": empty_workspace(),
                 "force_regenerate": force_regenerate,
+                "messages": [],
             }
         )
         self._persist_run(run)
@@ -167,6 +181,7 @@ class ReviewRunService:
             "due_count": 0,
             "prepared_count": 0,
             "limit": 0,
+            "messages": [],
             "created_at": now,
             "updated_at": now,
             "finished_at": now,
@@ -176,14 +191,176 @@ class ReviewRunService:
                 "cardReviewState": None,
                 "dialogueReviewState": {
                     "active": True,
+                    "reviewRunId": review_run_id,
                     "topics": cleaned,
                     "history": [],
                     "pendingSuggestions": [],
                 },
             },
         }
-        self._persist_run(run)
+        self._persist_run(normalize_dialogue_run(run))
         return self.snapshot(review_run_id) or run
+
+    def append_dialogue_pending_turn(self, review_run_id: str, user_content: str) -> dict[str, Any]:
+        run = self._require_dialogue_run(review_run_id)
+        now = utc_now_iso()
+        messages = list(run.get("messages") or [])
+        turn_id = next_turn_id(messages)
+        user_message = build_user_message(
+            message_id=next_message_id(messages),
+            turn_id=turn_id,
+            content=user_content,
+            created_at=now,
+        )
+        assistant_message = build_pending_assistant_message(
+            message_id=next_message_id([*messages, user_message]),
+            turn_id=turn_id,
+            created_at=now,
+        )
+        messages.extend([user_message, assistant_message])
+        run["messages"] = messages
+        run = self._finalize_dialogue_run(run)
+        self._persist_run(run)
+        return {"user_message": user_message, "assistant_message": assistant_message, "run": run}
+
+    def complete_dialogue_assistant(
+        self,
+        review_run_id: str,
+        *,
+        assistant_message_id: str,
+        assistant_content: str,
+        agent_actions: list[dict[str, Any]] | None = None,
+        trace_path: str = "",
+        suggested_commits: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        run = self._require_dialogue_run(review_run_id)
+        message = schema_find_message(run, assistant_message_id, role="assistant")
+        now = utc_now_iso()
+        commits = suggested_commits if suggested_commits is not None else extract_suggested_commits(agent_actions)
+        apply_assistant_completion(
+            message,
+            assistant_content=assistant_content,
+            updated_at=now,
+            agent_actions=agent_actions,
+        )
+        meta = dict(message.get("meta") or {})
+        if trace_path:
+            meta["trace_path"] = trace_path
+        if commits:
+            meta["suggested_commits"] = commits
+        message["meta"] = meta
+        run = self._finalize_dialogue_run(run)
+        self._persist_run(run)
+        return {"assistant_message": message, "run": run, "suggested_commits": commits}
+
+    def fail_dialogue_assistant(
+        self,
+        review_run_id: str,
+        *,
+        assistant_message_id: str,
+        assistant_content: str = "",
+        error_type: str = "Error",
+        error_message: str = "",
+        retryable: bool = True,
+    ) -> dict[str, Any]:
+        run = self._require_dialogue_run(review_run_id)
+        message = schema_find_message(run, assistant_message_id, role="assistant")
+        now = utc_now_iso()
+        apply_assistant_failure(
+            message,
+            updated_at=now,
+            assistant_content=assistant_content,
+            error_type=error_type,
+            error_message=error_message,
+            retryable=retryable,
+        )
+        run = self._finalize_dialogue_run(run)
+        self._persist_run(run)
+        return {"assistant_message": message, "run": run}
+
+    def prepare_dialogue_turn(
+        self,
+        review_run_id: str,
+        *,
+        message: str,
+        assistant_message_id: str = "",
+    ) -> dict[str, Any]:
+        text = str(message or "").strip()
+        if not text and not str(assistant_message_id or "").strip():
+            raise ValueError("message is required")
+        run = self._require_dialogue_run(review_run_id)
+        if str(assistant_message_id or "").strip():
+            pending = self._resolve_dialogue_pending_turn(run, assistant_message_id)
+            user_message = pending["user_message"]
+            assistant = pending["assistant_message"]
+            user_text = str(user_message.get("content") or "")
+        else:
+            pending = self.append_dialogue_pending_turn(review_run_id, text)
+            user_message = pending["user_message"]
+            assistant = pending["assistant_message"]
+            user_text = text
+            run = pending["run"]
+        topics = [str(topic).strip() for topic in run.get("topics") or run.get("selected_topics") or [] if str(topic).strip()]
+        chat_history = messages_for_agent_context(
+            run.get("messages") or [],
+            before_message_id=str(user_message.get("id") or ""),
+        )
+        return {
+            "run": run,
+            "topics": topics,
+            "user_message": user_message,
+            "assistant_message": assistant,
+            "user_text": user_text,
+            "chat_history": chat_history,
+        }
+
+    def _require_dialogue_run(self, review_run_id: str) -> dict[str, Any]:
+        run = self._get_run(review_run_id)
+        if run is None:
+            raise FileNotFoundError(f"review run not found: {review_run_id}")
+        if str(run.get("type") or "") != "dialogue":
+            raise ValueError("review run is not dialogue type")
+        return normalize_dialogue_run(run)
+
+    def _resolve_dialogue_pending_turn(self, run: dict[str, Any], assistant_message_id: str) -> dict[str, Any]:
+        assistant = schema_find_message(run, assistant_message_id, role="assistant")
+        if str(assistant.get("status") or "") != "pending":
+            raise ValueError("assistant_message_id is not a pending message")
+        messages = list(run.get("messages") or [])
+        user_message: dict[str, Any] | None = None
+        for index, message in enumerate(messages):
+            if str(message.get("id") or "") == assistant_message_id and index > 0:
+                previous = messages[index - 1]
+                if str(previous.get("role") or "") == "user":
+                    user_message = previous
+                break
+        if user_message is None:
+            raise ValueError("pending assistant message has no paired user message")
+        return {"user_message": user_message, "assistant_message": assistant}
+
+    def _finalize_dialogue_run(self, run: dict[str, Any]) -> dict[str, Any]:
+        run = normalize_session_messages(run)
+        workspace = dict(run.get("workspace") or empty_workspace())
+        dialogue = dict(workspace.get("dialogueReviewState") or {})
+        messages = list(run.get("messages") or [])
+        dialogue["history"] = project_dialogue_history(messages)
+        dialogue["reviewRunId"] = str(run.get("review_run_id") or dialogue.get("reviewRunId") or "")
+        commits: list[dict[str, Any]] = []
+        for message in reversed(messages):
+            if str(message.get("role") or "") != "assistant":
+                continue
+            meta = message.get("meta") or {}
+            for item in meta.get("suggested_commits") or []:
+                if isinstance(item, dict) and item.get("weak_point_id"):
+                    commits.append(item)
+            if commits:
+                break
+        dialogue["pendingSuggestions"] = commits
+        workspace["dialogueReviewState"] = dialogue
+        workspace["mode"] = "dialogue_review"
+        run["workspace"] = workspace
+        run["updated_at"] = utc_now_iso()
+        return normalize_dialogue_run(run)
 
     def generate_cards(self, review_run_id: str) -> None:
         with self._lock:

@@ -8,6 +8,18 @@ from pathlib import Path
 from typing import Any
 
 from agent.interview.state import default_interview_state_dict, normalize_interview_state_payload
+from services.workflows.conversation_schema import (
+    apply_assistant_completion,
+    apply_assistant_failure,
+    build_completed_assistant_message,
+    build_pending_assistant_message,
+    build_user_message,
+    find_message as schema_find_message,
+    next_message_id,
+    next_turn_id,
+    normalize_session_messages,
+    turn_id_for_message_pair,
+)
 
 
 SESSION_SCHEMA_VERSION = 1
@@ -127,12 +139,15 @@ class InterviewSessionStore:
         session = {
             "schema_version": SESSION_SCHEMA_VERSION,
             "session_id": session_id,
+            "kind": "interview",
             "mode": "interview",
             "status": "active",
             "created_at": now,
             "updated_at": now,
             "ended_at": None,
             "end_error": None,
+            "agent": {"skill": "interviewer", "runtime_version": ""},
+            "domain": {},
             "context": build_context(
                 source_type=source_type,
                 source_value=source_value,
@@ -191,6 +206,7 @@ class InterviewSessionStore:
         session = json.loads(path.read_text(encoding="utf-8-sig"))
         before = json.dumps(session.get("interview_state"), ensure_ascii=False, sort_keys=True)
         session = normalize_session_interview_state(session)
+        session = normalize_session_messages(session)
         after = json.dumps(session.get("interview_state"), ensure_ascii=False, sort_keys=True)
         if before != after:
             self.save_session(session)
@@ -232,22 +248,21 @@ class InterviewSessionStore:
 
         now = utc_now()
         messages = session.setdefault("messages", [])
-        user_message = {
-            "id": self._next_message_id(messages),
-            "role": "user",
-            "content": user_content,
-            "created_at": now,
-        }
-        assistant_message = {
-            "id": self._next_message_id([*messages, user_message]),
-            "role": "assistant",
-            "content": assistant_content,
-            "created_at": now,
-        }
-        if agent_actions is not None:
-            assistant_message["agent_actions"] = list(agent_actions)
-        if citations is not None:
-            assistant_message["citations"] = list(citations)
+        turn_id = next_turn_id(messages)
+        user_message = build_user_message(
+            message_id=next_message_id(messages),
+            turn_id=turn_id,
+            content=user_content,
+            created_at=now,
+        )
+        assistant_message = build_completed_assistant_message(
+            message_id=next_message_id([*messages, user_message]),
+            turn_id=turn_id,
+            content=assistant_content,
+            created_at=now,
+            agent_actions=agent_actions,
+            citations=citations,
+        )
         messages.extend([user_message, assistant_message])
 
         if interview_plan is not None:
@@ -300,24 +315,18 @@ class InterviewSessionStore:
 
         now = utc_now()
         messages = session.setdefault("messages", [])
-        user_message = {
-            "id": self._next_message_id(messages),
-            "role": "user",
-            "content": user_content,
-            "status": "completed",
-            "created_at": now,
-        }
-        assistant_message = {
-            "id": self._next_message_id([*messages, user_message]),
-            "role": "assistant",
-            "content": "",
-            "status": "pending",
-            "error_type": "",
-            "error_message": "",
-            "retryable": False,
-            "created_at": now,
-            "updated_at": now,
-        }
+        turn_id = next_turn_id(messages)
+        user_message = build_user_message(
+            message_id=next_message_id(messages),
+            turn_id=turn_id,
+            content=user_content,
+            created_at=now,
+        )
+        assistant_message = build_pending_assistant_message(
+            message_id=next_message_id([*messages, user_message]),
+            turn_id=turn_id,
+            created_at=now,
+        )
         messages.extend([user_message, assistant_message])
 
         self._update_session_context(
@@ -357,18 +366,15 @@ class InterviewSessionStore:
         citations: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         session = self.load_session(session_id)
-        message = self._find_message(session, assistant_message_id, role="assistant")
+        message = schema_find_message(session, assistant_message_id, role="assistant")
         now = utc_now()
-        message["content"] = assistant_content
-        message["status"] = "completed"
-        message["error_type"] = ""
-        message["error_message"] = ""
-        message["retryable"] = False
-        if agent_actions is not None:
-            message["agent_actions"] = list(agent_actions)
-        if citations is not None:
-            message["citations"] = list(citations)
-        message["updated_at"] = now
+        apply_assistant_completion(
+            message,
+            assistant_content=assistant_content,
+            updated_at=now,
+            agent_actions=agent_actions,
+            citations=citations,
+        )
         self._update_session_context(
             session,
             interview_plan=interview_plan,
@@ -404,14 +410,16 @@ class InterviewSessionStore:
         retryable: bool = True,
     ) -> dict[str, Any]:
         session = self.load_session(session_id)
-        message = self._find_message(session, assistant_message_id, role="assistant")
+        message = schema_find_message(session, assistant_message_id, role="assistant")
         now = utc_now()
-        message["content"] = assistant_content or message.get("content", "")
-        message["status"] = "failed"
-        message["error_type"] = error_type
-        message["error_message"] = error_message
-        message["retryable"] = bool(retryable)
-        message["updated_at"] = now
+        apply_assistant_failure(
+            message,
+            updated_at=now,
+            assistant_content=assistant_content,
+            error_type=error_type,
+            error_message=error_message,
+            retryable=retryable,
+        )
         session["updated_at"] = now
         self.save_session(session)
         self.append_trace_event(
@@ -441,8 +449,16 @@ class InterviewSessionStore:
     ) -> dict[str, Any]:
         reviews_doc = self.load_reviews(session_id)
         reviews = reviews_doc.setdefault("reviews", [])
+        session = self.load_session(session_id)
+        resolved_turn_id = turn_id_for_message_pair(
+            session,
+            user_message_id=user_message_id,
+            assistant_message_id=assistant_message_id,
+        )
         existing = self._find_review(reviews, user_message_id=user_message_id, assistant_message_id=assistant_message_id)
         if existing is not None:
+            if resolved_turn_id:
+                existing["turn_id"] = resolved_turn_id
             existing["feedback"] = feedback or {}
             existing["expression_example"] = reference_answer or ""
             existing["reference_answer"] = reference_answer or ""
@@ -468,7 +484,7 @@ class InterviewSessionStore:
             )
             return existing
         review = {
-            "turn_id": f"turn-{len(reviews) + 1:04d}",
+            "turn_id": resolved_turn_id or f"turn-{len(reviews) + 1:04d}",
             "user_message_id": user_message_id,
             "assistant_message_id": assistant_message_id,
             "feedback": feedback or {},
@@ -509,9 +525,17 @@ class InterviewSessionStore:
     ) -> dict[str, Any]:
         reviews_doc = self.load_reviews(session_id)
         reviews = reviews_doc.setdefault("reviews", [])
+        session = self.load_session(session_id)
+        resolved_turn_id = turn_id_for_message_pair(
+            session,
+            user_message_id=user_message_id,
+            assistant_message_id=assistant_message_id,
+        )
         existing = self._find_review(reviews, user_message_id=user_message_id, assistant_message_id=assistant_message_id)
         now = utc_now()
         if existing is not None:
+            if resolved_turn_id:
+                existing["turn_id"] = resolved_turn_id
             existing["status"] = "pending"
             existing["error"] = ""
             existing["retry_count"] = int(existing.get("retry_count", 0) or 0) + 1
@@ -530,7 +554,7 @@ class InterviewSessionStore:
             )
             return existing
         review = {
-            "turn_id": f"turn-{len(reviews) + 1:04d}",
+            "turn_id": resolved_turn_id or f"turn-{len(reviews) + 1:04d}",
             "user_message_id": user_message_id,
             "assistant_message_id": assistant_message_id,
             "feedback": {},
@@ -568,11 +592,17 @@ class InterviewSessionStore:
     ) -> dict[str, Any]:
         reviews_doc = self.load_reviews(session_id)
         reviews = reviews_doc.setdefault("reviews", [])
+        session = self.load_session(session_id)
+        resolved_turn_id = turn_id_for_message_pair(
+            session,
+            user_message_id=user_message_id,
+            assistant_message_id=assistant_message_id,
+        )
         review = self._find_review(reviews, user_message_id=user_message_id, assistant_message_id=assistant_message_id)
         now = utc_now()
         if review is None:
             review = {
-                "turn_id": f"turn-{len(reviews) + 1:04d}",
+                "turn_id": resolved_turn_id or f"turn-{len(reviews) + 1:04d}",
                 "user_message_id": user_message_id,
                 "assistant_message_id": assistant_message_id,
                 "feedback": {},
@@ -786,14 +816,8 @@ class InterviewSessionStore:
         path = self.session_path(session_id)
         return path.with_name(path.stem + ".reviews.json")
 
-    def _next_message_id(self, messages: list[dict[str, Any]]) -> str:
-        return f"msg-{len(messages) + 1:04d}"
-
     def _find_message(self, session: dict[str, Any], message_id: str, *, role: str | None = None) -> dict[str, Any]:
-        for message in session.get("messages", []):
-            if message.get("id") == message_id and (role is None or message.get("role") == role):
-                return message
-        raise ValueError(f"message not found: {message_id}")
+        return schema_find_message(session, message_id, role=role)
 
     def _find_review(
         self,

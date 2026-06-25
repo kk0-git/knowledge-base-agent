@@ -12,7 +12,7 @@ PROJECT_SRC = PROJECT_ROOT / "src"
 if str(PROJECT_SRC) not in sys.path:
     sys.path.insert(0, str(PROJECT_SRC))
 
-from services.workflows.interview_profile import InterviewProfileStore
+from services.workflows.interview_profile import InterviewProfileStore, mark_weak_point_improved
 from services.workflows.review_practice import (
     build_due_review_overview,
     build_grouped_review_prompt,
@@ -445,6 +445,34 @@ class ReviewPracticeTests(unittest.TestCase):
         self.assertEqual(updated_second["sr"]["last_reviewed"], today.isoformat())
         self.assertEqual(updated_second["sr"]["interval_days"], 1)
         self.assertLessEqual(updated_second["sr"]["repetitions"], 1)
+
+    def test_commit_review_pass_never_sets_improved_flag(self) -> None:
+        today = date.today()
+        tmp_path = make_writable_test_dir()
+        try:
+            store = InterviewProfileStore(tmp_path / "profile.json")
+            target = weak_point("review only", next_review=today.isoformat(), repetitions=0)
+            store.save({"schema_version": 3, "weak_points": [target], "strong_points": []})
+            card_id = weak_point_id(target)
+            for _ in range(3):
+                commit_review_outcome(store, card_id=card_id, outcome="pass")
+            profile = store.load()
+        finally:
+            shutil.rmtree(tmp_path, ignore_errors=True)
+
+        updated = profile["weak_points"][0]
+        self.assertGreaterEqual(updated["sr"]["repetitions"], 3)
+        self.assertFalse(updated.get("improved"))
+        self.assertFalse(updated.get("improved_at"))
+
+    def test_interview_improvement_still_sets_improved_after_three_passes(self) -> None:
+        today = date.today().isoformat()
+        weak = weak_point("interview verified", next_review=today, repetitions=0)
+        observation = {"planned_layer": "definition", "evidence": "interview gap closed"}
+        for _ in range(3):
+            mark_weak_point_improved(weak, observation, session_id="session-1", today=today)
+        self.assertTrue(weak.get("improved"))
+        self.assertEqual(weak.get("improved_at"), today)
 
     def test_commit_review_action_retry_keeps_ease_and_repetitions(self) -> None:
         today = date.today()
