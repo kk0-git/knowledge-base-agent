@@ -44,6 +44,7 @@ class LibrarianRequest:
     trace_path: str | None = None
     temperature: float = 0.2
     max_tool_calls_per_step: int = 4
+    learner_memory_context: str = ""
 
 
 class LibrarianApp:
@@ -308,11 +309,17 @@ def build_librarian_input(*, request: LibrarianRequest, runtime_context: dict[st
         content = str(item.get("content") or "").strip()
         if content:
             history.append(f"{role}: {content}")
-    sections = [
+    sections = []
+    memory_context = str(request.learner_memory_context or "").strip()
+    if memory_context:
+        sections.extend([memory_context, ""])
+    sections.extend(
+        [
             "# Runtime Context",
             json.dumps(runtime_context, ensure_ascii=False, indent=2),
             "",
-    ]
+        ]
+    )
     if request.strict_evidence:
         sections.extend(
             [

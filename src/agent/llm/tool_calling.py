@@ -90,7 +90,11 @@ class OpenAICompatibleToolCallingClient:
                 http_request,
                 timeout=getattr(self.base_client.config, "timeout_seconds", 60),
             ) as response:
-                raw = json.loads(response.read().decode("utf-8"))
+                raw_body = response.read().decode("utf-8")
+                try:
+                    raw = json.loads(raw_body)
+                except json.JSONDecodeError as exc:
+                    raise LLMToolCallError(f"LLM tools response JSON parse error: {exc}") from exc
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise LLMToolCallError(f"LLM tools HTTP error {exc.code}: {body}") from exc
@@ -307,22 +311,24 @@ def parse_arguments(raw: Any) -> dict[str, Any]:
 
 def parse_json_object(text: str) -> dict[str, Any]:
     stripped = text.strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        payload = json.loads(stripped)
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", stripped):
+        try:
+            payload, _end = decoder.raw_decode(stripped[match.start() :])
+        except json.JSONDecodeError:
+            continue
         if isinstance(payload, dict):
             return payload
-    match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
-    if not match:
-        raise LLMToolCallError("no JSON object found in fallback response")
-    payload = json.loads(match.group(0))
-    if not isinstance(payload, dict):
         raise LLMToolCallError("fallback response JSON must be an object")
-    return payload
+    raise LLMToolCallError("no JSON object found in fallback response")
 
 
 def looks_like_tool_support_error(exc: BaseException) -> bool:
     text = str(exc).lower()
     if "does not expose openai-compatible" in text:
         return True
+    if isinstance(exc, (LLMToolCallError, json.JSONDecodeError)):
+        if "json parse error" in text or "extra data" in text:
+            return True
     markers = ["tool", "tools", "tool_choice", "function", "unsupported", "unknown parameter", "extra inputs"]
     return any(marker in text for marker in markers)

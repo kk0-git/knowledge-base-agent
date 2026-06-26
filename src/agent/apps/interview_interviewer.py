@@ -196,12 +196,24 @@ def build_interviewer_runtime_context(
     snapshot = machine.snapshot()
     current_topic = snapshot.get("current_topic")
     current_layer = snapshot.get("current_layer_name", "")
+    memory_context = _render_interviewer_memory_context(
+        profile_store=profile_store,
+        current_topic=str(current_topic or ""),
+        planned_layer=str(current_layer or ""),
+        scope_note_paths=tuple(request.scope_note_paths or ()),
+    )
     profile_summary = build_profile_availability_counts(
         profile_store=profile_store,
         topic=current_topic,
         current_layer=current_layer,
         plan=request.interview_plan,
+        universal_limit=0 if memory_context else 3,
     )
+    preloaded = ["interview_state", "compact_plan", "scope_summary", "profile_layer_counts"]
+    if memory_context:
+        preloaded.append("learner_memory_background")
+    else:
+        preloaded.append("universal_profile_weak_points")
     return {
         "interview_mode": "mock",
         "session_id": request.session_id,
@@ -225,15 +237,46 @@ def build_interviewer_runtime_context(
             "allowed_note_count": len(request.scope_note_paths or ()),
         },
         "profile": profile_summary,
+        "memory_context": memory_context,
         "tool_boundaries": {
-            "preloaded": ["interview_state", "compact_plan", "scope_summary", "universal_profile_weak_points", "profile_layer_counts"],
+            "preloaded": preloaded,
             "on_demand": ["search_notes", "grep_vault", "read_note", "recall_profile"],
             "actions": ["advance_layer", "select_topic"],
         },
     }
 
 
-def build_profile_availability_counts(*, profile_store: Any | None, topic: Any, current_layer: Any = "", plan: Any | None = None) -> dict[str, Any]:
+def _render_interviewer_memory_context(
+    *,
+    profile_store: Any | None,
+    current_topic: str,
+    planned_layer: str,
+    scope_note_paths: tuple[str, ...],
+) -> str:
+    if profile_store is None:
+        return ""
+    try:
+        from services.memory.injection import render_interviewer_memory_context
+
+        model = profile_store.ensure_derived_fresh()
+        return render_interviewer_memory_context(
+            model=model,
+            current_topic=current_topic,
+            planned_layer=planned_layer,
+            scope_note_paths=scope_note_paths,
+        )
+    except Exception:
+        return ""
+
+
+def build_profile_availability_counts(
+    *,
+    profile_store: Any | None,
+    topic: Any,
+    current_layer: Any = "",
+    plan: Any | None = None,
+    universal_limit: int = 3,
+) -> dict[str, Any]:
     if profile_store is None:
         return {
             "profile_available": False,
@@ -256,7 +299,7 @@ def build_profile_availability_counts(*, profile_store: Any | None, topic: Any, 
             current_topic=topic,
             current_layer=current_layer,
             plan=plan,
-            universal_limit=3,
+            universal_limit=universal_limit,
         )
     except Exception:
         return {
@@ -281,12 +324,21 @@ def build_turn_input(request: InterviewTurnRequest, *, runtime_context: dict[str
         if content:
             history.append(f"{role}: {content}")
     context = runtime_context or {}
-    return "\n\n".join(
+    sections: list[str] = []
+    memory_context = str(context.get("memory_context") or "").strip()
+    if memory_context:
+        sections.extend(["# Learner Memory Background", memory_context, ""])
+    sections.extend(
         [
             "# Runtime Context",
             json.dumps(context, ensure_ascii=False, indent=2),
             "",
             "# Short Conversation History",
+        ]
+    )
+    return "\n\n".join(
+        [
+            *sections,
             "\n".join(history) if history else "(new interview session)",
             "",
             "# Current User Message",

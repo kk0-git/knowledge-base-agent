@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -85,11 +86,18 @@ class InterviewCoachApp:
             state=state,
             tool_context=tool_context,
         )
-        payload = normalize_coach_payload(parse_final_json(result.final_answer))
+        parsed_payload = parse_final_json(result.final_answer)
+        parse_error = str(parsed_payload.get("_parse_error") or "").strip()
+        repaired = bool(parsed_payload.get("_repaired"))
+        payload = normalize_coach_payload(parsed_payload)
         payload["profile_signals"] = []
         if not payload.get("context_note_paths"):
             payload["context_note_paths"] = list(request.context_note_paths)
-        payload["available"] = result.stopped_reason == "final"
+        payload["available"] = result.stopped_reason == "final" and not parse_error
+        if parse_error:
+            payload["error"] = "本轮复盘生成失败，可重试。"
+        if repaired:
+            payload["repaired"] = True
         payload["trace_id"] = result.trace_id
         payload["trace_path"] = result.trace_path
         payload["stopped_reason"] = result.stopped_reason
@@ -101,7 +109,7 @@ class InterviewCoachApp:
             "previous_interviewer_question": request.previous_interviewer_question,
         }
         rewrite_trace_memory_metadata(result=result, signals=[], drafts=tool_context.observation_drafts)
-        if request.save_review:
+        if request.save_review and payload.get("available") is not False:
             persist_review(request=request, payload=payload, result=result)
         return payload, result
 
@@ -149,19 +157,130 @@ def build_coach_input(request: CoachTurnRequest) -> str:
 def parse_final_json(text: str) -> dict[str, Any]:
     try:
         return parse_json_object(text)
+    except Exception as exc:
+        repaired = repair_turn_review_json(text)
+        if repaired:
+            repaired["_repaired"] = True
+            return repaired
+        return empty_parse_failure(str(exc))
+
+
+def empty_parse_failure(error: str = "") -> dict[str, Any]:
+    return {
+        "_parse_error": error or "invalid turn review JSON",
+        "feedback": {
+            "question_requires": [],
+            "coach_note": "",
+            "covered": [],
+            "gaps": [],
+            "thinking_framework": "",
+            "interviewer_followup_note": "",
+        },
+        "expression_example": "",
+        "profile_signals": [],
+    }
+
+
+def repair_turn_review_json(text: str) -> dict[str, Any]:
+    raw = str(text or "")
+    if not raw.strip():
+        return {}
+    feedback_block = extract_object_block(raw, "feedback")
+    feedback = {
+        "question_requires": extract_string_array(feedback_block, "question_requires"),
+        "coach_note": extract_string_field(feedback_block, "coach_note"),
+        "covered": extract_string_array(feedback_block, "covered"),
+        "gaps": extract_string_array(feedback_block, "gaps"),
+        "thinking_framework": extract_string_field(feedback_block, "thinking_framework"),
+        "interviewer_followup_note": extract_string_field(feedback_block, "interviewer_followup_note"),
+    }
+    expression_example = extract_string_field(raw, "expression_example")
+    has_content = any(feedback[key] for key in feedback) or bool(expression_example)
+    if not has_content:
+        return {}
+    return {
+        "feedback": feedback,
+        "expression_example": expression_example,
+        "profile_signals": [],
+    }
+
+
+def extract_object_block(text: str, key: str) -> str:
+    marker = re.search(rf'"{re.escape(key)}"\s*:\s*\{{', text)
+    if not marker:
+        return text
+    start = marker.end() - 1
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return text[start:]
+
+
+def extract_string_field(text: str, key: str) -> str:
+    marker = re.search(rf'"{re.escape(key)}"\s*:\s*"', text)
+    if not marker:
+        return ""
+    start = marker.end()
+    # A field value ends at the quote before the next JSON key, object close, or array close.
+    end_pattern = re.compile(r'"\s*(?:,\s*"[A-Za-z_][A-Za-z0-9_]*"\s*:|\s*[}\]])', re.DOTALL)
+    best_end = -1
+    for match in end_pattern.finditer(text, start):
+        best_end = match.start()
+        break
+    if best_end < start:
+        return ""
+    return decode_jsonish_string(text[start:best_end])
+
+
+def extract_string_array(text: str, key: str) -> list[str]:
+    marker = re.search(rf'"{re.escape(key)}"\s*:\s*\[', text)
+    if not marker:
+        return []
+    start = marker.end()
+    depth = 1
+    end = -1
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                end = index
+                break
+    if end < start:
+        return []
+    body = text[start:end]
+    values: list[str] = []
+    for line in body.splitlines():
+        item = line.strip().rstrip(",").strip()
+        if len(item) >= 2 and item[0] == '"' and item[-1] == '"':
+            value = decode_jsonish_string(item[1:-1])
+            if value:
+                values.append(value)
+    if values:
+        return values
+    try:
+        parsed = json.loads(f"[{body}]")
     except Exception:
-        return {
-            "feedback": {
-                "question_requires": [],
-                "coach_note": text.strip(),
-                "covered": [],
-                "gaps": [],
-                "thinking_framework": "",
-                "interviewer_followup_note": "",
-            },
-            "expression_example": "",
-            "profile_signals": [],
-        }
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
+def decode_jsonish_string(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(json.loads(f'"{text}"')).strip()
+    except Exception:
+        return text.replace("\\n", "\n").replace('\\"', '"').strip()
 
 
 def normalize_coach_payload(payload: dict[str, Any]) -> dict[str, Any]:

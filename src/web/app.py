@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -65,6 +65,7 @@ from services.wiki.tag_refinement import LLMTagRefiner, tag_refinement_proposal_
 from services.data_paths import (
     answer_sessions_root,
     interview_sessions_root,
+    learner_model_path,
     migrate_legacy_runtime_dirs,
     review_cache_root,
     review_runs_root,
@@ -86,6 +87,7 @@ from services.workflows.interview_profile import (
     render_candidate_profile_context,
 )
 from services.workflows.interview_memory_commit import commit_interview_memory
+from services.workflows.answer_memory_commit import commit_answer_memory
 from services.workflows.interview_sessions import InterviewSessionStore
 from services.workflows.answer_sessions import AnswerSessionStore
 from services.workflows.review_runs import ReviewRunStore
@@ -98,6 +100,7 @@ from services.workflows.review_practice import (
     build_grouped_weak_point_verification_query,
     build_weak_point_verification_query,
     build_recall_prompt,
+    commit_review_suggestions_as_candidates,
     commit_review_action,
     commit_review_outcome,
     find_weak_point,
@@ -352,6 +355,14 @@ class InterviewSessionSelectTopicRequest(BaseModel):
     reason: str = Field(default="")
     source: str = Field(default="ui")
     interview_plan: dict[str, Any] | None = Field(default=None)
+
+
+class MemoryCommitmentRequest(BaseModel):
+    action: str = Field(default="")
+    belief_id: str = Field(default="")
+    procedure_id: str = Field(default="")
+    target_type: str = Field(default="belief")
+    note: str = Field(default="")
 
 
 class WikiSynthesizeTagRequest(BaseModel):
@@ -644,7 +655,10 @@ def create_app(
     migrate_legacy_runtime_dirs(project_root)
     interview_session_store = InterviewSessionStore(interview_sessions_root(project_root))
     answer_session_store = AnswerSessionStore(answer_sessions_root(project_root))
-    interview_profile_store = InterviewProfileStore(project_root / "profile" / "interview_profile.json")
+    interview_profile_store = InterviewProfileStore(
+        learner_model_path(project_root),
+        legacy_path=project_root / "profile" / "interview_profile.json",
+    )
     startup_sync_status: dict[str, Any] = {
         "enabled": sync_on_start,
         "running": False,
@@ -763,6 +777,10 @@ def create_app(
     @app.get("/settings", response_class=HTMLResponse)
     def settings() -> str:
         return render_web_page(SETTINGS_HTML, "设置")
+
+    @app.get("/memory", response_class=HTMLResponse)
+    def memory_page() -> str:
+        return render_web_page(MEMORY_HTML, "Learner Memory")
 
     @app.get("/api/workspace/config")
     def workspace_config() -> dict[str, Any]:
@@ -1117,6 +1135,22 @@ def create_app(
             )
             snapshot = review_run_service.snapshot(review_run_id) or {}
             messages = snapshot.get("messages") or []
+            memory_candidate_commit: dict[str, Any] = {"changed": False, "observations": 0, "added_candidate_ids": [], "warnings": []}
+            if suggested_commits:
+                try:
+                    memory_candidate_commit = commit_review_suggestions_as_candidates(
+                        interview_profile_store,
+                        suggested_commits=suggested_commits,
+                        review_run_id=review_run_id,
+                        messages=messages,
+                    )
+                except Exception as exc:
+                    memory_candidate_commit = {
+                        "changed": False,
+                        "observations": 0,
+                        "added_candidate_ids": [],
+                        "warnings": [{"warning": str(exc), "error_type": type(exc).__name__}],
+                    }
             return {
                 "review_run_id": review_run_id,
                 "answer": result.final_answer,
@@ -1129,6 +1163,7 @@ def create_app(
                 "messages": messages,
                 "history": project_dialogue_history(messages),
                 "suggested_commits": completed.get("suggested_commits") or [],
+                "memory_candidate_commit": memory_candidate_commit,
                 "workspace": snapshot.get("workspace"),
             }
         except FileNotFoundError as exc:
@@ -2595,9 +2630,82 @@ def create_app(
     def archive_answer_session(session_id: str) -> dict[str, Any]:
         try:
             session = answer_session_store.archive_session(session_id)
-            return {"session": session}
+            llm_config = load_llm_config(project_root)
+            llm_client = create_llm_client(llm_config)
+            memory_commit, profile_update = commit_answer_memory(
+                session_store=answer_session_store,
+                profile_store=interview_profile_store,
+                session=session,
+                llm_client=llm_client,
+                model=llm_config.model,
+                temperature=min(llm_config.temperature, 0.1),
+            )
+            session = answer_session_store.load_session(session_id)
+            return {"session": session, "memory_commit": memory_commit, "profile_update": profile_update}
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/memory/candidates")
+    def list_memory_candidates() -> dict[str, Any]:
+        try:
+            return interview_profile_store.list_memory_candidates()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/memory/archived")
+    def list_memory_archived() -> dict[str, Any]:
+        try:
+            return interview_profile_store.list_memory_archived()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/memory/metrics")
+    def get_memory_metrics() -> dict[str, Any]:
+        try:
+            from services.memory.eval import memory_metrics
+
+            return {"metrics": memory_metrics(interview_profile_store.load_v4())}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/memory/commitments")
+    def post_memory_commitment(request: MemoryCommitmentRequest) -> dict[str, Any]:
+        action = str(request.action or "").strip()
+        target_type = str(request.target_type or "belief").strip() or "belief"
+        belief_id = str(request.belief_id or "").strip()
+        procedure_id = str(request.procedure_id or "").strip()
+        valid_actions = {
+            "confirm_candidate",
+            "deny_belief",
+            "restore_archived",
+            "confirm_procedure",
+            "set_procedure",
+            "deny_procedure",
+            "restore_procedure",
+        }
+        if action not in valid_actions:
+            raise HTTPException(status_code=400, detail=f"unsupported action: {action}")
+        if target_type not in {"belief", "procedure"}:
+            raise HTTPException(status_code=400, detail=f"unsupported target_type: {target_type}")
+        if target_type == "belief" and not belief_id:
+            raise HTTPException(status_code=400, detail="belief_id is required")
+        if target_type == "procedure" and not procedure_id:
+            raise HTTPException(status_code=400, detail="procedure_id is required")
+        try:
+            result = interview_profile_store.apply_user_commit(
+                action=action,
+                belief_id=belief_id,
+                procedure_id=procedure_id,
+                target_type=target_type,
+                note=str(request.note or "").strip(),
+            )
+            return result
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -3184,6 +3292,7 @@ SIDEBAR_HTML = r"""
           <div class="app-nav-title">维护</div>
           <a class="app-nav-link" href="/admin/wiki" data-nav-id="wiki-admin"><span class="app-nav-icon">🛠</span><span>Wiki Admin</span></a>
           <a class="app-nav-link" href="/search?debug=true" data-nav-id="search-debug"><span class="app-nav-icon">⚙</span><span>Search Debug</span></a>
+          <a class="app-nav-link" href="/memory" data-nav-id="memory"><span class="app-nav-icon">🧩</span><span>Learner Memory</span></a>
           <a class="app-nav-link" href="/settings" data-nav-id="settings"><span class="app-nav-icon">⚙</span><span>设置</span></a>
           <a class="app-nav-link" href="/organize" data-nav-id="organize"><span class="app-nav-icon">🧹</span><span>笔记整理</span></a>
         </section>
@@ -3393,6 +3502,7 @@ SHELL_SCRIPT = r"""
       else if (path === "/topics") active = "topics";
       else if (path === "/wiki") active = "wiki";
       else if (path === "/search") active = "search";
+      else if (path === "/memory") active = "memory";
       else if (path === "/settings") active = "settings";
       else if (path === "/organize" || path === "/audit") active = "organize";
       else if (path === "/review") active = "review";
@@ -3482,6 +3592,239 @@ def render_web_page(raw_html: str, title: str) -> str:
   </div>
   <script>
 {SHELL_SCRIPT}
+  </script>
+</body>
+</html>"""
+
+
+MEMORY_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Learner Memory</title>
+  <style>
+    main { max-width: 1120px; margin: 0 auto; padding: 24px; }
+    .memory-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+    .memory-header h2 { margin: 0 0 6px; }
+    .muted { color: #6b7280; font-size: 13px; }
+    .status { margin: 12px 0; color: #374151; }
+    .status.error { color: #b91c1c; }
+    .metrics { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 18px; }
+    .metric { border: 1px solid #e5e7eb; border-radius: 999px; padding: 6px 10px; background: #f9fafb; font-size: 13px; color: #374151; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+    .panel { border: 1px solid #e5e7eb; border-radius: 14px; background: #fff; padding: 16px; }
+    .panel h3 { margin: 0 0 12px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; margin-bottom: 10px; background: #f9fafb; }
+    .card-title { font-weight: 700; margin-bottom: 6px; }
+    .meta { color: #6b7280; font-size: 12px; margin: 4px 0; }
+    .evidence { color: #374151; font-size: 13px; margin: 8px 0; }
+    .evidence a { color: #1d4ed8; text-decoration: none; }
+    .evidence a:hover { text-decoration: underline; }
+    .evidence-line { margin: 4px 0; }
+    .steps { margin: 8px 0; padding-left: 18px; color: #374151; font-size: 13px; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    button { border: 1px solid #d1d5db; border-radius: 9px; padding: 7px 10px; background: #fff; cursor: pointer; }
+    button.primary { background: #111827; color: #fff; border-color: #111827; }
+    button.danger { color: #b91c1c; }
+    .empty { color: #6b7280; border: 1px dashed #d1d5db; border-radius: 12px; padding: 16px; }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="memory-header">
+      <div>
+        <h2>Learner Memory</h2>
+        <div class="muted">确认或否认候选记忆。Candidate 默认不会注入 prompt。</div>
+      </div>
+      <button id="refreshBtn" type="button">刷新</button>
+    </section>
+    <div id="status" class="status">加载中...</div>
+    <div id="metrics" class="metrics"></div>
+    <section class="grid">
+      <article class="panel">
+        <h3>Candidate Beliefs</h3>
+        <div id="beliefs"></div>
+      </article>
+      <article class="panel">
+        <h3>Candidate Procedures</h3>
+        <div id="procedures"></div>
+      </article>
+    </section>
+    <section class="grid" style="margin-top: 16px">
+      <article class="panel">
+        <h3>Archived Beliefs</h3>
+        <div class="muted" style="margin-bottom: 10px">已归档记忆不会注入 prompt，可手动恢复为 active。</div>
+        <div id="archivedBeliefs"></div>
+      </article>
+      <article class="panel">
+        <h3>Archived Procedures</h3>
+        <div id="archivedProcedures"></div>
+      </article>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[ch]));
+    }
+
+    function latestEvidence(item) {
+      const refs = Array.isArray(item.evidence_refs) ? item.evidence_refs : [];
+      const latest = refs.length ? refs[refs.length - 1] : null;
+      return latest ? latest.summary || "" : "";
+    }
+
+    function renderEvidenceLinks(item) {
+      const links = Array.isArray(item.evidence_links) ? item.evidence_links : [];
+      if (!links.length) {
+        const fallback = latestEvidence(item);
+        return fallback ? `<div class="evidence">${escapeHtml(fallback)}</div>` : "";
+      }
+      return `<div class="evidence">${links.map((link) => {
+        const summary = link.summary || "";
+        const label = link.label || link.source_kind || "来源";
+        const href = link.href || "";
+        if (href) {
+          return `<div class="evidence-line"><a href="${escapeHtml(href)}">${escapeHtml(label)}</a>${summary ? ` · ${escapeHtml(summary)}` : ""}</div>`;
+        }
+        return `<div class="evidence-line">${escapeHtml(summary || label)}</div>`;
+      }).join("")}</div>`;
+    }
+
+    async function postJson(url, body) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body || {})
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || response.statusText);
+      return data;
+    }
+
+    async function commit(targetType, id, action) {
+      $("status").textContent = "提交中...";
+      const body = {target_type: targetType, action};
+      if (targetType === "belief") body.belief_id = id;
+      else body.procedure_id = id;
+      await postJson("/api/memory/commitments", body);
+      $("status").textContent = "已更新。";
+      await load();
+    }
+
+    function renderBelief(item) {
+      return `
+        <div class="card">
+          <div class="card-title">${escapeHtml(item.point || item.id)}</div>
+          <div class="meta">${escapeHtml(item.category || "knowledge_gap")} · ${escapeHtml((item.source_kinds || []).join(", ") || "unknown")}</div>
+          ${renderEvidenceLinks(item)}
+          <div class="actions">
+            <button class="primary" type="button" onclick="commit('belief', '${escapeHtml(item.id)}', 'confirm_candidate')">确认</button>
+            <button class="danger" type="button" onclick="commit('belief', '${escapeHtml(item.id)}', 'deny_belief')">否认</button>
+          </div>
+        </div>`;
+    }
+
+    function renderArchivedBelief(item) {
+      return `
+        <div class="card">
+          <div class="card-title">${escapeHtml(item.point || item.id)}</div>
+          <div class="meta">archived · ${escapeHtml(item.category || "knowledge_gap")}</div>
+          ${renderEvidenceLinks(item)}
+          <div class="actions">
+            <button class="primary" type="button" onclick="commit('belief', '${escapeHtml(item.id)}', 'restore_archived')">恢复</button>
+          </div>
+        </div>`;
+    }
+
+    function renderProcedure(item) {
+      const steps = Array.isArray(item.steps) ? item.steps : [];
+      return `
+        <div class="card">
+          <div class="card-title">${escapeHtml(item.title || item.id)}</div>
+          <div class="meta">${escapeHtml(item.procedure_key || item.key || "")} · ${escapeHtml((item.source_kinds || []).join(", ") || "unknown")}</div>
+          ${steps.length ? `<ol class="steps">${steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>` : ""}
+          ${renderEvidenceLinks(item)}
+          <div class="actions">
+            <button class="primary" type="button" onclick="commit('procedure', '${escapeHtml(item.id)}', 'confirm_procedure')">确认</button>
+            <button class="danger" type="button" onclick="commit('procedure', '${escapeHtml(item.id)}', 'deny_procedure')">否认</button>
+          </div>
+        </div>`;
+    }
+
+    function renderArchivedProcedure(item) {
+      const steps = Array.isArray(item.steps) ? item.steps : [];
+      return `
+        <div class="card">
+          <div class="card-title">${escapeHtml(item.title || item.id)}</div>
+          <div class="meta">archived · ${escapeHtml(item.procedure_key || item.key || "")}</div>
+          ${steps.length ? `<ol class="steps">${steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>` : ""}
+          ${renderEvidenceLinks(item)}
+          <div class="actions">
+            <button class="primary" type="button" onclick="commit('procedure', '${escapeHtml(item.id)}', 'restore_procedure')">恢复</button>
+          </div>
+        </div>`;
+    }
+
+    function renderMetrics(metrics) {
+      if (!metrics) {
+        $("metrics").innerHTML = "";
+        return;
+      }
+      const preview = metrics.injection_preview || {};
+      const backlog = metrics.backlog || {};
+      const items = [
+        `candidates ${backlog.candidate_total ?? ((metrics.beliefs?.candidate ?? 0) + (metrics.procedures?.candidate ?? 0))}`,
+        `archived ${backlog.archived_total ?? ((metrics.beliefs?.archived ?? 0) + (metrics.procedures?.archived ?? 0))}`,
+        `active beliefs ${metrics.beliefs?.active ?? 0}`,
+        `due ${metrics.beliefs?.due_active ?? 0}`,
+        `confusion pairs ${metrics.beliefs?.confusion_pair ?? 0}`,
+        `interviewer inject b${preview.interviewer_active_beliefs ?? 0}/p${preview.interviewer_procedures ?? 0}`,
+        `librarian inject b${preview.librarian_active_beliefs ?? 0}/p${preview.librarian_procedures ?? 0}`,
+        `derived ${metrics.derived?.stale ? "stale" : "fresh"}${metrics.derived?.generation_mismatch ? " / mismatch" : ""}`
+      ];
+      $("metrics").innerHTML = items.map((item) => `<span class="metric">${escapeHtml(item)}</span>`).join("");
+    }
+
+    async function load() {
+      try {
+        const [candidateResponse, metricsResponse, archivedResponse] = await Promise.all([
+          fetch("/api/memory/candidates"),
+          fetch("/api/memory/metrics"),
+          fetch("/api/memory/archived")
+        ]);
+        const data = await candidateResponse.json();
+        if (!candidateResponse.ok) throw new Error(data.detail || candidateResponse.statusText);
+        const archivedData = await archivedResponse.json();
+        if (!archivedResponse.ok) throw new Error(archivedData.detail || archivedResponse.statusText);
+        const metricsData = await metricsResponse.json().catch(() => ({}));
+        if (metricsResponse.ok) renderMetrics(metricsData.metrics);
+        const beliefs = data.beliefs || data.candidates || [];
+        const procedures = data.procedures || [];
+        const archivedBeliefs = archivedData.beliefs || [];
+        const archivedProcedures = archivedData.procedures || [];
+        $("beliefs").innerHTML = beliefs.length ? beliefs.map(renderBelief).join("") : `<div class="empty">暂无候选 Belief。</div>`;
+        $("procedures").innerHTML = procedures.length ? procedures.map(renderProcedure).join("") : `<div class="empty">暂无候选 Procedure。</div>`;
+        $("archivedBeliefs").innerHTML = archivedBeliefs.length ? archivedBeliefs.map(renderArchivedBelief).join("") : `<div class="empty">暂无归档 Belief。</div>`;
+        $("archivedProcedures").innerHTML = archivedProcedures.length ? archivedProcedures.map(renderArchivedProcedure).join("") : `<div class="empty">暂无归档 Procedure。</div>`;
+        const total = beliefs.length + procedures.length + archivedBeliefs.length + archivedProcedures.length;
+        $("status").textContent = `候选 ${beliefs.length + procedures.length} 条，归档 ${archivedBeliefs.length + archivedProcedures.length} 条（共 ${total} 条可见）。`;
+        $("status").classList.remove("error");
+      } catch (error) {
+        $("status").textContent = error.message || String(error);
+        $("status").classList.add("error");
+      }
+    }
+
+    $("refreshBtn").addEventListener("click", load);
+    load();
   </script>
 </body>
 </html>"""

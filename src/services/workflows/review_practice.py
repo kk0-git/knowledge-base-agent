@@ -9,10 +9,8 @@ from typing import Any
 from knowledge_base_agent.llm.schema import LLMMessage, LLMRequest
 from services.workflows.interview_profile import (
     InterviewProfileStore,
-    advance_review_schedule,
     normalize_category,
     profile_weak_point_for_agent,
-    update_weak_point,
 )
 
 
@@ -951,30 +949,47 @@ def choose_question_type_for_weak_point(weak: dict[str, Any]) -> str:
     return "recall"
 
 
-def grade_weak_point(profile: dict[str, Any], weak: dict[str, Any], *, outcome: str, today: str | None = None) -> dict[str, Any]:
+def grade_weak_point(
+    store: InterviewProfileStore,
+    profile: dict[str, Any],
+    weak: dict[str, Any],
+    *,
+    outcome: str,
+    today: str | None = None,
+) -> dict[str, Any]:
     normalized = str(outcome or "").strip().lower()
     today_value = today or date.today().isoformat()
-    observation = {
-        "planned_layer": weak.get("planned_layer") or "",
-        "evidence": "review practice outcome",
-    }
+    belief_id = weak_point_id(weak)
     before = json.loads(json.dumps(weak.get("sr") or {}, ensure_ascii=False))
     previous_last_seen = weak.get("last_seen", "")
     if normalized == "pass":
-        advance_review_schedule(weak, observation, session_id="review", today=today_value)
+        from services.memory.bridge import observation_schedule_pass
+
+        observation = observation_schedule_pass(belief_id=belief_id)
     elif normalized == "fail":
-        update_weak_point(weak, observation, session_id="review", today=today_value)
+        from services.memory.bridge import observation_schedule_retry
+
+        observation = observation_schedule_retry(belief_id=belief_id, evidence_summary="review practice fail")
     else:
         raise ValueError("outcome must be pass or fail")
-    weak["last_seen"] = previous_last_seen
-    weak.setdefault("sr", {})["last_reviewed"] = today_value
-    after = weak.get("sr") or {}
+
+    from services.memory.commit import commit_observations
+
+    model, _ = commit_observations(store.load_v4(), [observation], today=today_value)
+    store.save_v4(model)
+    updated_profile = store.load()
+    updated_weak = find_weak_point(updated_profile, belief_id)
+    if updated_weak is None:
+        updated_weak = weak
+    updated_weak["last_seen"] = previous_last_seen
+    updated_weak.setdefault("sr", {})["last_reviewed"] = today_value
+    after = updated_weak.get("sr") or {}
     return {
-        "card_id": weak_point_id(weak),
+        "card_id": belief_id,
         "outcome": normalized,
         "before": before,
         "after": after,
-        "improved": bool(weak.get("improved")),
+        "improved": bool(updated_weak.get("improved")),
     }
 
 
@@ -983,9 +998,7 @@ def commit_review_outcome(store: InterviewProfileStore, *, card_id: str, outcome
     weak = find_weak_point(profile, card_id)
     if weak is None:
         raise KeyError(f"review card not found: {card_id}")
-    result = grade_weak_point(profile, weak, outcome=outcome)
-    store.save(profile)
-    return result
+    return grade_weak_point(store, profile, weak, outcome=outcome)
 
 
 def commit_review_action(store: InterviewProfileStore, *, card_id: str, action: str) -> dict[str, Any]:
@@ -999,16 +1012,18 @@ def commit_review_action(store: InterviewProfileStore, *, card_id: str, action: 
     if weak is None:
         raise KeyError(f"review card not found: {card_id}")
     today_value = date.today().isoformat()
+    belief_id = weak_point_id(weak)
     before = json.loads(json.dumps(weak.get("sr") or {}, ensure_ascii=False))
-    weak["improved"] = False
-    sr = weak.setdefault("sr", {})
-    sr["ease_factor"] = round(float(sr.get("ease_factor", 2.5) or 2.5), 2)
-    sr["repetitions"] = int(sr.get("repetitions", 0) or 0)
-    sr["interval_days"] = 1
-    sr["next_review"] = today_value
-    sr["last_outcome"] = "retry"
-    sr["last_reviewed"] = today_value
-    store.save(profile)
+    from services.memory.bridge import apply_review_ui_retry
+
+    model = store.load_v4()
+    updated = apply_review_ui_retry(model, belief_id=belief_id, today=today_value)
+    if updated is None:
+        raise KeyError(f"review card not found: {card_id}")
+    store.save_v4(model)
+    profile = store.load()
+    weak = find_weak_point(profile, card_id) or weak
+    sr = weak.get("sr") or {}
     return {
         "card_id": card_id,
         "action": "retry",
@@ -1016,6 +1031,115 @@ def commit_review_action(store: InterviewProfileStore, *, card_id: str, action: 
         "after": sr,
         "improved": False,
     }
+
+
+def commit_review_suggestions_as_candidates(
+    store: InterviewProfileStore,
+    *,
+    suggested_commits: list[dict[str, Any]],
+    review_run_id: str,
+    messages: list[dict[str, Any]] | None = None,
+    today: str | None = None,
+) -> dict[str, Any]:
+    if not suggested_commits:
+        return {"changed": False, "observations": 0, "added_candidate_ids": [], "warnings": []}
+
+    profile = store.load()
+    model_before = store.load_v4()
+    before_ids = {str(item.get("id") or "") for item in model_before.get("beliefs") or [] if isinstance(item, dict)}
+    warnings: list[dict[str, str]] = []
+    observations: list[dict[str, Any]] = []
+    latest_turn_id = _latest_dialogue_turn_id(messages or [])
+
+    for suggestion in suggested_commits:
+        if not isinstance(suggestion, dict):
+            continue
+        weak_id = str(suggestion.get("weak_point_id") or "").strip()
+        if not weak_id:
+            continue
+        weak = find_weak_point(profile, weak_id)
+        if weak is None:
+            warnings.append({"weak_point_id": weak_id, "warning": "review weak point not found"})
+            continue
+        evidence_summary = _review_candidate_evidence_summary(suggestion, weak, messages or [])
+        observations.append(
+            {
+                "op": "propose_belief",
+                "source_kind": "review",
+                "confidence": "medium",
+                "target_lifecycle": "candidate",
+                "force_new_candidate": True,
+                "point": str(weak.get("point") or "").strip(),
+                "topic": str(weak.get("topic") or "").strip(),
+                "planned_layer": str(weak.get("planned_layer") or "").strip(),
+                "category": normalize_category(weak.get("category")),
+                "scope": str(weak.get("scope") or "domain").strip() or "domain",
+                "domain_anchor": weak.get("domain_anchor") or {},
+                "source_note_paths": list(weak.get("source_note_paths") or []),
+                "review_run_id": review_run_id,
+                "card_id": weak_id,
+                "turn_id": latest_turn_id,
+                "evidence_summary": evidence_summary,
+            }
+        )
+
+    if not observations:
+        return {"changed": False, "observations": 0, "added_candidate_ids": [], "warnings": warnings}
+
+    from services.memory.commit import commit_observations
+
+    model_after, operations = commit_observations(model_before, observations, today=today)
+    store.save_v4(model_after)
+    added_ids = [
+        str(item.get("id") or "")
+        for item in model_after.get("beliefs") or []
+        if isinstance(item, dict)
+        and str(item.get("id") or "") not in before_ids
+        and str(item.get("lifecycle") or "") == "candidate"
+    ]
+    return {
+        "changed": bool(operations.get("changed")),
+        "observations": len(observations),
+        "added_candidate_ids": added_ids,
+        "warnings": warnings,
+        "operations": operations,
+        "canonical_revision": int(model_after.get("canonical_revision") or 0),
+    }
+
+
+def _latest_dialogue_turn_id(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("turn_id"):
+            return str(message.get("turn_id") or "")
+    return ""
+
+
+def _review_candidate_evidence_summary(
+    suggestion: dict[str, Any],
+    weak: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> str:
+    explicit = str(suggestion.get("evidence") or suggestion.get("reason") or "").strip()
+    if explicit:
+        return explicit
+    action = str(suggestion.get("action") or suggestion.get("suggested_action") or "retry").strip().lower()
+    latest_user = ""
+    latest_assistant = ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip()
+        content = str(message.get("content") or "").strip()
+        if role == "assistant" and not latest_assistant:
+            latest_assistant = content
+        elif role == "user" and not latest_user:
+            latest_user = content
+        if latest_user and latest_assistant:
+            break
+    snippets = [item[:120] for item in (latest_user, latest_assistant) if item]
+    if snippets:
+        return f"review dialogue suggested {action}: " + " / ".join(snippets)
+    return f"review dialogue suggested {action} for: {str(weak.get('point') or '').strip()}"
 
 
 def parse_correction_payload(text: str, *, citations: list[dict[str, Any]] | None = None) -> dict[str, Any]:

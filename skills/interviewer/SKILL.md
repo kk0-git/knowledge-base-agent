@@ -21,7 +21,9 @@ Stay on the current layer until you have enough signal, but do not turn one sub-
 
 # Runtime Context Boundary
 
-The runtime context in the user message already contains the server-authoritative interview state, compact plan, scope summary, universal profile weak points, and domain weak-point counts by planned layer. Treat it as the default source of truth for the current topic, layer, `follow_up_count_before_this_turn`, `should_consider_layer_transition`, and available topics.
+The runtime context in the user message already contains the server-authoritative interview state, compact plan, scope summary, domain weak-point counts by planned layer, and (when available) a **Learner Memory Background** block with derived summary, active beliefs, procedures, and user commitments. Treat runtime JSON as the default source of truth for the current topic, layer, `follow_up_count_before_this_turn`, `should_consider_layer_transition`, and available topics.
+
+When `# Learner Memory Background` is present, active belief bodies live there—not in `profile.universal_weak_points`. Use that block quietly to shape probes.
 
 Do not routinely call `get_interview_state` or `list_plan_topics`. Use them only when the injected runtime context is missing, contradictory, or insufficient—for example after an ambiguous `advance_layer` result.
 
@@ -30,7 +32,7 @@ Respect `follow_up_count_before_this_turn`: it is the count before this turn. Af
 # Tool Behavior
 
 - Use `search_notes` for conceptual note lookup, `grep_vault` for exact terms, and `read_note` before relying on note-specific details.
-- Universal weak points are already preloaded in runtime context. Use them quietly when they naturally affect the next probe; do not call `recall_profile` for universal weak points.
+- Active beliefs and interaction preferences may be preloaded in **Learner Memory Background** (top of user message). Use them quietly when they naturally affect the next probe; do not call `recall_profile` for universal beliefs already in that block.
 - Domain weak-point bodies are not preloaded. If `runtime_context.profile.current_layer_domain_weak_count > 0`, call `recall_profile` once for the current planned layer before the first question on that layer: `recall_profile(topic=current_topic, planned_layer=current_layer_name)`.
 - Do not call `recall_profile` when the current layer count is 0, when profile is unavailable, or repeatedly within the same layer unless the previous recall result was clearly missing or contradictory.
 - Do not claim you read a note unless `read_note` succeeded for that path in this turn.
@@ -129,6 +131,7 @@ The following are handled outside this skill. Do not duplicate them with tools o
 - **Opening track menu**: UI/API while `topic_phase=awaiting_selection`.
 - **Full interview plan text**: already in runtime `compact_plan`.
 - **Full note bodies**: use `search_notes` / `read_note` / `grep_vault`.
-- **Universal profile weak points**: already preloaded in runtime context, capped to the top items.
+- **Learner Memory Background**: derived summary, ≤5 active beliefs (with probe hints and latest evidence), ≤2 procedures, user commitments—when canonical memory exists.
+- **Universal profile weak points**: fallback in runtime JSON only when the memory block is absent (legacy / empty profile).
 - **Domain profile weak points**: use `recall_profile(planned_layer=current_layer_name)` only when the current layer count says there are matching weak points.
 - **Real interview mode**: interviewer-led opening topic selection is not enabled in Mock mode.

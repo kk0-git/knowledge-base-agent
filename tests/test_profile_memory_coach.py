@@ -12,7 +12,7 @@ if str(PROJECT_SRC) not in sys.path:
     sys.path.insert(0, str(PROJECT_SRC))
 
 from agent.apps import CoachTurnRequest, InterviewCoachApp
-from agent.apps.interview_coach import build_coach_input, normalize_coach_payload
+from agent.apps.interview_coach import build_coach_input, normalize_coach_payload, parse_final_json
 from agent.llm.tool_calling import LLMToolRequest, LLMToolResponse
 from agent.runtime import AgentRuntime
 from agent.schema import ToolCall, WorkingMemory
@@ -190,6 +190,43 @@ class CoachAgentTests(unittest.TestCase):
         self.assertEqual(payload["feedback"]["question_requires"], ["reliable signal", "fallback strategy"])
         self.assertEqual(payload["profile_signals"], [])
 
+    def test_parse_final_json_does_not_expose_raw_invalid_output(self) -> None:
+        parsed = parse_final_json(
+            'I will now produce JSON. {"feedback": {"coach_note": '
+        )
+        self.assertIn("_parse_error", parsed)
+        self.assertEqual(parsed["feedback"]["coach_note"], "")
+        self.assertNotIn("I will now produce JSON", parsed["feedback"]["coach_note"])
+
+    def test_parse_final_json_repairs_turn_review_fields_when_possible(self) -> None:
+        parsed = parse_final_json(
+            """
+I already have the content. Now let me produce the JSON.
+{
+  "feedback": {
+    "question_requires": [
+      "用一个具体场景对比三种模式的核心区别，展示它们在"何时规划""如何反馈""能否从失败中学习"上的差异"
+    ],
+    "coach_note": "Plan-and-Execute 的动机说成"节省 token"太表面了。",
+    "covered": [
+      "ReAct 的 Thought-Action-Observation 循环描述正确"
+    ],
+    "gaps": [
+      "Reflexion 完全缺失"
+    ],
+    "thinking_framework": "概念对比题：先说痛点，再用同一场景对齐。",
+    "interviewer_followup_note": "面试官追问是因为 Reflexion 完全缺失。"
+  },
+  "expression_example": "ReAct 适合动态探索。\\nPlan-and-Execute 适合先规划后执行。",
+  "profile_signals": []
+}
+"""
+        )
+        self.assertTrue(parsed["_repaired"])
+        self.assertIn("何时规划", parsed["feedback"]["question_requires"][0])
+        self.assertIn("节省 token", parsed["feedback"]["coach_note"])
+        self.assertIn("ReAct 适合动态探索", parsed["expression_example"])
+
     def test_coach_skill_does_not_expose_profile_write_or_state_action_tools(self) -> None:
         registry = ToolRegistry()
         register_interview_tools(registry)
@@ -241,6 +278,8 @@ class CoachAgentTests(unittest.TestCase):
             self.assertTrue(summary["available"])
             self.assertEqual(summary["feedback"]["gaps"], ["Host/Client/Server responsibilities are not separated"])
             self.assertEqual(summary["profile_signals"], [])
+            self.assertEqual(result.steps[0].metadata["llm_mode"], "fake")
+            self.assertEqual(runtime.llm_client.requests[0].response_format, {"type": "json_object"})
             reviews = session_store.load_reviews(session["session_id"])["reviews"]
             self.assertEqual(len(reviews), 1)
             self.assertEqual(reviews[0]["profile_signals"], [])

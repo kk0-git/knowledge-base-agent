@@ -76,10 +76,12 @@ def suggest_review_commit(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     if action not in {"improve", "retry"}:
         action = "retry"
     weak_point_id = str(args.get("weak_point_id") or "").strip()
+    evidence = str(args.get("evidence") or args.get("reason") or "").strip()
     return {
         "ok": bool(weak_point_id),
         "weak_point_id": weak_point_id,
         "suggested_action": action,
+        "evidence": evidence,
         "requires_user_confirmation": True,
         "committed": False,
     }
@@ -132,6 +134,7 @@ def register_review_tools(registry: ToolRegistry) -> None:
                 "properties": {
                     "weak_point_id": {"type": "string"},
                     "action": {"type": "string", "enum": ["improve", "retry"]},
+                    "evidence": {"type": "string"},
                 },
                 "required": ["weak_point_id", "action"],
             },
