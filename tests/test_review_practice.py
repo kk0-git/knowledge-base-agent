@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import shutil
+import tempfile
 import unittest
 import uuid
 from datetime import date, timedelta
@@ -21,6 +22,7 @@ from services.workflows.review_practice import (
     build_review_plan,
     commit_review_action,
     commit_review_outcome,
+    commit_review_suggestions_as_candidates,
     grouped_review_cards,
     list_due_reviews,
     matching_strategy_constraints_for_card,
@@ -80,7 +82,7 @@ def weak_point(
     improved: bool = False,
     repetitions: int = 0,
     ease_factor: float = 2.2,
-    category: str = "knowledge_gap",
+    category: str = "knowledge",
     times_seen: int = 1,
     last_seen: str = "",
     last_reviewed: str = "",
@@ -290,7 +292,7 @@ class ReviewPracticeTests(unittest.TestCase):
         today = date.today().isoformat()
         profile = {
             "weak_points": [
-                weak_point("agent mechanism gap", next_review=today, topic="Agent", category="knowledge_gap"),
+                weak_point("agent mechanism gap", next_review=today, topic="Agent", category="knowledge"),
                 weak_point("mcp decision pattern", next_review=today, topic="MCP", category="thinking_pattern"),
                 weak_point("agent answer too short", next_review=today, topic="Agent", category="answer_structure"),
             ]
@@ -298,7 +300,7 @@ class ReviewPracticeTests(unittest.TestCase):
 
         grouped = grouped_review_cards(profile, topics=["Agent"], today=today)
 
-        card = next(item for item in grouped["cards"] if item["category"] == "knowledge_gap")
+        card = next(item for item in grouped["cards"] if item["facet"] == "knowledge")
         strategy_points = [item["point"] for item in card["strategy_constraints"]]
         self.assertEqual(strategy_points, ["agent answer too short"])
         self.assertNotIn("mcp decision pattern", strategy_points)
@@ -328,8 +330,8 @@ class ReviewPracticeTests(unittest.TestCase):
         today = date.today().isoformat()
         profile = {
             "weak_points": [
-                weak_point("first gap", next_review=today, topic="MCP", category="knowledge_gap"),
-                weak_point("second gap", next_review=today, topic="MCP", category="knowledge_gap"),
+                weak_point("first gap", next_review=today, topic="MCP", category="knowledge"),
+                weak_point("second gap", next_review=today, topic="MCP", category="knowledge"),
                 weak_point("structure gap", next_review=today, topic="MCP", category="answer_structure"),
             ]
         }
@@ -340,7 +342,7 @@ class ReviewPracticeTests(unittest.TestCase):
         self.assertEqual(counts, [1, 2])
         merged = [card for card in grouped["cards"] if card["weak_point_count"] == 2][0]
         self.assertEqual(merged["topic"], "MCP")
-        self.assertEqual(merged["category"], "knowledge_gap")
+        self.assertEqual(merged["facet"], "knowledge")
 
     def test_review_card_cache_round_trips_success_payload(self) -> None:
         cache_dir = make_writable_test_dir()
@@ -515,6 +517,66 @@ class ReviewPracticeTests(unittest.TestCase):
         fallback = parse_verification_payload("Need mention result.content.")
         self.assertTrue(fallback["parse_error"])
         self.assertEqual(fallback["suggested_action"], "retry")
+
+    def test_commit_review_suggestions_writes_candidate_belief(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = InterviewProfileStore(Path(tmp) / "learner_model.json")
+            model = store.load_v4()
+            model["learner_items"] = [
+                {
+                    "id": "wp-active",
+                    "lifecycle": "active",
+                    **weak_point("MCP host/client boundary", next_review=date.today().isoformat(), topic="MCP"),
+                }
+            ]
+            store.save_v4(model)
+
+            result = commit_review_suggestions_as_candidates(
+                store,
+                suggested_commits=[
+                    {
+                        "weak_point_id": "wp-active",
+                        "action": "retry",
+                        "evidence": "still mixed up host and client responsibilities",
+                    }
+                ],
+                review_run_id="review-run-1",
+                messages=[
+                    {"role": "user", "content": "Host 是发起连接的一方吗？", "turn_id": "turn-1"},
+                    {"role": "assistant", "content": "这里还需要区分 host/client。", "turn_id": "turn-1"},
+                ],
+                today="2026-06-26",
+            )
+
+            updated = store.load_v4()
+            beliefs = updated["learner_items"]
+            active = [item for item in beliefs if item.get("lifecycle") == "active"]
+            candidates = [item for item in beliefs if item.get("lifecycle") == "candidate"]
+            self.assertTrue(result["changed"])
+            self.assertEqual(len(active), 1)
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["point"], "MCP host/client boundary")
+            self.assertEqual(candidates[0]["source_kinds"], ["review"])
+            evidence = candidates[0]["evidence_refs"][0]
+            self.assertEqual(evidence["review_run_id"], "review-run-1")
+            self.assertEqual(evidence["card_id"], "wp-active")
+            self.assertEqual(evidence["turn_id"], "turn-1")
+            self.assertIn("host and client", evidence["summary"])
+
+    def test_commit_review_suggestions_skips_unknown_weak_point(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = InterviewProfileStore(Path(tmp) / "learner_model.json")
+
+            result = commit_review_suggestions_as_candidates(
+                store,
+                suggested_commits=[{"weak_point_id": "missing", "action": "retry"}],
+                review_run_id="review-run-1",
+                messages=[],
+            )
+
+            self.assertFalse(result["changed"])
+            self.assertEqual(result["observations"], 0)
+            self.assertEqual(result["warnings"][0]["weak_point_id"], "missing")
 
 
 if __name__ == "__main__":

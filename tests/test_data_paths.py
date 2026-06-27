@@ -13,6 +13,7 @@ from services.data_paths import (
     answer_sessions_root,
     app_data_root,
     interview_sessions_root,
+    learner_model_path,
     migrate_legacy_runtime_dirs,
     review_cache_root,
     review_runs_root,
@@ -26,6 +27,7 @@ def test_app_data_roots(tmp_path: Path) -> None:
     assert answer_sessions_root(root) == root / "data" / "answer-sessions"
     assert review_runs_root(root) == root / "data" / "review-runs"
     assert review_cache_root(root) == root / "data" / "review-cache"
+    assert learner_model_path(root) == root / "data" / "profile" / "learner_model.json"
     assert app_data_root(root) == root / "data"
 
 

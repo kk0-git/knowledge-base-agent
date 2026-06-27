@@ -42,6 +42,8 @@ def commit_interview_memory(
         model=model,
         temperature=temperature,
     )
+    if session_id and enriched_session.get("memory_extraction"):
+        session_store.save_session(enriched_session)
     audit = build_commit_audit(
         profile_update=profile_update,
         memory_signals=memory_signals,

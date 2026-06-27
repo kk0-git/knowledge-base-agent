@@ -36,6 +36,20 @@ class ToolExecutionContext:
     profile_signals: list[dict[str, Any]] = field(default_factory=list)
     observation_drafts: list[dict[str, Any]] = field(default_factory=list)
     citations: list[dict[str, Any]] = field(default_factory=list)
+    current_call_id: str | None = None
+    stats_holder: dict[str, Any] = field(default_factory=dict)
+
+    def begin_tool_call(self, call_id: str) -> None:
+        self.current_call_id = call_id
+        self.stats_holder = {}
+
+    def put_stats(self, stats: dict[str, Any]) -> None:
+        if isinstance(stats, dict):
+            self.stats_holder.update(to_jsonable(stats))
+
+    def clear_tool_call(self) -> None:
+        self.current_call_id = None
+        self.stats_holder = {}
 
 
 class ToolExecutor:
@@ -49,10 +63,14 @@ class ToolExecutor:
             spec = self.registry.get(call.name)
             self._check_permission(spec)
             validate_arguments(spec, call.arguments)
-            output = self._run_handler(spec, call.arguments)
-            collect_tool_citations(call.name, output, self.ctx)
-            latency_ms = elapsed_ms(started_at)
-            return build_success_result(call, output, latency_ms)
+            self.ctx.begin_tool_call(call.id)
+            try:
+                output = self._run_handler(spec, call.arguments)
+                collect_tool_citations(call.name, output, self.ctx)
+                latency_ms = elapsed_ms(started_at)
+                return build_success_result(call, output, latency_ms, extra_stats=dict(self.ctx.stats_holder))
+            finally:
+                self.ctx.clear_tool_call()
         except ToolNotFoundError as exc:
             return build_error_result(call, exc, ToolExecutionStatus.NOT_FOUND.value, elapsed_ms(started_at))
         except ToolValidationError as exc:
@@ -118,9 +136,12 @@ def value_matches_json_type(value: Any, expected_type: str | list[str]) -> bool:
     return True
 
 
-def build_success_result(call: ToolCall, output: Any, latency_ms: int) -> ToolResult:
+def build_success_result(call: ToolCall, output: Any, latency_ms: int, *, extra_stats: dict[str, Any] | None = None) -> ToolResult:
     jsonable = to_jsonable(output)
     rendered = json_dumps(jsonable)
+    stats = extract_tool_stats(call.name, jsonable)
+    if extra_stats:
+        stats.update(to_jsonable(extra_stats))
     return ToolResult(
         call_id=call.id,
         name=call.name,
@@ -130,7 +151,7 @@ def build_success_result(call: ToolCall, output: Any, latency_ms: int) -> ToolRe
         latency_ms=latency_ms,
         result_size=len(rendered),
         summary=truncate_text(rendered, 500),
-        stats=extract_tool_stats(call.name, jsonable),
+        stats=stats,
     )
 
 

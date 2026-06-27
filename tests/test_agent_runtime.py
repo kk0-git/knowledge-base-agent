@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 import sys
 from dataclasses import dataclass
+from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_SRC = PROJECT_ROOT / "src"
@@ -23,7 +24,7 @@ from agent.llm.tool_calling import (
     parse_fallback_tool_calls,
 )
 from agent.runtime import AgentRuntime, execute_with_run_cache, is_cacheable_tool
-from agent.schema import AgentRunConfig, ToolCall, ToolResult, ToolExecutionStatus, ToolSpec, WorkingMemory
+from agent.schema import AgentMessage, AgentRunConfig, ToolCall, ToolResult, ToolExecutionStatus, ToolSpec, WorkingMemory
 from agent.serialization import to_jsonable
 from agent.skill_loader import SkillLoader
 from agent.tool_executor import ToolExecutionContext, ToolExecutor
@@ -150,6 +151,34 @@ class JsonFallbackBaseClient:
                 raw={"fake": True},
             )
         return LLMResponse(content='{"final":"fallback final"}', raw={"fake": True})
+
+
+class MalformedNativeBaseClient:
+    base_url = "http://fake.local"
+
+    def __init__(self) -> None:
+        self.config = FakeLLMConfig()
+        self.calls = 0
+        self.requests = []
+
+    def complete(self, request):
+        self.calls += 1
+        self.requests.append(request)
+        return LLMResponse(content='{"final":"fallback after malformed native"}', raw={"fake": True})
+
+
+class MalformedNativeResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self) -> bytes:
+        return (
+            b'{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}'
+            b'\n{"extra":true}'
+        )
 
 
 class AgentRuntimeTests(unittest.TestCase):
@@ -696,6 +725,25 @@ class AgentRuntimeTests(unittest.TestCase):
         calls = parse_fallback_tool_calls(payload["tool_calls"])
         self.assertEqual(calls[0].name, "echo")
         self.assertEqual(calls[0].arguments["text"], "hi")
+
+    def test_json_fallback_parser_uses_first_complete_object(self) -> None:
+        payload = parse_json_object('{"final":"ok"}\n{"extra":true}')
+        self.assertEqual(payload["final"], "ok")
+
+    def test_auto_native_extra_data_response_falls_back_to_json_adapter(self) -> None:
+        base_client = MalformedNativeBaseClient()
+        client = OpenAICompatibleToolCallingClient(base_client)
+        request = LLMToolRequest(
+            model="fake",
+            messages=[AgentMessage(role="user", content="review this turn")],
+            tools=[],
+            tool_mode="auto",
+        )
+        with patch("urllib.request.urlopen", return_value=MalformedNativeResponse()):
+            response = client.complete_with_tools(request)
+        self.assertEqual(response.used_mode, "json")
+        self.assertEqual(response.content, "fallback after malformed native")
+        self.assertEqual(base_client.calls, 1)
 
 
 def write_temp_skill(root: str, name: str, allowed_tools: list[str]) -> None:

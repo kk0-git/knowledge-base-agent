@@ -4,6 +4,8 @@ from typing import Any
 
 
 SIGNAL_TYPES = {"possible_weak_point", "possible_partial", "possible_improvement"}
+FACETS = {"knowledge", "behavior"}
+# Deprecated alias — kept for backward compat with agent tool schemas
 CATEGORIES = {"knowledge_gap", "answer_structure", "communication", "thinking_pattern"}
 SCOPES = {"domain", "universal"}
 CONFIDENCE = {"low", "medium", "high"}

@@ -360,6 +360,7 @@ def extract_suggested_commits(agent_actions: list[dict[str, Any]] | None) -> lis
             {
                 "weak_point_id": weak_point_id,
                 "action": str(output.get("suggested_action") or output.get("action") or "retry").strip().lower(),
+                "evidence": str(output.get("evidence") or output.get("reason") or "").strip(),
             }
         )
     return commits

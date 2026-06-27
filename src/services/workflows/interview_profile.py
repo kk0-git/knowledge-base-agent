@@ -26,6 +26,8 @@ Extract only observations that are useful across future interview sessions:
 - partial: evidence that the user partially addressed an existing weak point, but not completely.
 - strong_point: a durable strength shown by the user.
 - improvement: evidence that an existing weak point may have improved.
+- procedure: an explicit assistant interaction preference, such as "answer with conclusion first" or "use counterexamples".
+- confusion_pair: a durable confusion between two concepts.
 
 Prefer concrete engineering phrasing over generic labels. Keep each point short enough to become a future interview probe.
 
@@ -44,6 +46,7 @@ Prefer concrete engineering phrasing over generic labels. Keep each point short 
   - Concrete knowledge/mechanism/component gaps should be domain.
   - Listening, communication, or answer-structure habits may be universal, but the system will make the final scope decision.
 - Do not output domain_anchor; it is written by code.
+- Do not use procedure for learner weaknesses such as unclear expression, shallow reasoning, or listening mistakes. Those are weak_point observations with category communication, answer_structure, or thinking_pattern.
 
 # Output
 
@@ -57,12 +60,18 @@ Return only JSON:
   },
   "observations": [
     {
-      "type": "weak_point|partial|strong_point|improvement",
+      "type": "weak_point|partial|strong_point|improvement|procedure|confusion_pair",
       "topic": "topic name if clear",
       "planned_layer": "planned layer if clear, otherwise empty string",
       "category": "knowledge_gap|answer_structure|communication|thinking_pattern",
       "scope_suggestion": "domain|universal",
       "point": "short durable point",
+      "procedure_key": "stable key for procedure, if type=procedure",
+      "title": "procedure title, if type=procedure",
+      "steps": ["procedure steps, if type=procedure"],
+      "left": "left concept, if type=confusion_pair",
+      "right": "right concept, if type=confusion_pair",
+      "distinction": "short distinction, if type=confusion_pair",
       "weak_point_ref": "existing weak point text if improvement, otherwise empty string",
       "evidence": "brief evidence from the session",
       "confidence": "low|medium|high"
@@ -72,6 +81,57 @@ Return only JSON:
     "style": "stable expression pattern if any, otherwise empty string",
     "suggestions": ["durable communication suggestions"]
   }
+}
+"""
+
+
+ANSWER_MEMORY_EXTRACTION_SYSTEM_PROMPT = """# Role
+
+You are a learner memory curator for a personal knowledge Q&A system.
+
+You read a completed answer session transcript and extract durable learning observations. You do not edit memory directly.
+
+# What To Extract
+
+Extract observations that are useful across future Q&A sessions:
+- recurring knowledge gaps
+- answer-structure or thinking-pattern habits when clearly shown
+- procedure observations only when the user explicitly asks for answer or interaction style
+- confusion_pair observations when the user clearly mixes two concepts
+
+# Boundaries
+
+- Write in Simplified Chinese.
+- Do not score the user.
+- Do not create weak points from one trivial typo.
+- category must be one of: knowledge_gap, answer_structure, communication, thinking_pattern.
+- scope_suggestion must be domain or universal.
+- confidence high only when the user clearly admits not understanding or gave an answer clearly wrong on a cited topic.
+- Do not output domain_anchor; it is written by code.
+- Do not use procedure for learner weaknesses such as unclear expression or shallow reasoning. Those remain weak_point observations.
+
+# Output
+
+Return only JSON:
+{
+  "observations": [
+    {
+      "type": "weak_point|procedure|confusion_pair",
+      "topic": "topic if clear",
+      "planned_layer": "",
+      "category": "knowledge_gap|answer_structure|communication|thinking_pattern",
+      "scope_suggestion": "domain|universal",
+      "point": "short durable point",
+      "procedure_key": "stable key for procedure, if type=procedure",
+      "title": "procedure title, if type=procedure",
+      "steps": ["procedure steps, if type=procedure"],
+      "left": "left concept, if type=confusion_pair",
+      "right": "right concept, if type=confusion_pair",
+      "distinction": "short distinction, if type=confusion_pair",
+      "evidence": "brief evidence from the session",
+      "confidence": "low|medium|high"
+    }
+  ]
 }
 """
 
@@ -91,23 +151,44 @@ def default_interview_profile() -> dict[str, Any]:
 
 
 class InterviewProfileStore:
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, *, legacy_path: Path | str | None = None):
+        from services.memory.store import LearnerModelStore
+
         self.path = Path(path)
+        self.legacy_path = Path(legacy_path) if legacy_path is not None else self.path
+        self._learner_store = LearnerModelStore(self.path, self.legacy_path)
+
+    def load_v4(self) -> dict[str, Any]:
+        return self._learner_store.load()
+
+    def save_v4(self, model: dict[str, Any]) -> None:
+        from services.memory.bridge import learner_model_to_profile_view
+        from services.memory.schema import normalize_learner_model
+
+        normalized = normalize_learner_model(model)
+        profile_view = learner_model_to_profile_view(normalized)
+        profile_view = recompute_topic_mastery(profile_view)
+        legacy = dict(normalized.get("legacy") or {})
+        legacy["topic_mastery"] = profile_view.get("topic_mastery") or {}
+        normalized["legacy"] = legacy
+        normalized["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._learner_store.save(normalized)
 
     def load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            profile = default_interview_profile()
-            self.save(profile)
-            return profile
-        profile = json.loads(self.path.read_text(encoding="utf-8-sig"))
+        from services.memory.bridge import learner_model_to_profile_view
+
+        model = self.load_v4()
+        profile = learner_model_to_profile_view(model)
         return normalize_interview_profile(profile)
 
     def save(self, profile: dict[str, Any]) -> None:
-        profile = normalize_interview_profile(profile)
-        profile["updated_at"] = datetime.now(timezone.utc).isoformat()
-        profile = recompute_topic_mastery(profile)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+        from services.memory.bridge import sync_profile_view_to_model
+
+        if int(profile.get("schema_version") or 0) >= 4 and (profile.get("beliefs") is not None or profile.get("learner_items") is not None):
+            self.save_v4(profile)
+            return
+        model = sync_profile_view_to_model(profile, self.load_v4())
+        self.save_v4(model)
 
     def update_from_session(
         self,
@@ -118,6 +199,30 @@ class InterviewProfileStore:
         model: str | None = None,
         temperature: float = 0.1,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        from services.memory.bridge import (
+            apply_legacy_profile_observations_to_model,
+            build_memory_extraction_checkpoint,
+            observations_from_profile_extractor,
+            should_skip_memory_extraction,
+        )
+        from services.memory.commit import commit_observations
+
+        session_id = str(session.get("session_id") or "")
+        if should_skip_memory_extraction(session, reviews=reviews):
+            checkpoint = session.get("memory_extraction") or {}
+            return (
+                fallback_final_review(session, []),
+                {
+                    "source": "memory_extraction_checkpoint",
+                    "extraction_error": "",
+                    "operations": {"skipped": True},
+                    "observation_count": int(checkpoint.get("observation_count") or 0),
+                    "filtered_low_count": int(checkpoint.get("filtered_low_count") or 0),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+        model_before = self.load_v4()
         profile_before = self.load()
         extraction_error = ""
         observations: list[dict[str, Any]]
@@ -146,22 +251,254 @@ class InterviewProfileStore:
             communication = {}
             extraction_source = "turn_review_signals_fallback"
 
-        profile_after, operations = apply_profile_observations(
-            profile=profile_before,
-            observations=observations,
+        commit_obs = observations_from_profile_extractor(
+            observations,
+            session=session,
+            model=model_before,
+            communication=communication,
+        )
+        model_after, commit_ops = commit_observations(model_before, commit_obs)
+        model_after, legacy_ops = apply_legacy_profile_observations_to_model(
+            model_after,
+            observations,
             session=session,
             communication=communication,
         )
-        self.save(profile_after)
-        profile_after = self.load()
+        self.save_v4(model_after)
+        model_after = self.load_v4()
+
+        if session_id:
+            session.setdefault("memory_extraction", {})
+            session["memory_extraction"] = build_memory_extraction_checkpoint(
+                session=session,
+                reviews=reviews,
+                trigger="interview.session_ended",
+                observation_count=len(observations),
+                filtered_low_count=int(commit_ops.get("filtered_low_count") or 0),
+                commit_revision=int(model_after.get("canonical_revision") or 0),
+            )
+
+        operations = {
+            "added": [],
+            "updated": [],
+            "partial": legacy_ops.get("partial") or [],
+            "improved": [],
+            "strong_added": legacy_ops.get("strong_added") or [],
+            "strong_updated": legacy_ops.get("strong_updated") or [],
+            "commit": commit_ops,
+        }
         update = {
             "source": extraction_source,
             "extraction_error": extraction_error,
             "operations": operations,
             "observation_count": len(observations),
+            "filtered_low_count": int(commit_ops.get("filtered_low_count") or 0),
+            "canonical_revision": int(model_after.get("canonical_revision") or 0),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         return final_review, update
+
+    def update_from_answer_session(
+        self,
+        *,
+        session: dict[str, Any],
+        llm_client: Any | None = None,
+        model: str | None = None,
+        temperature: float = 0.1,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        from services.memory.bridge import (
+            build_memory_extraction_checkpoint,
+            observations_from_answer_extractor,
+            observations_from_answer_rules_fallback,
+            should_skip_memory_extraction,
+        )
+        from services.memory.commit import commit_observations
+
+        reviews: list[dict[str, Any]] = []
+        session_id = str(session.get("session_id") or "")
+        if should_skip_memory_extraction(session, reviews=reviews):
+            checkpoint = session.get("memory_extraction") or {}
+            return (
+                {
+                    "source": "memory_extraction_checkpoint",
+                    "extraction_error": "",
+                    "operations": {"skipped": True, "commit": {"skipped": True}},
+                    "observation_count": int(checkpoint.get("observation_count") or 0),
+                    "filtered_low_count": int(checkpoint.get("filtered_low_count") or 0),
+                    "canonical_revision": int(checkpoint.get("commit_revision") or 0),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                session,
+            )
+
+        model_before = self.load_v4()
+        profile_before = self.load()
+        extraction_error = ""
+        observations: list[dict[str, Any]]
+        extraction_source = "llm"
+
+        try:
+            if not llm_client or not model:
+                raise ValueError("LLM client and model are required for answer memory extraction")
+            extracted = extract_answer_memory_observations(
+                session=session,
+                profile=profile_before,
+                llm_client=llm_client,
+                model=model,
+                temperature=temperature,
+            )
+            observations = extracted["observations"]
+        except Exception as exc:
+            extraction_error = str(exc)
+            observations = observations_from_answer_rules_fallback(session)
+            extraction_source = "rules_fallback"
+
+        commit_obs = observations_from_answer_extractor(
+            observations,
+            session=session,
+            model=model_before,
+        )
+        model_after, commit_ops = commit_observations(model_before, commit_obs)
+        self.save_v4(model_after)
+        model_after = self.load_v4()
+
+        if session_id:
+            session.setdefault("memory_extraction", {})
+            session["memory_extraction"] = build_memory_extraction_checkpoint(
+                session=session,
+                reviews=reviews,
+                trigger="answer.session_ended",
+                observation_count=len(observations),
+                filtered_low_count=int(commit_ops.get("filtered_low_count") or 0),
+                commit_revision=int(model_after.get("canonical_revision") or 0),
+            )
+
+        update = {
+            "source": extraction_source,
+            "extraction_error": extraction_error,
+            "operations": {"commit": commit_ops},
+            "observation_count": len(observations),
+            "filtered_low_count": int(commit_ops.get("filtered_low_count") or 0),
+            "canonical_revision": int(model_after.get("canonical_revision") or 0),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return update, session
+
+    def apply_user_commit(
+        self,
+        *,
+        action: str,
+        belief_id: str = "",
+        procedure_id: str = "",
+        target_type: str = "belief",
+        note: str = "",
+    ) -> dict[str, Any]:
+        from services.memory.bridge import observation_user_commit
+        from services.memory.commit import commit_observations
+
+        model_before = self.load_v4()
+        target = str(target_type or "belief").strip() or "belief"
+        target_id = procedure_id if target == "procedure" else belief_id
+        collection = "assistant_items" if target == "procedure" else "learner_items"
+        target_before = next(
+            (item for item in (model_before.get(collection) or model_before.get("procedures" if target == "procedure" else "beliefs") or []) if str(item.get("id") or "") == target_id),
+            None,
+        )
+        if target_before is None:
+            raise KeyError(f"{target} not found: {target_id}")
+
+        model_after, operations = commit_observations(
+            model_before,
+            [
+                observation_user_commit(
+                    action=action,
+                    belief_id=belief_id if target == "belief" else "",
+                    procedure_id=procedure_id if target == "procedure" else "",
+                    target_type=target,
+                    note=note,
+                )
+            ],
+        )
+        if not operations.get("changed"):
+            raise ValueError(f"user commit rejected for action={action} {target}_id={target_id}")
+
+        self.save_v4(model_after)
+        target_after = next(
+            (item for item in model_after.get(collection) or [] if str(item.get("id") or "") == target_id),
+            None,
+        )
+        return {
+            target: target_after,
+            "target_type": target,
+            "operations": operations,
+            "canonical_revision": int(model_after.get("canonical_revision") or 0),
+        }
+
+    def list_candidate_beliefs(self) -> list[dict[str, Any]]:
+        model = self.load_v4()
+        return [
+            dict(belief)
+            for belief in (model.get("learner_items") or model.get("beliefs") or [])
+            if isinstance(belief, dict) and str(belief.get("lifecycle") or "") == "candidate"
+        ]
+
+    def list_candidate_procedures(self) -> list[dict[str, Any]]:
+        model = self.load_v4()
+        return [
+            dict(procedure)
+            for procedure in (model.get("assistant_items") or model.get("procedures") or [])
+            if isinstance(procedure, dict) and str(procedure.get("lifecycle") or "") == "candidate"
+        ]
+
+    def list_memory_candidates(self) -> dict[str, Any]:
+        from services.memory.ui import enrich_memory_item_for_ui
+
+        beliefs = [enrich_memory_item_for_ui(item) for item in self.list_candidate_beliefs()]
+        procedures = [enrich_memory_item_for_ui(item) for item in self.list_candidate_procedures()]
+        return {
+            "beliefs": beliefs,
+            "procedures": procedures,
+            "candidates": beliefs,
+            "count": len(beliefs) + len(procedures),
+        }
+
+    def list_archived_beliefs(self) -> list[dict[str, Any]]:
+        model = self.load_v4()
+        return [
+            dict(belief)
+            for belief in (model.get("learner_items") or model.get("beliefs") or [])
+            if isinstance(belief, dict) and str(belief.get("lifecycle") or "") == "archived"
+        ]
+
+    def list_archived_procedures(self) -> list[dict[str, Any]]:
+        model = self.load_v4()
+        return [
+            dict(procedure)
+            for procedure in (model.get("assistant_items") or model.get("procedures") or [])
+            if isinstance(procedure, dict) and str(procedure.get("lifecycle") or "") == "archived"
+        ]
+
+    def list_memory_archived(self) -> dict[str, Any]:
+        from services.memory.ui import enrich_memory_item_for_ui
+
+        beliefs = [enrich_memory_item_for_ui(item) for item in self.list_archived_beliefs()]
+        procedures = [enrich_memory_item_for_ui(item) for item in self.list_archived_procedures()]
+        return {
+            "beliefs": beliefs,
+            "procedures": procedures,
+            "count": len(beliefs) + len(procedures),
+        }
+
+    def ensure_derived_fresh(self) -> dict[str, Any]:
+        from services.memory.derived import rebuild_derived
+
+        model = self.load_v4()
+        derived = model.get("derived") or {}
+        if not derived.get("stale", True):
+            return model
+        model = rebuild_derived(model)
+        self.save_v4(model)
+        return model
 
 
 def normalize_interview_profile(profile: dict[str, Any]) -> dict[str, Any]:
@@ -183,11 +520,12 @@ def normalize_interview_profile(profile: dict[str, Any]) -> dict[str, Any]:
 
 def normalize_weak_point(item: dict[str, Any]) -> dict[str, Any]:
     weak = dict(item or {})
-    category = normalize_category(weak.get("category"))
-    weak["category"] = category
+    from services.memory.types import normalize_facet as _normalize_facet
+    facet = _normalize_facet(weak.get("facet") or weak.get("category"))
+    weak["category"] = "knowledge_gap" if facet == "knowledge" else "answer_structure"
     weak["scope"] = normalize_scope(
         weak.get("scope") or weak.get("scope_suggestion"),
-        category=category,
+        facet=facet,
         existing_scope=weak.get("scope"),
     )
     weak["domain_anchor"] = normalize_domain_anchor(
@@ -219,26 +557,15 @@ def normalize_strong_point(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_category(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    aliases = {
-        "knowledge": "knowledge_gap",
-        "knowledge_gap": "knowledge_gap",
-        "domain": "knowledge_gap",
-        "answer": "answer_structure",
-        "answer_structure": "answer_structure",
-        "structure": "answer_structure",
-        "communication": "communication",
-        "thinking": "thinking_pattern",
-        "thinking_pattern": "thinking_pattern",
-    }
-    return aliases.get(text, "knowledge_gap")
+    """Deprecated — delegates to normalize_facet, maps back to v4 category for compatibility."""
+    from services.memory.types import normalize_facet as _normalize_facet
+    facet = _normalize_facet(value, default="knowledge")
+    return "knowledge_gap" if facet == "knowledge" else "answer_structure"
 
 
-def normalize_scope(value: Any, *, category: str, existing_scope: Any = None) -> str:
+def normalize_scope(value: Any, *, facet: str = "", category: str = "", existing_scope: Any = None) -> str:
     current = str(existing_scope or value or "").strip().lower()
     if current == "universal":
-        return "universal"
-    if category == "communication":
         return "universal"
     return "domain"
 
@@ -262,6 +589,74 @@ def normalize_domain_anchor(
     anchor["plan_topic"] = str(anchor.get("plan_topic") or topic or "").strip()
     anchor["scope_path"] = str(anchor.get("scope_path") or "").strip()
     return anchor
+
+
+def extract_answer_memory_observations(
+    *,
+    session: dict[str, Any],
+    profile: dict[str, Any],
+    llm_client: Any,
+    model: str,
+    temperature: float = 0.1,
+) -> dict[str, Any]:
+    from services.memory.bridge import collect_answer_citation_paths, enrich_answer_session_for_memory
+
+    enriched = enrich_answer_session_for_memory(session)
+    citation_paths = collect_answer_citation_paths(enriched)
+    citations_compact = [
+        {
+            "message_id": message.get("message_id"),
+            "paths": [
+                str(item.get("path") or item.get("relative_path") or item).replace("\\", "/")
+                for item in (message.get("citations") or [])
+                if str(item.get("path") if isinstance(item, dict) else item or "").strip()
+            ],
+        }
+        for message in enriched.get("messages") or []
+        if message.get("role") == "assistant" and message.get("citations")
+    ]
+    user_content = "\n\n".join(
+        [
+            "# Existing Profile",
+            json.dumps(compact_profile_for_extraction(profile), ensure_ascii=False, indent=2),
+            "",
+            "# Session Context",
+            json.dumps(answer_context_for_extraction(enriched), ensure_ascii=False, indent=2),
+            "",
+            "# Assistant Citations",
+            json.dumps({"citation_paths": citation_paths[:20], "by_message": citations_compact[:12]}, ensure_ascii=False, indent=2),
+            "",
+            "# Transcript",
+            render_session_transcript(enriched.get("messages") or []),
+        ]
+    )
+    response = llm_client.complete(
+        LLMRequest(
+            model=model,
+            messages=[
+                LLMMessage(role="system", content=ANSWER_MEMORY_EXTRACTION_SYSTEM_PROMPT),
+                LLMMessage(role="user", content=user_content),
+            ],
+            temperature=temperature,
+            response_format={"type": "json_object"},
+        )
+    )
+    payload = parse_json_object(response.content)
+    observations = normalize_observations(payload.get("observations") or [])
+    return {"observations": observations}
+
+
+def answer_context_for_extraction(session: dict[str, Any]) -> dict[str, Any]:
+    context = session.get("context") or {}
+    return {
+        "session_id": session.get("session_id"),
+        "created_at": session.get("created_at"),
+        "scope_type": context.get("scope_type"),
+        "scope_value": context.get("scope_value"),
+        "scope_paths": context.get("scope_paths") or [],
+        "strict_evidence": bool(context.get("strict_evidence")),
+        "source_note_paths": context.get("source_note_paths") or [],
+    }
 
 
 def extract_profile_observations(
@@ -425,10 +820,10 @@ def normalize_profile_extraction(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def normalize_observations(value: Any) -> list[dict[str, str]]:
+def normalize_observations(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
-    observations: list[dict[str, str]] = []
+    observations: list[dict[str, Any]] = []
     for item in value:
         if not isinstance(item, dict):
             continue
@@ -437,7 +832,14 @@ def normalize_observations(value: Any) -> list[dict[str, str]]:
             continue
         point = str(item.get("point") or item.get("summary") or "").strip()
         evidence = str(item.get("evidence") or "").strip()
-        if not point and not evidence:
+        title = str(item.get("title") or point).strip()
+        left = str(item.get("left") or "").strip()
+        right = str(item.get("right") or "").strip()
+        if obs_type == "procedure" and not title and not item.get("steps"):
+            continue
+        if obs_type == "confusion_pair" and not (left and right):
+            continue
+        if obs_type not in {"procedure", "confusion_pair"} and not point and not evidence:
             continue
         observations.append(
             {
@@ -451,6 +853,12 @@ def normalize_observations(value: Any) -> list[dict[str, str]]:
                 "evidence": evidence,
                 "confidence": normalize_confidence(item.get("confidence")),
                 "context_note_paths": [str(path) for path in item.get("context_note_paths", []) if str(path).strip()] if isinstance(item.get("context_note_paths"), list) else [],
+                "procedure_key": str(item.get("procedure_key") or item.get("key") or "").strip(),
+                "title": title,
+                "steps": [str(step).strip() for step in item.get("steps", []) if str(step).strip()] if isinstance(item.get("steps"), list) else [],
+                "left": left,
+                "right": right,
+                "distinction": str(item.get("distinction") or "").strip(),
             }
         )
         if len(observations) >= 30:
@@ -471,6 +879,11 @@ def normalize_observation_type(value: Any) -> str:
         "improvement": "improvement",
         "strong": "strong_point",
         "strong_point": "strong_point",
+        "procedure": "procedure",
+        "assistant_preference": "procedure",
+        "preference": "procedure",
+        "confusion": "confusion_pair",
+        "confusion_pair": "confusion_pair",
     }
     return aliases.get(text, "")
 
@@ -596,9 +1009,10 @@ def apply_profile_observations(
 
 def prepare_observation_for_write(observation: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
     prepared = dict(observation or {})
-    category = normalize_category(prepared.get("category"))
-    prepared["category"] = category
-    prepared["scope"] = normalize_scope(prepared.get("scope_suggestion") or prepared.get("scope"), category=category)
+    from services.memory.types import normalize_facet as _normalize_facet
+    facet = _normalize_facet(prepared.get("facet") or prepared.get("category"))
+    prepared["category"] = "knowledge_gap" if facet == "knowledge" else "answer_structure"
+    prepared["scope"] = normalize_scope(prepared.get("scope_suggestion") or prepared.get("scope"), facet=facet)
     prepared["domain_anchor"] = resolve_domain_anchor(observation=prepared, session=session)
     return prepared
 
@@ -952,7 +1366,9 @@ def domain_relevance_between_anchors(left: dict[str, Any], right: dict[str, Any]
 def domain_relevance_for_current(weak: dict[str, Any], *, current_topic_card: dict[str, Any] | None, current_topic: str | None) -> str:
     anchor = normalize_domain_anchor(weak.get("domain_anchor"), topic=weak.get("topic"))
     card_paths = set(str(path) for path in ((current_topic_card or {}).get("source_note_paths") or []) if str(path).strip())
-    anchor_paths = set(str(path) for path in anchor.get("context_note_paths", []) if str(path).strip())
+    anchor_paths: set[str] = set()
+    for key in ("context_note_paths", "source_note_paths"):
+        anchor_paths.update(str(path) for path in (anchor.get(key) or weak.get("domain_anchor", {}).get(key) or []) if str(path).strip())
     if card_paths and anchor_paths and card_paths.intersection(anchor_paths):
         return "strong"
     if anchor_paths:
@@ -1096,7 +1512,7 @@ def dedupe_strings(value: Any, max_items: int) -> list[str]:
 def recompute_topic_mastery(profile: dict[str, Any]) -> dict[str, Any]:
     counts: dict[str, int] = {}
     for weak in profile.get("weak_points", []):
-        if weak.get("improved"):
+        if not is_injectable_weak_point(weak):
             continue
         topic = str(weak.get("topic") or "").strip()
         if not topic:
@@ -1376,6 +1792,13 @@ def find_topic_mastery(profile: dict[str, Any], current_topic: str | None) -> di
     return {}
 
 
+def is_injectable_weak_point(weak: dict[str, Any]) -> bool:
+    if weak.get("improved"):
+        return False
+    lifecycle = str(weak.get("lifecycle") or "active").strip().lower()
+    return lifecycle == "active"
+
+
 def split_weak_points_for_current(
     profile: dict[str, Any],
     *,
@@ -1386,7 +1809,7 @@ def split_weak_points_for_current(
     domain: list[dict[str, Any]] = []
     other: list[dict[str, Any]] = []
     for weak in profile.get("weak_points", []):
-        if weak.get("improved"):
+        if not is_injectable_weak_point(weak):
             continue
         if weak.get("scope") == "universal":
             universal.append(weak)
@@ -1425,7 +1848,7 @@ def split_due_reviews(
     matching: list[dict[str, Any]] = []
     other: list[dict[str, Any]] = []
     for weak in profile.get("weak_points", []):
-        if weak.get("improved"):
+        if not is_injectable_weak_point(weak):
             continue
         sr = weak.get("sr") or {}
         next_review = str(sr.get("next_review") or "2000-01-01")

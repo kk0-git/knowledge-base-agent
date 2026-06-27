@@ -33,6 +33,14 @@ def review_cache_root(project_root: Path | str) -> Path:
     return app_data_root(project_root) / "review-cache"
 
 
+def profile_data_root(project_root: Path | str) -> Path:
+    return app_data_root(project_root) / "profile"
+
+
+def learner_model_path(project_root: Path | str) -> Path:
+    return profile_data_root(project_root) / "learner_model.json"
+
+
 def ensure_app_data_dirs(project_root: Path | str) -> Path:
     root = app_data_root(project_root)
     for path in (
@@ -40,6 +48,7 @@ def ensure_app_data_dirs(project_root: Path | str) -> Path:
         answer_sessions_root(project_root),
         review_runs_root(project_root),
         review_cache_root(project_root),
+        profile_data_root(project_root),
     ):
         path.mkdir(parents=True, exist_ok=True)
     return root

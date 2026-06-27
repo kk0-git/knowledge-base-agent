@@ -236,6 +236,17 @@ class AgentTurnRunner:
         online_enabled = self.deps.librarian_online_enabled(request)
         online_client = OnlineSearchClient(provider=request.online_provider) if online_enabled else None
         rag_manager_factory = lambda: self.deps.build_librarian_rag_manager(request)
+        learner_memory_context = ""
+        profile_store = getattr(self.deps, "interview_profile_store", None)
+        if profile_store is not None:
+            from services.memory.injection import render_librarian_memory_context
+
+            model = profile_store.ensure_derived_fresh()
+            learner_memory_context = render_librarian_memory_context(
+                model=model,
+                scope_note_paths=tuple(scope_note_paths),
+                scope_value=str(request.scope_value or ""),
+            )
         app_runner = LibrarianApp(self.deps.build_agent_runtime(self.llm_client))
         answer_text = ""
         citations: list[dict[str, Any]] = []
@@ -258,6 +269,7 @@ class AgentTurnRunner:
                 tool_mode="auto",
                 trace_path=str(self.deps.project_root / "eval-results" / "agent-debug" / "traces"),
                 temperature=self.deps.llm_temperature,
+                learner_memory_context=learner_memory_context,
             )
         ):
             event_type = str(event.get("type") or "")

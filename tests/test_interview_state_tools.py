@@ -411,13 +411,15 @@ class InterviewerRuntimeTests(unittest.TestCase):
             context = build_interviewer_runtime_context(request, machine, profile_store)
             profile = context["profile"]
             self.assertTrue(profile["profile_available"])
-            self.assertEqual(profile["universal_weak_points"][0]["point"], "Universal answer structure habit")
+            self.assertIn("Universal answer structure habit", context.get("memory_context") or "")
+            self.assertEqual(profile["universal_weak_points"], [])
             self.assertEqual(profile["domain_weak_by_layer"]["definition"], 1)
             self.assertEqual(profile["domain_weak_by_layer"]["roles"], 1)
             self.assertEqual(profile["current_layer_domain_weak_count"], 1)
             rendered = json.dumps(profile, ensure_ascii=False)
             self.assertNotIn("Domain definition gap", rendered)
             self.assertNotIn("Domain roles gap", rendered)
+            self.assertIn("learner_memory_background", context["tool_boundaries"]["preloaded"])
 
     def test_five_turn_mock_session_routine_state_fetch_zero(self) -> None:
         registry = ToolRegistry()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import time
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 from agent.errors import AgentRuntimeError
 from agent.llm.tool_calling import LLMToolRequest, ToolCallingLLMClient, has_dsml_tool_intent, parse_dsml_tool_calls
@@ -419,7 +419,19 @@ def build_llm_request(
         temperature=config.temperature if config.temperature is not None else skill.temperature,
         tool_choice="auto",
         tool_mode=config.tool_mode,
+        response_format=response_format_for_output_contract(skill.output_contract),
     )
+
+
+def response_format_for_output_contract(output_contract: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(output_contract, dict):
+        return None
+    if isinstance(output_contract.get("response_format"), dict):
+        return dict(output_contract["response_format"])
+    contract_type = str(output_contract.get("type") or "").strip()
+    if contract_type in {"json", "json_object", "turn_review_json"}:
+        return {"type": "json_object"}
+    return None
 
 
 def append_forced_final_instruction(state: AgentState) -> None:

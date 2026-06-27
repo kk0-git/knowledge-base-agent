@@ -9,15 +9,15 @@ from typing import Any
 from knowledge_base_agent.llm.schema import LLMMessage, LLMRequest
 from services.workflows.interview_profile import (
     InterviewProfileStore,
-    advance_review_schedule,
-    normalize_category,
     profile_weak_point_for_agent,
-    update_weak_point,
 )
 
 
 QUESTION_TYPES = ("recall", "boundary", "compare", "scenario", "followup")
 AUTO_QUESTION_TYPE = "auto"
+# v5: behavior facet replaces the old 3-category strategy split
+BEHAVIOR_FACET = "behavior"
+# Deprecated — kept for Phase 0a fallback template compatibility
 STRATEGY_CATEGORIES = {"answer_structure", "communication", "thinking_pattern"}
 DEFAULT_MAX_STRATEGY_CONSTRAINTS = 2
 REVIEW_PROMPT_VERSION = "review-prompt-v3"
@@ -204,19 +204,25 @@ def review_card_payload(weak: dict[str, Any], *, due: bool, early: bool = False)
     return payload
 
 
+def _weak_point_facet(weak: dict[str, Any]) -> str:
+    """Resolve the effective facet for a weak point (v5 facet or v4 category)."""
+    from services.memory.types import normalize_facet
+    return normalize_facet(weak.get("facet") or weak.get("category"))
+
+
 def is_knowledge_weak_point(weak: dict[str, Any]) -> bool:
-    return normalize_category(weak.get("category")) == "knowledge_gap"
+    return _weak_point_facet(weak) == "knowledge"
 
 
 def is_strategy_weak_point(weak: dict[str, Any]) -> bool:
-    return normalize_category(weak.get("category")) in STRATEGY_CATEGORIES
+    return _weak_point_facet(weak) == "behavior"
 
 
 def strategy_constraint_payload(weak: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": weak_point_id(weak),
         "point": str(weak.get("point") or "").strip(),
-        "category": normalize_category(weak.get("category")),
+        "facet": _weak_point_facet(weak),
         "topic": str(weak.get("topic") or "").strip(),
         "planned_layer": str(weak.get("planned_layer") or "").strip(),
         "evidence": str(weak.get("evidence") or "").strip(),
@@ -292,7 +298,7 @@ def weak_point_cache_content(weak: dict[str, Any]) -> dict[str, Any]:
         "id": weak_point_id(weak),
         "point": str(weak.get("point") or "").strip(),
         "evidence": str(weak.get("evidence") or "").strip(),
-        "category": normalize_category(weak.get("category")),
+        "facet": _weak_point_facet(weak),
         "topic": str(weak.get("topic") or "").strip(),
         "planned_layer": str(weak.get("planned_layer") or "").strip(),
         "source_note_paths": sorted(str(path).strip() for path in weak.get("source_note_paths") or [] if str(path).strip()),
@@ -492,7 +498,7 @@ def grouped_review_cards(
         key = (
             str(weak.get("topic") or UNCATEGORIZED).strip() or UNCATEGORIZED,
             str(weak.get("planned_layer") or "").strip(),
-            normalize_category(weak.get("category")),
+            _weak_point_facet(weak),
         )
         buckets.setdefault(key, []).append(weak)
 
@@ -540,7 +546,7 @@ def build_grouped_review_card_payload(weak_points: list[dict[str, Any]], *, stra
     first = weak_points[0]
     topic = str(first.get("topic") or UNCATEGORIZED).strip() or UNCATEGORIZED
     planned_layer = str(first.get("planned_layer") or "").strip()
-    category = normalize_category(first.get("category"))
+    facet = _weak_point_facet(first)
     cache_key = review_card_cache_key(weak_points)
     weak_ids = [weak_point_id(weak) for weak in weak_points]
     source_note_paths = sorted(
@@ -572,7 +578,7 @@ def build_grouped_review_card_payload(weak_points: list[dict[str, Any]], *, stra
         "cache_key": cache_key,
         "topic": topic,
         "planned_layer": planned_layer,
-        "category": category,
+        "facet": facet,
         "weak_point_ids": weak_ids,
         "weak_points_summary": weak_summary,
         "weak_point_count": len(weak_ids),
@@ -826,9 +832,7 @@ def build_grouped_review_prompt(
                 "question_blocks_must_test_only_weak_points": True,
                 "strategy_constraints_are_expression_guidance_only": True,
                 "do_not_create_question_blocks_from_strategy_constraints": True,
-                "answer_structure_uses_evidence_reconstruction": True,
-                "thinking_pattern_uses_new_scenario": True,
-                "communication_reasks_for_clearer_expression": True,
+                "behavior_weak_points_review_focus": True,
             },
         }
         response = llm_client.complete(
@@ -882,23 +886,17 @@ def build_static_grouped_review_prompt(
             "fallback_used": True,
             "prompt_version": REVIEW_PROMPT_VERSION,
         }
-    category = normalize_category(weak_points[0].get("category"))
+    facet = _weak_point_facet(weak_points[0])
     topic = str(weak_points[0].get("topic") or UNCATEGORIZED).strip() or UNCATEGORIZED
     ids = [weak_point_id(weak) for weak in weak_points]
     points = [str(weak.get("point") or "").strip() for weak in weak_points if str(weak.get("point") or "").strip()]
     evidence = [str(weak.get("evidence") or "").strip() for weak in weak_points if str(weak.get("evidence") or "").strip()]
     joined_points = "；".join(points) or "这个薄弱点"
-    if category == "answer_structure":
-        prompt = f"围绕「{topic}」，请根据上次暴露出的回答问题，重新组织一版更完整的回答。重点修复：{joined_points}"
+    if facet == "behavior":
+        prompt = f"围绕「{topic}」，请重新组织一版更完整、更清晰的回答，重点修复以下表达/组织/思维问题：{joined_points}"
         if evidence:
             prompt += f"\n上次证据摘要：{evidence[0][:500]}"
-        block_type = "answer_structure"
-    elif category == "thinking_pattern":
-        prompt = f"换一个新的工程场景来考察同一个思维模式：如果你在「{topic}」相关项目中遇到相似取舍，请说明你会如何判断。需要覆盖：{joined_points}"
-        block_type = "thinking_pattern"
-    elif category == "communication":
-        prompt = f"请重新回答一道相似面试题，目标是表达更清晰、有层次。主题是「{topic}」，需要修复：{joined_points}"
-        block_type = "communication"
+        block_type = "behavior"
     else:
         prompt = f"围绕「{topic}」，请用自己的话解释这些薄弱点，并说明定义、边界、触发时机和工程例子：{joined_points}"
         block_type = "knowledge_gap"
@@ -951,30 +949,47 @@ def choose_question_type_for_weak_point(weak: dict[str, Any]) -> str:
     return "recall"
 
 
-def grade_weak_point(profile: dict[str, Any], weak: dict[str, Any], *, outcome: str, today: str | None = None) -> dict[str, Any]:
+def grade_weak_point(
+    store: InterviewProfileStore,
+    profile: dict[str, Any],
+    weak: dict[str, Any],
+    *,
+    outcome: str,
+    today: str | None = None,
+) -> dict[str, Any]:
     normalized = str(outcome or "").strip().lower()
     today_value = today or date.today().isoformat()
-    observation = {
-        "planned_layer": weak.get("planned_layer") or "",
-        "evidence": "review practice outcome",
-    }
+    belief_id = weak_point_id(weak)
     before = json.loads(json.dumps(weak.get("sr") or {}, ensure_ascii=False))
     previous_last_seen = weak.get("last_seen", "")
     if normalized == "pass":
-        advance_review_schedule(weak, observation, session_id="review", today=today_value)
+        from services.memory.bridge import observation_schedule_pass
+
+        observation = observation_schedule_pass(belief_id=belief_id)
     elif normalized == "fail":
-        update_weak_point(weak, observation, session_id="review", today=today_value)
+        from services.memory.bridge import observation_schedule_retry
+
+        observation = observation_schedule_retry(belief_id=belief_id, evidence_summary="review practice fail")
     else:
         raise ValueError("outcome must be pass or fail")
-    weak["last_seen"] = previous_last_seen
-    weak.setdefault("sr", {})["last_reviewed"] = today_value
-    after = weak.get("sr") or {}
+
+    from services.memory.commit import commit_observations
+
+    model, _ = commit_observations(store.load_v4(), [observation], today=today_value)
+    store.save_v4(model)
+    updated_profile = store.load()
+    updated_weak = find_weak_point(updated_profile, belief_id)
+    if updated_weak is None:
+        updated_weak = weak
+    updated_weak["last_seen"] = previous_last_seen
+    updated_weak.setdefault("sr", {})["last_reviewed"] = today_value
+    after = updated_weak.get("sr") or {}
     return {
-        "card_id": weak_point_id(weak),
+        "card_id": belief_id,
         "outcome": normalized,
         "before": before,
         "after": after,
-        "improved": bool(weak.get("improved")),
+        "improved": bool(updated_weak.get("improved")),
     }
 
 
@@ -983,9 +998,7 @@ def commit_review_outcome(store: InterviewProfileStore, *, card_id: str, outcome
     weak = find_weak_point(profile, card_id)
     if weak is None:
         raise KeyError(f"review card not found: {card_id}")
-    result = grade_weak_point(profile, weak, outcome=outcome)
-    store.save(profile)
-    return result
+    return grade_weak_point(store, profile, weak, outcome=outcome)
 
 
 def commit_review_action(store: InterviewProfileStore, *, card_id: str, action: str) -> dict[str, Any]:
@@ -999,16 +1012,18 @@ def commit_review_action(store: InterviewProfileStore, *, card_id: str, action: 
     if weak is None:
         raise KeyError(f"review card not found: {card_id}")
     today_value = date.today().isoformat()
+    belief_id = weak_point_id(weak)
     before = json.loads(json.dumps(weak.get("sr") or {}, ensure_ascii=False))
-    weak["improved"] = False
-    sr = weak.setdefault("sr", {})
-    sr["ease_factor"] = round(float(sr.get("ease_factor", 2.5) or 2.5), 2)
-    sr["repetitions"] = int(sr.get("repetitions", 0) or 0)
-    sr["interval_days"] = 1
-    sr["next_review"] = today_value
-    sr["last_outcome"] = "retry"
-    sr["last_reviewed"] = today_value
-    store.save(profile)
+    from services.memory.bridge import apply_review_ui_retry
+
+    model = store.load_v4()
+    updated = apply_review_ui_retry(model, belief_id=belief_id, today=today_value)
+    if updated is None:
+        raise KeyError(f"review card not found: {card_id}")
+    store.save_v4(model)
+    profile = store.load()
+    weak = find_weak_point(profile, card_id) or weak
+    sr = weak.get("sr") or {}
     return {
         "card_id": card_id,
         "action": "retry",
@@ -1016,6 +1031,115 @@ def commit_review_action(store: InterviewProfileStore, *, card_id: str, action: 
         "after": sr,
         "improved": False,
     }
+
+
+def commit_review_suggestions_as_candidates(
+    store: InterviewProfileStore,
+    *,
+    suggested_commits: list[dict[str, Any]],
+    review_run_id: str,
+    messages: list[dict[str, Any]] | None = None,
+    today: str | None = None,
+) -> dict[str, Any]:
+    if not suggested_commits:
+        return {"changed": False, "observations": 0, "added_candidate_ids": [], "warnings": []}
+
+    profile = store.load()
+    model_before = store.load_v4()
+    before_ids = {str(item.get("id") or "") for item in (model_before.get("learner_items") or model_before.get("beliefs") or []) if isinstance(item, dict)}
+    warnings: list[dict[str, str]] = []
+    observations: list[dict[str, Any]] = []
+    latest_turn_id = _latest_dialogue_turn_id(messages or [])
+
+    for suggestion in suggested_commits:
+        if not isinstance(suggestion, dict):
+            continue
+        weak_id = str(suggestion.get("weak_point_id") or "").strip()
+        if not weak_id:
+            continue
+        weak = find_weak_point(profile, weak_id)
+        if weak is None:
+            warnings.append({"weak_point_id": weak_id, "warning": "review weak point not found"})
+            continue
+        evidence_summary = _review_candidate_evidence_summary(suggestion, weak, messages or [])
+        observations.append(
+            {
+                "op": "propose_belief",
+                "source_kind": "review",
+                "confidence": "medium",
+                "target_lifecycle": "candidate",
+                "force_new_candidate": True,
+                "point": str(weak.get("point") or "").strip(),
+                "topic": str(weak.get("topic") or "").strip(),
+                "planned_layer": str(weak.get("planned_layer") or "").strip(),
+                "category": _weak_point_facet(weak),
+                "scope": str(weak.get("scope") or "domain").strip() or "domain",
+                "domain_anchor": weak.get("domain_anchor") or {},
+                "source_note_paths": list(weak.get("source_note_paths") or []),
+                "review_run_id": review_run_id,
+                "card_id": weak_id,
+                "turn_id": latest_turn_id,
+                "evidence_summary": evidence_summary,
+            }
+        )
+
+    if not observations:
+        return {"changed": False, "observations": 0, "added_candidate_ids": [], "warnings": warnings}
+
+    from services.memory.commit import commit_observations
+
+    model_after, operations = commit_observations(model_before, observations, today=today)
+    store.save_v4(model_after)
+    added_ids = [
+        str(item.get("id") or "")
+        for item in (model_after.get("learner_items") or model_after.get("beliefs") or [])
+        if isinstance(item, dict)
+        and str(item.get("id") or "") not in before_ids
+        and str(item.get("lifecycle") or "") == "candidate"
+    ]
+    return {
+        "changed": bool(operations.get("changed")),
+        "observations": len(observations),
+        "added_candidate_ids": added_ids,
+        "warnings": warnings,
+        "operations": operations,
+        "canonical_revision": int(model_after.get("canonical_revision") or 0),
+    }
+
+
+def _latest_dialogue_turn_id(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("turn_id"):
+            return str(message.get("turn_id") or "")
+    return ""
+
+
+def _review_candidate_evidence_summary(
+    suggestion: dict[str, Any],
+    weak: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> str:
+    explicit = str(suggestion.get("evidence") or suggestion.get("reason") or "").strip()
+    if explicit:
+        return explicit
+    action = str(suggestion.get("action") or suggestion.get("suggested_action") or "retry").strip().lower()
+    latest_user = ""
+    latest_assistant = ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip()
+        content = str(message.get("content") or "").strip()
+        if role == "assistant" and not latest_assistant:
+            latest_assistant = content
+        elif role == "user" and not latest_user:
+            latest_user = content
+        if latest_user and latest_assistant:
+            break
+    snippets = [item[:120] for item in (latest_user, latest_assistant) if item]
+    if snippets:
+        return f"review dialogue suggested {action}: " + " / ".join(snippets)
+    return f"review dialogue suggested {action} for: {str(weak.get('point') or '').strip()}"
 
 
 def parse_correction_payload(text: str, *, citations: list[dict[str, Any]] | None = None) -> dict[str, Any]:
